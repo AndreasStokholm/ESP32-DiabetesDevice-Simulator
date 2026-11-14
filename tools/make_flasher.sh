@@ -1,6 +1,6 @@
 #!/bin/sh
-# Builds the web flasher into flasher/dist: the page, its manifest, one merged
-# firmware image, and a pinned copy of ESP Web Tools (Apache-2.0).
+# Builds the web flasher into flasher/dist: the page, its manifest, the firmware
+# parts, and a pinned copy of ESP Web Tools (Apache-2.0).
 # Upload that folder to any HTTPS web server (Web Serial needs HTTPS).
 #
 #   tools/make_flasher.sh                 build flasher/dist
@@ -19,9 +19,13 @@ BOOT_APP0="$HOME/.platformio/packages/framework-arduinoespressif32/tools/partiti
 
 rm -rf "$OUT"
 mkdir -p "$OUT/vendor/esp-web-tools"
-pio pkg exec -p tool-esptoolpy -- esptool.py --chip esp32s3 merge_bin -o "$OUT/esp-sim-$VERSION.bin" \
-    --flash_mode dio --flash_freq 80m --flash_size 8MB \
-    0x0 "$B/bootloader.bin" 0x8000 "$B/partitions.bin" 0xe000 "$BOOT_APP0" 0x10000 "$B/firmware.bin"
+# Four separate parts, as `pio run -t upload` writes them. Do not merge them
+# into one image: the padding between the parts would overwrite the NVS
+# partition (the pod's state and the Wi-Fi settings) on every update.
+cp "$B/bootloader.bin" "$OUT/bootloader-$VERSION.bin"
+cp "$B/partitions.bin" "$OUT/partitions-$VERSION.bin"
+cp "$BOOT_APP0" "$OUT/boot_app0-$VERSION.bin"
+cp "$B/firmware.bin" "$OUT/firmware-$VERSION.bin"
 
 cat > "$OUT/manifest.json" <<JSON
 {
@@ -29,7 +33,15 @@ cat > "$OUT/manifest.json" <<JSON
   "version": "$VERSION",
   "new_install_prompt_erase": true,
   "builds": [
-    { "chipFamily": "ESP32-S3", "parts": [ { "path": "esp-sim-$VERSION.bin", "offset": 0 } ] }
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "bootloader-$VERSION.bin", "offset": 0 },
+        { "path": "partitions-$VERSION.bin", "offset": 32768 },
+        { "path": "boot_app0-$VERSION.bin", "offset": 57344 },
+        { "path": "firmware-$VERSION.bin", "offset": 65536 }
+      ]
+    }
   ]
 }
 JSON

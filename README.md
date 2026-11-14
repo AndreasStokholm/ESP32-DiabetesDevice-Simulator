@@ -36,7 +36,7 @@ The easiest way: open **https://loudestnoi.se/esp-sim/** in Chrome or Edge on a 
 plug in the board and press *Connect and install*. Nothing to install.
 
 To host the flasher yourself, `tools/make_flasher.sh` builds it into `flasher/dist`
-(page, manifest, one merged firmware image, and a pinned copy of ESP Web Tools); put that
+(page, manifest, the firmware parts, and a pinned copy of ESP Web Tools); put that
 folder on any HTTPS server.
 
 ## Build and flash from source
