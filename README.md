@@ -85,8 +85,9 @@ flash.
 ### If flashing fails
 
 - **No port listed:** try another cable or USB port.
-- **It won't connect:** hold the board's **BOOT** button, tap **RESET**, release BOOT, and
-  try again.
+- **Stuck on "Preparing installation", or it won't connect:** the board hasn't entered
+  download mode. Hold the board's **BOOT** button, tap **RESET**, release BOOT, then
+  reload the page and try again. After installing, press RESET once to start the firmware.
 - **"Port is busy":** close anything else using the port, such as another serial monitor
   or a second browser tab with the flasher open.
 - **More than one board plugged in:** `pio device list` shows the ports; choose one with
