@@ -46,9 +46,9 @@ flash.
    *USB JTAG/serial debug unit*.
 3. Choose **Install**. Tick *Erase device* for a fresh start; leave it unticked to update a
    board and keep its paired sensor and pod.
-4. When it finishes, open **Logs & Console** and press **Reset device**. The log shows the
-   G7's name, its 4-digit **pairing code**, and the board's Wi‑Fi access point name and
-   password.
+4. When it finishes, close the installer and press **Show my board's details**. The page
+   reads the G7's name and 4-digit **pairing code**, the pod type, and the board's Wi‑Fi
+   name and password straight from the board. (`status` on the console shows the same.)
 
 ### From source
 

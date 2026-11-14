@@ -28,6 +28,13 @@
   .install { text-align:center; padding:26px 20px; }
   .install .meta { color:var(--mut); font-size:13px; margin:12px 0 0; }
   .no { display:inline-block; text-align:left; background:var(--warn-bg); border:1px solid var(--warn-line); border-radius:10px; padding:12px 16px; }
+  button.secondary { font:inherit; font-weight:600; padding:9px 16px; border:1px solid var(--accent); border-radius:9px; background:transparent; color:var(--accent); cursor:pointer; }
+  button.secondary:disabled { opacity:.5; cursor:default; }
+  .meta { color:var(--mut); font-size:14px; }
+  dl { display:grid; grid-template-columns:max-content 1fr; gap:8px 18px; margin:14px 0 0; align-items:baseline; }
+  dt { color:var(--mut); font-size:14px; }
+  dd { margin:0; font-weight:600; overflow-wrap:anywhere; }
+  dd.big { font-size:30px; letter-spacing:.12em; line-height:1.1; }
   footer { color:var(--mut); font-size:13px; margin-top:24px; }
 </style>
 </head>
@@ -59,13 +66,25 @@
     <p class="meta">Firmware <span id="ver">…</span></p>
   </div>
 
+  <div class="card" id="details-card">
+    <h2>After installing: your board's details</h2>
+    <p>Each board makes its own sensor and pod. Close the installer, then read the pairing code straight from the board.</p>
+    <p><button id="details-btn" class="secondary">Show my board's details</button> <span id="details-msg" class="meta"></span></p>
+    <dl id="details" hidden>
+      <dt>G7 sensor</dt><dd id="d-name"></dd>
+      <dt>G7 pairing code</dt><dd id="d-code" class="big"></dd>
+      <dt>Pod</dt><dd id="d-pod"></dd>
+      <dt>Board's Wi‑Fi</dt><dd id="d-wifi"></dd>
+    </dl>
+  </div>
+
   <div class="card">
     <h2>Steps</h2>
     <ol>
       <li>Plug the board into the computer and press <strong>Connect and install</strong>.</li>
       <li>Pick the board's port. It is usually listed as <em>USB JTAG/serial debug unit</em>.</li>
       <li>Choose <strong>Install</strong>. Tick <em>Erase device</em> for a fresh start; leave it unticked to update a board and keep its paired sensor and pod.</li>
-      <li>When it finishes, open <strong>Logs &amp; Console</strong> and press <strong>Reset device</strong>. The log shows the G7's name and its 4-digit <strong>pairing code</strong>, and the board's Wi‑Fi access point name and password.</li>
+      <li>When it finishes, close the installer and press <strong>Show my board's details</strong> above. It shows the G7's name and 4-digit <strong>pairing code</strong>, the pod type, and the board's Wi‑Fi name and password.</li>
       <li>In the app, pair an Omnipod DASH pod and add a Dexcom G7 with that code.</li>
     </ol>
   </div>
@@ -86,6 +105,82 @@
 </main>
 <script type="module" src="vendor/esp-web-tools/install-button.js?module"></script>
 <script>
+  // Reads the board's own details over USB: sends the console's `status`
+  // command and picks the answers out of the reply (or out of the boot log,
+  // if opening the port restarted the board).
+  function parseBoardDetails(text) {
+    const pick = (...res) => { for (const re of res) { const m = text.match(re); if (m) return m[1]; } return null; };
+    const d = {
+      name: pick(/"name":\s*"([^"]+)"/, /\b(DX[A-Z0-9]{2}[a-z]{2}) \(/),
+      code: pick(/"code":\s*"(\d{4})"/, /PAIRING CODE (\d{4})/),
+      podType: pick(/"podType":\s*"([^"]+)"/, /pod: (?:a new|restored the) (DASH|Omnipod 5) pod/),
+      podPaired: null, reservoir: pick(/"reservoir":\s*([\d.]+)/),
+      apName: pick(/access point "([^"]+)"/, /access point ([^\s):,]+)/),
+      apPassword: pick(/password "([^"]+)"/),
+      webUrl: pick(/web: (http:\/\/[\d.]+\/)/),
+    };
+    const paired = pick(/"paired":\s*(true|false)/);
+    if (paired) d.podPaired = paired === 'true';
+    else if (/pod: [^\n]*not paired/.test(text)) d.podPaired = false;
+    else if (/pod: restored[^\n]*: paired/.test(text)) d.podPaired = true;
+    return d;
+  }
+
+  async function readBoard() {
+    const port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    let text = '';
+    const reader = port.readable.getReader();
+    try {
+      const writer = port.writable.getWriter();
+      await writer.write(new TextEncoder().encode('\nstatus\n'));
+      writer.releaseLock();
+      const decoder = new TextDecoder();
+      const stop = setTimeout(() => reader.cancel().catch(() => {}), 5000);
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+        if (/"code":/.test(text) && /pod: \{[^\n]*\}\s*\n/.test(text)) break;
+      }
+      clearTimeout(stop);
+    } finally {
+      try { await reader.cancel(); } catch (e) {}
+      reader.releaseLock();
+      await port.close();
+    }
+    return text;
+  }
+
+  const btn = document.getElementById('details-btn'), msg = document.getElementById('details-msg');
+  if (!('serial' in navigator)) {
+    btn.disabled = true;
+    msg.textContent = 'Needs Chrome or Edge on a computer.';
+  }
+  btn.onclick = async () => {
+    btn.disabled = true;
+    msg.textContent = 'Reading from the board…';
+    try {
+      const d = parseBoardDetails(await readBoard());
+      if (!d.code) throw new Error('The board did not answer. Press its RESET button and try again.');
+      const set = (id, v) => { document.getElementById(id).textContent = v; };
+      set('d-name', d.name || 'unknown');
+      set('d-code', d.code);
+      set('d-pod', (d.podType || 'unknown') + (d.podPaired === null ? '' : d.podPaired ? ', paired' : ', not paired yet')
+        + (d.reservoir ? ', ' + Number(d.reservoir) + ' U' : ''));
+      set('d-wifi', d.webUrl ? 'On your network: ' + d.webUrl
+        : d.apName ? 'Network "' + d.apName + '"' + (d.apPassword ? ', password "' + d.apPassword + '", then open http://192.168.4.1/' : ' (password is in the console log at start-up)')
+        : 'not available');
+      document.getElementById('details').hidden = false;
+      msg.textContent = '';
+    } catch (e) {
+      msg.textContent = e.name === 'NotFoundError' ? 'No port picked.'
+        : e.name === 'InvalidStateError' || e.name === 'NetworkError' ? 'The port is busy. Close the installer window first, then try again.'
+        : e.message;
+    }
+    btn.disabled = false;
+  };
+
   fetch('manifest.json').then(r => r.json()).then(m => {
     document.getElementById('ver').textContent = m.version + ' · ESP32-S3 · 8 MB flash';
     const c = document.getElementById('commit');

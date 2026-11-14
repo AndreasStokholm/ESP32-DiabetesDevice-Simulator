@@ -37,6 +37,7 @@ static WebServer web(80);
 static bool clockSynced = false, wifiConfigured = false, apStarted = false;
 static volatile int staFailures = 0;
 static int64_t restartAt = 0;
+static String apSsid, apPass;
 
 // MARK: - Commands shared by the console and the API
 
@@ -191,6 +192,8 @@ static void startAP() {
   snprintf(pass, sizeof pass, "pod-%02x%02x%02x%02x", mac[2] ^ 0x5a, mac[3] ^ 0xa5, mac[4] ^ 0x3c, mac[5] ^ 0xc3);
   WiFi.mode(wifiConfigured ? WIFI_AP_STA : WIFI_AP);
   WiFi.softAP(ssid, pass, 1, 0, 4);
+  apSsid = ssid;
+  apPass = pass;
   logf("Wi-Fi: access point \"%s\", password \"%s\": panels at http://192.168.4.1/", ssid, pass);
 }
 
@@ -271,7 +274,8 @@ static void printStatus() {
   serializeJson(d2["slots"], Serial);
   Serial.println();
   if (WiFi.status() == WL_CONNECTED) Serial.printf("web: http://%s/\n", WiFi.localIP().toString().c_str());
-  if (apStarted) Serial.printf("web (access point %s): http://192.168.4.1/\n", WiFi.softAPSSID().c_str());
+  if (apStarted)
+    Serial.printf("web (access point \"%s\", password \"%s\"): http://192.168.4.1/\n", apSsid.c_str(), apPass.c_str());
   Serial.printf("pod: %s\n", pod::statusJson().c_str());
 }
 
