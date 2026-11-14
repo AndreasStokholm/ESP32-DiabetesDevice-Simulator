@@ -30,22 +30,84 @@ device and share the single connection underneath.
   arrive up to about 30 seconds late.
 - **One phone at a time.**
 
-## Flash from a browser
+## Flashing the firmware
 
-The easiest way: open **https://loudestnoi.se/esp-sim/** in Chrome or Edge on a computer,
-plug in the board and press *Connect and install*. Nothing to install.
+You need an **ESP32-S3 board with at least 8 MB of flash** and a USB **data** cable (some
+cables only charge). If the board has two USB sockets, use the one marked *USB*, not
+*UART* or *COM*.
 
-To host the flasher yourself, `tools/make_flasher.sh` builds it into `flasher/dist`
-(page, manifest, the firmware parts, and a pinned copy of ESP Web Tools); put that
-folder on any HTTPS server.
+### From a browser (easiest)
 
-## Build and flash from source
+Nothing to install. Needs Chrome or Edge on a computer; Safari, Firefox and phones can't
+flash.
+
+1. Open **https://loudestnoi.se/esp-sim/** and plug in the board.
+2. Press **Connect and install** and pick the board's port, usually listed as
+   *USB JTAG/serial debug unit*.
+3. Choose **Install**. Tick *Erase device* for a fresh start; leave it unticked to update a
+   board and keep its paired sensor and pod.
+4. When it finishes, open **Logs & Console** and press **Reset device**. The log shows the
+   G7's name, its 4-digit **pairing code**, and the board's Wi‑Fi access point name and
+   password.
+
+### From source
+
+1. Install [PlatformIO](https://platformio.org) (`brew install platformio` on a Mac) and
+   get the code:
+
+   ```bash
+   git clone https://github.com/loudestnoise/ESP-Sim
+   cd ESP-Sim
+   ```
+
+2. Plug in the board, then build and flash. The first build downloads the toolchain and
+   takes a few minutes.
+
+   ```bash
+   pio run -t upload
+   ```
+
+3. Open the console to see the pairing code. Type `help` for commands; Ctrl+C quits.
+
+   ```bash
+   pio device monitor
+   ```
+
+### Updating, and starting over
+
+- **Updating** keeps everything the board has stored: the sensor, the pod, their
+  pairings and the Wi‑Fi network. Flash again from the browser with *Erase device*
+  unticked, or run `git pull` and `pio run -t upload`.
+- **Starting over** wipes all of that. Tick *Erase device* in the browser, or run
+  `pio run -t erase` and then `pio run -t upload`. To replace only the sensor or only the
+  pod, use the `new` and `pod new` console commands instead.
+
+### If flashing fails
+
+- **No port listed:** try another cable or USB port.
+- **It won't connect:** hold the board's **BOOT** button, tap **RESET**, release BOOT, and
+  try again.
+- **"Port is busy":** close anything else using the port, such as another serial monitor
+  or a second browser tab with the flasher open.
+- **More than one board plugged in:** `pio device list` shows the ports; choose one with
+  `pio run -t upload --upload-port /dev/cu.usbmodemXXXX`.
+- **Nothing happens after flashing:** press RESET, or unplug the board and plug it back in.
+
+### Hosting the flasher, or flashing by hand
+
+`tools/make_flasher.sh` builds the browser flasher into `flasher/dist` (page, manifest,
+the firmware parts, and a pinned copy of ESP Web Tools). Put that folder on any HTTPS
+server; Web Serial does not work over plain HTTP.
+
+The firmware is four parts at fixed addresses. With `esptool.py`:
 
 ```bash
-brew install platformio
-pio run -t upload        # build and flash
-pio device monitor       # the console
+esptool.py --chip esp32s3 write_flash \
+  0x0 bootloader.bin 0x8000 partitions.bin 0xe000 boot_app0.bin 0x10000 firmware.bin
 ```
+
+Write them separately. A single merged image pads the gaps between the parts, and that
+padding overwrites the board's stored pod state and Wi‑Fi settings.
 
 Tested on an ESP32-S3 with 8 MB flash, with Trio on a test iPhone: a DASH pod and an
 Omnipod 5 pod each paired, primed and ran, with the G7 paired on the same connection and
