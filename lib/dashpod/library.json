@@ -1,0 +1,13 @@
+{
+  "name": "dashpod",
+  "version": "0.0.0",
+  "description": "ESP-Sim's portable Omnipod DASH / Omnipod 5 pod core (github.com/nightscout/ESP-Sim, commit 26c5219), unmodified. GPL-3.0-or-later.",
+  "license": "GPL-3.0-or-later",
+  "build": {
+    "srcDir": "src",
+    "includeDir": "include",
+    "flags": [
+      "-DLOG_LOCAL_LEVEL=3"
+    ]
+  }
+}
