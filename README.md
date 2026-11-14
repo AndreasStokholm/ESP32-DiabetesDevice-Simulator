@@ -38,7 +38,9 @@ pio run -t upload        # build and flash
 pio device monitor       # the console
 ```
 
-Tested on an ESP32-S3 with 8 MB flash.
+Tested on an ESP32-S3 with 8 MB flash, with Trio on a test iPhone: a DASH pod and an
+Omnipod 5 pod each paired, primed and ran, with the G7 paired on the same connection and
+its readings collected every 5 minutes.
 
 ## Pair
 
@@ -86,6 +88,7 @@ ESP-Sim's under `/pod` (`/pod/status`, `/pod/command`, `/pod/wifi`).
 - Unlike a real G7, the sensor serves a phone that has already collected the current
   reading, and it does not serve a second display (a watch or a second phone).
 - Neither device appears in iOS Settings → Bluetooth. That's expected.
+- Not yet tested: the web panels over the board's own access point, and long runs.
 - The ESP32 is 2.4 GHz only, and can't sign in to captive-portal Wi‑Fi (hotels). Use its
   own access point or a phone hotspot.
 
