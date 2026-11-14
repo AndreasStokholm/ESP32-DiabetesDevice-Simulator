@@ -30,7 +30,16 @@ device and share the single connection underneath.
   arrive up to about 30 seconds late.
 - **One phone at a time.**
 
-## Build and flash
+## Flash from a browser
+
+The easiest way: open **https://loudestnoi.se/esp-sim/** in Chrome or Edge on a computer,
+plug in the board and press *Connect and install*. Nothing to install.
+
+To host the flasher yourself, `tools/make_flasher.sh` builds it into `flasher/dist`
+(page, manifest, one merged firmware image, and a pinned copy of ESP Web Tools); put that
+folder on any HTTPS server.
+
+## Build and flash from source
 
 ```bash
 brew install platformio
@@ -110,6 +119,7 @@ ESP-Sim's under `/pod` (`/pod/status`, `/pod/command`, `/pod/wifi`).
 | `src/radio.cpp` | One Bluetooth device for both |
 | `src/sensor.cpp`, `handler.cpp`, `crypto.cpp` | The G7 (from g7simESP32) |
 | `src/main.cpp` | Boot, Wi‑Fi, web panels, console |
+| `flasher/`, `tools/make_flasher.sh` | The browser flasher |
 | `tools/g7client.py`, `tools/podcheck.py` | Test clients for a Mac |
 
 ## License
