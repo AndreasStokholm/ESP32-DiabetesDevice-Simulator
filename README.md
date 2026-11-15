@@ -2,7 +2,8 @@
 
 One ESP32-S3 that is both an **Omnipod pod simulator** (DASH or Omnipod 5) and a
 **Dexcom G7 sensor simulator**. Pair both from Loop or Trio on a test phone and the app has
-a pump and a CGM, with no real pod or sensor.
+a pump and a CGM, with no real pod or sensor. A new board starts as an Omnipod 5; one
+button switches it to DASH and back.
 
 > **Test equipment only.** Not a Dexcom or Insulet product, and not a medical device. It
 > delivers no insulin and every value it reports is made up. Never use it, or an app
@@ -37,6 +38,11 @@ You need an **ESP32-S3 board with at least 8 MB of flash** and a USB **data** ca
 cables only charge). If the board has two USB sockets, use the one marked *USB*, not
 *UART* or *COM*.
 
+It has to be an ESP32-S3. Look-alike boards with another chip, such as the Seeed XIAO
+nRF52840, show up as a port but cannot be flashed: the installer waits on "Preparing
+installation" forever. Other ESP32 kinds (the original ESP32, S2, C3, C6) are refused or
+won't run this build.
+
 ### From a browser (easiest)
 
 Nothing to install. Needs Chrome or Edge on a computer; Safari, Firefox and phones can't
@@ -50,6 +56,8 @@ flash.
 4. When it finishes, close the installer and press **Connect to the board**. The page
    reads the G7's name and 4-digit **pairing code**, the pod type, and the board's Wi‑Fi
    name and password straight from the board. (`status` on the console shows the same.)
+5. Pair from the app (see [Pair](#pair)), and use the same page's buttons to
+   [control](#control) the board.
 
 ### From source
 
@@ -89,6 +97,7 @@ flash.
 - **Stuck on "Preparing installation", or it won't connect:** the board hasn't entered
   download mode. Hold the board's **BOOT** button, tap **RESET**, release BOOT, then
   reload the page and try again. After installing, press RESET once to start the firmware.
+  If that never helps, check the board really is an ESP32-S3 (see above).
 - **"Port is busy":** close anything else using the port, such as another serial monitor
   or a second browser tab with the flasher open.
 - **More than one board plugged in:** `pio device list` shows the ports; choose one with
@@ -113,11 +122,13 @@ padding overwrites the board's stored pod state and Wi‑Fi settings.
 
 Tested on an ESP32-S3 with 8 MB flash, with Trio on a test iPhone: a DASH pod and an
 Omnipod 5 pod each paired, primed and ran, with the G7 paired on the same connection and
-its readings collected every 5 minutes.
+its readings collected every 5 minutes. Switching the pod type from the USB panel and
+pairing the new pod was tested both ways.
 
 ## Pair
 
-- **G7:** add a Dexcom G7 in the app and enter the 4-digit pairing code the console prints.
+- **G7:** add a Dexcom G7 in the app and enter the board's 4-digit pairing code. The USB
+  panel shows it, and so does `status` on the console.
 - **Pod:** pair a new Omnipod 5 pod, which is what a new board starts as. For DASH, switch
   the pod type first: the **Switch to DASH** button on either panel, or `pod mode dash`.
   The button always offers the other type, and switching starts a new, unpaired pod.
@@ -127,25 +138,37 @@ Use a **test phone**, never one that runs a real sensor or pod.
 ## Control
 
 **Over USB, with buttons (no Wi‑Fi needed).** Open **https://loudestnoi.se/esp-sim/** in
-Chrome or Edge, press **Connect to the board** and pick its port. The page shows the
-pairing code, the latest reading and the pod, and has buttons for test situations: steady,
-low, high, wave and random-walk glucose; sensor states such as warmup, a temporary sensor
-issue or a failed sensor; pod reservoir, alerts, age and an occlusion fault; and starting
-a new sensor or pod. Below the buttons is the board's log and a box for typing any
-[command](#commands). Close other serial monitors first: only one program can use the
-port.
+Chrome or Edge, press **Connect to the board** and pick its port. Close other serial
+monitors first: only one program can use the port. The page shows the pairing code, the
+latest reading with its trend, the glucose pattern, the pod and the board's Wi‑Fi details,
+and has buttons for test situations:
 
-**Web panels.** With no Wi‑Fi network saved, the board runs its own access point,
-`ESP-Sim-XXXX`; its password is printed on the console at boot. Join it and open
-`http://192.168.4.1/`. To put the board on your network instead, use the pod panel's Wi‑Fi
-card or `wifi <name> <password>`; it then prints its address (also `http://esp-sim.local/`)
-and takes the time from NTP.
+- **CGM glucose:** steady, low, urgent low, high, very high, a wave, a random walk, or any
+  value you enter. A countdown shows when the next 5-minute reading is due.
+- **Sensor state:** normal, warmup, temporary sensor issue, excess noise, expired, failed.
+- **Pod type:** one button that offers the other type, **Switch to DASH** or **Switch to
+  Omnipod 5**. Switching starts a new, unpaired pod, and warns first if the current one is
+  paired.
+- **Pod:** reservoir levels, alerts, pod age up to the 80-hour shutdown, an occlusion
+  fault, a crash before or after the next command, and ignoring the next messages.
+- **Start over:** unpair the sensor, a new sensor, a new pod of the same type.
+- **Console:** the board's live log and a box for typing any [command](#commands).
+
+The buttons send the console commands below, so a board whose firmware is older than the
+page may not know them: install again to update it.
+
+**Web panels (over Wi‑Fi).** With no Wi‑Fi network saved, the board runs its own access
+point, `ESP-Sim-XXXX`. Its name and password are shown by the USB panel and by `status`,
+and printed on the console at boot. Join it and open `http://192.168.4.1/`. To put the
+board on your network instead, use the pod panel's Wi‑Fi card or `wifi <name> <password>`;
+it then prints its address (also `http://esp-sim.local/`) and takes the time from NTP.
 
 - `/` is the G7 panel: glucose (fixed, sine, random walk), sensor errors, new sensor.
-- `/pod` is the pod panel: reservoir, pod age, alerts, faults, DASH or Omnipod 5, new pod.
+- `/pod` is the pod panel: reservoir, pod age, alerts, faults, crash on the next command,
+  the same pod type switch button, new pod, Wi‑Fi.
 
 The JSON APIs are the originals': g7sim's at `/status`, `/glucose`, `/forget`, `/new`, and
-ESP-Sim's under `/pod` (`/pod/status`, `/pod/command`, `/pod/wifi`).
+loopkit/pod's under `/pod` (`/pod/status`, `/pod/command`), plus `/pod/wifi`.
 
 The console commands below do everything the panels do, and more.
 
@@ -159,13 +182,16 @@ simulators, and commands you run **on your computer** to build and flash.
 The board must be plugged in by USB. Only one program can use its port at a time, so
 close one console before opening another.
 
-**In a browser (Logs & Console).** Nothing to install; needs Chrome or Edge on a computer.
+**In a browser.** Nothing to install; needs Chrome or Edge on a computer.
 
-1. Open **https://loudestnoi.se/esp-sim/** and press **Connect and install**.
+1. Open **https://loudestnoi.se/esp-sim/** and press **Connect to the board**.
 2. Pick the board's port, usually *USB JTAG/serial debug unit*.
-3. Choose **Logs & Console**. (Don't choose Install; that reflashes the board.)
-4. Type a command in the box at the bottom and press Enter. The reply appears in the log.
-5. Close the window when you're done, so the port is free again.
+3. Scroll to **Console**, type a command in the box and press Enter. The reply appears in
+   the log above it.
+4. Press **Disconnect** when you're done, so the port is free again.
+
+The installer's own **Logs & Console** window (under **Connect and install**) works too.
+Don't choose Install there unless you mean to reflash the board.
 
 **In a terminal.** Needs [PlatformIO](https://platformio.org) and a copy of this repo.
 
@@ -310,7 +336,10 @@ need the board free: one phone or computer can be connected at a time.
 - Unlike a real G7, the sensor serves a phone that has already collected the current
   reading, and it does not serve a second display (a watch or a second phone).
 - Neither device appears in iOS Settings → Bluetooth. That's expected.
-- Not yet tested: the web panels over the board's own access point, and long runs.
+- Not yet tested: the web panels over the board's own access point; long runs; what the
+  app does after `crashNextCommand` and `ignoreNextMessages` (the board accepts them); and
+  a blank board starting as an Omnipod 5 (boards updated from an earlier build keep the
+  pod they had).
 - The ESP32 is 2.4 GHz only, and can't sign in to captive-portal Wi‑Fi (hotels). Use its
   own access point or a phone hotspot.
 
@@ -318,10 +347,14 @@ need the board free: one phone or computer can be connected at a time.
 
 - **ESP-Sim** is an ESP-IDF project; here its pod core runs under Arduino/PlatformIO with
   new board glue (`src/pod.cpp`, and the pod's side of `src/radio.cpp`) in place of its
-  `main/`. The pod's panel moved to `/pod`. ESP-Sim's host tests are not included: run them
-  in ESP-Sim itself.
+  `main/`. The pod's panel moved to `/pod`, and its pod type dropdown became one switch
+  button. A new board starts as an Omnipod 5, where ESP-Sim starts as a DASH. The pod core
+  gained loopkit/pod's `ignoreNextMessages` and `failNextConnects` commands. ESP-Sim's
+  host tests are not included: run them in ESP-Sim itself.
 - **g7simESP32**'s radio is rewritten to share one connection with the pod, and its
   session stays open on that connection instead of hanging up after a few idle seconds.
+  `/glucose` now fills in omitted fields as g7sim does (0, not g7simESP32's 120, 50 and
+  240), and the console takes g7sim's request bodies.
 
 ## Layout
 
