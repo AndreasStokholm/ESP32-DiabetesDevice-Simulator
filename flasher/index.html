@@ -125,34 +125,41 @@
 
       <h3>Pod</h3>
       <div class="btns">
-        <button data-cmd="pod reservoir 200">Reservoir full</button>
-        <button data-cmd="pod reservoir 30">Reservoir 30 U</button>
-        <button data-cmd="pod reservoir 5">Reservoir 5 U</button>
-        <button data-cmd="pod reservoir 0">Reservoir empty</button>
+        <button data-cmd="pod changeReservoir 200">Reservoir full</button>
+        <button data-cmd="pod changeReservoir 30">Reservoir 30 U</button>
+        <button data-cmd="pod changeReservoir 5">Reservoir 5 U</button>
+        <button data-cmd="pod changeReservoir 0">Reservoir empty</button>
       </div>
       <div class="btns" style="margin-top:8px">
-        <button data-cmd="pod alerts 16">Low reservoir alert</button>
-        <button data-cmd="pod alerts 8">Expiration reminder</button>
-        <button data-cmd="pod alerts 4">Shutdown imminent</button>
-        <button data-cmd="pod alerts 0">Clear alerts</button>
+        <button data-cmd="pod setAlerts 16">Low reservoir alert</button>
+        <button data-cmd="pod setAlerts 8">Expiration reminder</button>
+        <button data-cmd="pod setAlerts 4">Shutdown imminent</button>
+        <button data-cmd="pod setAlerts 0">Clear alerts</button>
       </div>
       <div class="btns" style="margin-top:8px">
-        <button data-cmd="pod age 4290">Age 71.5 h</button>
-        <button data-cmd="pod age 4320">Age 72 h (expires)</button>
-        <button data-cmd="pod age 4740">Age 79 h</button>
-        <button class="danger" data-cmd="pod age 4800" data-confirm="Set the pod's age to 80 hours? It faults at the next command and the app will ask you to replace it.">Age 80 h (shuts down)</button>
+        <button data-cmd="pod setActiveTime 4290">Age 71.5 h</button>
+        <button data-cmd="pod setActiveTime 4320">Age 72 h (expires)</button>
+        <button data-cmd="pod setActiveTime 4740">Age 79 h</button>
+        <button class="danger" data-cmd="pod setActiveTime 4800" data-confirm="Set the pod's age to 80 hours? It faults at the next command and the app will ask you to replace it.">Age 80 h (shuts down)</button>
       </div>
       <div class="btns" style="margin-top:8px">
-        <button class="danger" data-cmd="pod fault 20" data-confirm="Raise an occlusion fault? The app will ask you to replace the pod.">Occlusion fault</button>
-        <button data-cmd="pod fault 0">Clear fault</button>
+        <button class="danger" data-cmd="pod setFault 20" data-confirm="Raise an occlusion fault? The app will ask you to replace the pod.">Occlusion fault</button>
+        <button data-cmd="pod setFault 0">Clear fault</button>
       </div>
+      <div class="btns" style="margin-top:8px">
+        <button class="danger" data-cmd="pod crashNextCommand before" data-confirm="Restart the board just before it processes the next delivery command? The phone gets no answer; the same pod comes back.">Crash before next command</button>
+        <button class="danger" data-cmd="pod crashNextCommand after" data-confirm="Restart the board just after it processes the next delivery command? The phone gets no answer; the same pod comes back.">Crash after next command</button>
+        <button data-cmd="pod ignoreNextMessages 1">Ignore next message</button>
+        <button data-cmd="pod ignoreNextMessages 3">Ignore next 3 messages</button>
+      </div>
+      <p class="note">The pod buttons send <a href="https://github.com/loopkit/pod">loopkit/pod</a>'s commands by name, for example <code>pod changeReservoir 30</code>. If the board answers "pod: want …", its firmware is older than this page: install again to update.</p>
 
       <h3>Start over</h3>
       <div class="btns">
         <button class="danger" data-cmd="forget" data-confirm="Unpair every phone from the G7 sensor? You'll pair it in the app again with the same code.">Unpair the sensor</button>
         <button class="danger" data-cmd="new" data-confirm="Replace the sensor with a new one? It gets a new name and pairing code, and the board restarts.">New sensor</button>
-        <button class="danger" data-cmd="pod type dash" data-confirm="Replace the pod with a new, unpaired DASH pod? Discard the current pod in the app first.">New DASH pod</button>
-        <button class="danger" data-cmd="pod type o5" data-confirm="Replace the pod with a new, unpaired Omnipod 5 pod? Discard the current pod in the app first.">New Omnipod 5 pod</button>
+        <button class="danger" data-cmd="pod mode dash" data-confirm="Replace the pod with a new, unpaired DASH pod? Discard the current pod in the app first.">New DASH pod</button>
+        <button class="danger" data-cmd="pod mode o5" data-confirm="Replace the pod with a new, unpaired Omnipod 5 pod? Discard the current pod in the app first.">New Omnipod 5 pod</button>
       </div>
 
       <h3>Console</h3>

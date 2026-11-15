@@ -298,11 +298,15 @@ static void help() {
       "      [lifetime=HOURS] [warmup=MIN]   start a new sensor (restarts)\n"
       "Omnipod pod:\n"
       "  pod                                 the pod's status\n"
-      "  pod new                             forget the pod and start as a new, unpaired one\n"
-      "  pod type dash|o5                    become a new DASH or Omnipod 5 pod\n"
-      "  pod reservoir <units>               set the reservoir (0-200 U)\n"
-      "  pod age <minutes>                   set how long the pod has been active\n"
-      "  pod fault <code> | pod alerts <mask>  raise a fault (0 clears) or alert slots\n"
+      "  pod fresh                           forget the pod and start as a new, unpaired one\n"
+      "  pod mode dash|o5                    become a new DASH or Omnipod 5 pod\n"
+      "  pod changeReservoir <units>         set the reservoir (0-200 U)\n"
+      "  pod setActiveTime <minutes>         set how long the pod has been active\n"
+      "  pod setAlerts <mask>                raise alert slots (0-255, 0 clears)\n"
+      "  pod setFault <code>                 raise a fault (0 clears)\n"
+      "  pod crashNextCommand before|after   reboot before or after processing the next delivery command\n"
+      "  pod ignoreNextMessages <count>      stay connected but leave that many messages unanswered\n"
+      "  pod failNextConnects <count> [sec]  loopkit/pod's command; needs its ImpossiBLE transport\n"
       "  pod selftest                        check the pod's crypto on this board\n"
       "Board:\n"
       "  wifi <ssid> [password] | wifi off   join Wi-Fi for the web panels + NTP (restarts)\n"
@@ -392,17 +396,38 @@ static void command(const std::string& line) {
   } else if (cmd == "pod") {
     std::string sub = a.size() >= 2 ? a[1] : "";
     std::string v = a.size() >= 3 ? a[2] : "";
-    auto withValue = [&](const char* c) { podCommand(std::string("{\"command\":\"") + c + "\",\"value\":" + v + "}"); };
+    // The commands and their names are loopkit/pod's control API:
+    // `pod <command> <value>` sends {"command": <command>, "value": <value>}.
+    auto isNumber = [](const std::string& x) {
+      char* end = nullptr;
+      strtod(x.c_str(), &end);
+      return !x.empty() && *end == 0;
+    };
+    // The names this console used before it took loopkit/pod's.
+    static const std::pair<const char*, const char*> old[] = {
+        {"new", "fresh"}, {"type", "mode"}, {"reservoir", "changeReservoir"},
+        {"age", "setActiveTime"}, {"fault", "setFault"}, {"alerts", "setAlerts"}};
+    for (auto& [was, now] : old)
+      if (sub == was) sub = now;
+
     if (sub.empty()) Serial.printf("pod: %s\n", pod::statusJson().c_str());
     else if (sub == "selftest") Serial.printf("pod self-test:\n%s", pod::selfTest().c_str());
-    else if (sub == "new") podCommand("{\"command\":\"resetPod\"}");
-    else if (sub == "type" && (v == "dash" || v == "o5"))
-      podCommand(std::string("{\"command\":\"setPodType\",\"value\":") + (v == "o5" ? "1" : "0") + "}");
-    else if (sub == "reservoir" && !v.empty()) withValue("changeReservoir");
-    else if (sub == "age" && !v.empty()) withValue("setActiveTime");
-    else if (sub == "fault" && !v.empty()) withValue("setFault");
-    else if (sub == "alerts" && !v.empty()) withValue("setAlerts");
-    else Serial.println("pod: want new, type dash|o5, reservoir <U>, age <min>, fault <code> or alerts <mask>");
+    else if (sub == "fresh") podCommand("{\"command\":\"resetPod\"}");
+    else if (sub == "mode") {
+      if (v == "dash" || v == "o5") podCommand(std::string("{\"command\":\"setPodType\",\"value\":") + (v == "o5" ? "1" : "0") + "}");
+      else Serial.println("pod mode: want dash or o5");
+    } else if (sub == "crashNextCommand") {
+      if (v == "before" || v == "after" || v == "true" || v == "false")
+        podCommand(std::string("{\"command\":\"crashNextCommand\",\"beforeProcessing\":") + (v == "before" || v == "true" ? "true" : "false") + "}");
+      else Serial.println("pod crashNextCommand: want before or after");
+    } else if (sub.find_first_of("\"\\{}") != std::string::npos || (!v.empty() && !isNumber(v))) {
+      Serial.println("pod: want pod <command> <number>; try help");
+    } else {
+      std::string json = "{\"command\":\"" + sub + "\"";
+      if (!v.empty()) json += ",\"value\":" + v;
+      if (sub == "failNextConnects" && a.size() >= 4 && isNumber(a[3])) json += ",\"hangUpAfter\":" + a[3];
+      podCommand(json + "}");
+    }
   } else if (cmd == "wifi" && a.size() >= 2) {
     saveWifi(a[1] == "off" ? "" : a[1].c_str(), a.size() >= 3 ? a[2].c_str() : "");
     sensor->persist();

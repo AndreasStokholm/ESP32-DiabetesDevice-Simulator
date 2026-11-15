@@ -565,6 +565,16 @@ static dash_link_t command_loop(dash_pod_t *p)
         if (r != DASH_LINK_OK) {
             return r;
         }
+        lock(p);
+        bool ignore = p->ignore_messages > 0;
+        if (ignore) {
+            p->ignore_messages--;
+        }
+        unlock(p);
+        if (ignore) {
+            DLOGI("ignoring message seq %u (ignoreNextMessages)", (unsigned)m.seq);
+            continue;
+        }
         if (m.seq == last_seq) {
             continue; /* the phone resending one the pod hasn't answered yet */
         }
@@ -701,6 +711,13 @@ void dash_pod_crash_next(dash_pod_t *p, bool before_processing)
 {
     lock(p);
     p->crash_next = before_processing ? DASH_CRASH_BEFORE : DASH_CRASH_AFTER;
+    unlock(p);
+}
+
+void dash_pod_ignore_next_messages(dash_pod_t *p, int count)
+{
+    lock(p);
+    p->ignore_messages = count;
     unlock(p);
 }
 
@@ -864,6 +881,14 @@ const char *dash_pod_panel_command(dash_pod_t *p, const char *json, size_t len)
             return "beforeProcessing is not a bool or not in msg";
         }
         dash_pod_crash_next(p, b[0] == 't');
+    } else if (strcmp(cmd, "ignoreNextMessages") == 0) {
+        NEED_VALUE("message count", 0, 100);
+        dash_pod_ignore_next_messages(p, (int)value);
+    } else if (strcmp(cmd, "failNextConnects") == 0) {
+        NEED_VALUE("connect count", 0, 100);
+        /* The Go simulator refuses this on a real radio too: only its
+         * ImpossiBLE transport can leave service discovery unanswered. */
+        return "failNextConnects needs -transport impossible (a real radio cannot leave service discovery unanswered)";
     } else if (strcmp(cmd, "resetPod") == 0) {
         dash_pod_reset(p);
     } else if (strcmp(cmd, "setPodType") == 0) {

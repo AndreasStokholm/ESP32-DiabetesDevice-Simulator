@@ -11,7 +11,8 @@ a pump and a CGM, with no real pod or sensor.
 It combines two projects:
 
 - the pod is [nightscout/ESP-Sim](https://github.com/nightscout/ESP-Sim)'s pod core,
-  unmodified, in `lib/dashpod` (commit `26c5219`);
+  in `lib/dashpod` (commit `26c5219`, plus loopkit/pod's `ignoreNextMessages` and
+  `failNextConnects` commands);
 - the G7 is [g7simESP32](https://github.com/loudestnoise/g7simESP32), a C++ port of
   [LoopKit/g7sim](https://github.com/LoopKit/g7sim).
 
@@ -80,7 +81,7 @@ flash.
   unticked, or run `git pull` and `pio run -t upload`.
 - **Starting over** wipes all of that. Tick *Erase device* in the browser, or run
   `pio run -t erase` and then `pio run -t upload`. To replace only the sensor or only the
-  pod, use the `new` and `pod new` console commands instead.
+  pod, use the `new` and `pod fresh` console commands instead.
 
 ### If flashing fails
 
@@ -118,7 +119,7 @@ its readings collected every 5 minutes.
 
 - **G7:** add a Dexcom G7 in the app and enter the 4-digit pairing code the console prints.
 - **Pod:** pair a new Omnipod DASH pod. For Omnipod 5, switch the pod type first (pod
-  panel, or `pod type o5`).
+  panel, or `pod mode o5`).
 
 Use a **test phone**, never one that runs a real sensor or pod.
 
@@ -200,20 +201,34 @@ Glucose and `algo` changes take effect at the next 5-minute reading. After `forg
 
 ### Console commands: Omnipod pod
 
+The pod's commands are [loopkit/pod](https://github.com/loopkit/pod)'s, with the same
+names, values and limits as its control API. `pod <command> <value>` on the console is
+`{"command": "<command>", "value": <value>}` posted to `/pod/command`.
+
 | Command | What it does |
 |---|---|
-| `pod` | The pod's status |
-| `pod new` | Forget the pod and become a new, unpaired one of the same type |
-| `pod type dash` | Become a new, unpaired DASH pod |
-| `pod type o5` | Become a new, unpaired Omnipod 5 pod |
-| `pod reservoir 30` | Set the reservoir, 0 to 200 U |
-| `pod age 4200` | Set how long the pod has been active, in minutes |
-| `pod fault 20` | Raise a fault with that code. `pod fault 0` clears it. |
-| `pod alerts 4` | Raise alert slots (a bit mask, 0 to 255). `pod alerts 0` clears them. |
-| `pod selftest` | Check the pod's cryptography on this board |
+| `pod changeReservoir 45` | Set the reservoir, 0 to 200 U |
+| `pod setActiveTime 4200` | Set how long the pod has been active, in minutes (0 to 6000) |
+| `pod setAlerts 16` | Raise alert slots (a bit mask, 0 to 255). `pod setAlerts 0` clears them. |
+| `pod setFault 20` | Raise a fault with that code. `pod setFault 0` clears it. |
+| `pod crashNextCommand before` | Restart the board before it processes the next command that changes delivery, leaving the phone without an answer. `after` restarts once it has processed it. (`"beforeProcessing": true` or `false` in the API.) |
+| `pod ignoreNextMessages 3` | Keep the link up but leave that many messages unanswered (0 to 100), as a pod that didn't hear them would |
+| `pod failNextConnects 2 7` | Accepted and refused, as loopkit/pod refuses it over real Bluetooth: it needs loopkit/pod's ImpossiBLE transport, because a real radio cannot leave service discovery unanswered |
 
-`pod new` and `pod type` end the pod the app is using: discard it in the app, then pair
-the new one.
+loopkit/pod takes its remaining choices as flags when it starts. A board has no command
+line, so they are console commands here:
+
+| Command | loopkit/pod | What it does |
+|---|---|---|
+| `pod` | `GET /status` | The pod's status |
+| `pod fresh` | `-fresh` | Forget the pod and become a new, unpaired one of the same type |
+| `pod mode dash` | `-mode dash -fresh` | Become a new, unpaired DASH pod |
+| `pod mode o5` | `-mode o5 -fresh` | Become a new, unpaired Omnipod 5 pod |
+| `pod selftest` | none | Check the pod's cryptography on this board |
+
+`pod fresh` and `pod mode` end the pod the app is using: discard it in the app, then pair
+the new one. The names this console used before (`pod new`, `type`, `reservoir`, `age`,
+`fault`, `alerts`) still work.
 
 ### Console commands: the board
 
@@ -286,7 +301,7 @@ need the board free: one phone or computer can be connected at a time.
 
 | Path | What |
 |---|---|
-| `lib/dashpod/` | ESP-Sim's pod core, unmodified (GPL-3.0-or-later) |
+| `lib/dashpod/` | ESP-Sim's pod core with two commands added (GPL-3.0-or-later) |
 | `src/pod.cpp` | The pod's clock, storage and task |
 | `src/radio.cpp` | One Bluetooth device for both |
 | `src/sensor.cpp`, `handler.cpp`, `crypto.cpp` | The G7 (from g7simESP32) |

@@ -192,6 +192,7 @@ typedef struct {
     const dash_io_t *io;
     bool connected;
     int crash_next;     /* 0, or DASH_CRASH_BEFORE / DASH_CRASH_AFTER */
+    int ignore_messages; /* messages left to leave unanswered (ignoreNextMessages) */
     uint8_t adv_fault, adv_alerts;
     bool adv_valid;
     uint8_t rx_buf[DASH_MSG_MAX + 48]; /* the link layer's reassembly */
@@ -215,6 +216,9 @@ void dash_pod_set_alerts(dash_pod_t *p, uint8_t mask);
 void dash_pod_set_fault(dash_pod_t *p, uint8_t fault);
 void dash_pod_set_active_time(dash_pod_t *p, int minutes);
 void dash_pod_crash_next(dash_pod_t *p, bool before_processing);
+/* Stay connected but leave the next count messages unanswered, as a pod
+ * that didn't hear them would. */
+void dash_pod_ignore_next_messages(dash_pod_t *p, int count);
 /* Forget the pod (pairing, delivery, everything) and start as a new one. */
 void dash_pod_reset(dash_pod_t *p);
 /* Become a new pod of another type (DASH or Omnipod 5). */
