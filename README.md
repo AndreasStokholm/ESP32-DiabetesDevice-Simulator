@@ -46,7 +46,7 @@ flash.
    *USB JTAG/serial debug unit*.
 3. Choose **Install**. Tick *Erase device* for a fresh start; leave it unticked to update a
    board and keep its paired sensor and pod.
-4. When it finishes, close the installer and press **Show my board's details**. The page
+4. When it finishes, close the installer and press **Connect to the board**. The page
    reads the G7's name and 4-digit **pairing code**, the pod type, and the board's Wi‑Fi
    name and password straight from the board. (`status` on the console shows the same.)
 
@@ -123,6 +123,15 @@ its readings collected every 5 minutes.
 Use a **test phone**, never one that runs a real sensor or pod.
 
 ## Control
+
+**Over USB, with buttons (no Wi‑Fi needed).** Open **https://loudestnoi.se/esp-sim/** in
+Chrome or Edge, press **Connect to the board** and pick its port. The page shows the
+pairing code, the latest reading and the pod, and has buttons for test situations: steady,
+low, high, wave and random-walk glucose; sensor states such as warmup, a temporary sensor
+issue or a failed sensor; pod reservoir, alerts, age and an occlusion fault; and starting
+a new sensor or pod. Below the buttons is the board's log and a box for typing any
+[command](#commands). Close other serial monitors first: only one program can use the
+port.
 
 **Web panels.** With no Wi‑Fi network saved, the board runs its own access point,
 `ESP-Sim-XXXX`; its password is printed on the console at boot. Join it and open

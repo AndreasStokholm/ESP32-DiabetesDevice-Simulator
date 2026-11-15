@@ -6,9 +6,9 @@
 <title>ESP-Sim flasher</title>
 <meta name="description" content="Flash the ESP-Sim Omnipod pod + Dexcom G7 simulator onto an ESP32-S3 from your browser.">
 <style>
-  :root { --bg:#f6f7f9; --card:#fff; --line:#dfe3e8; --fg:#1b1f24; --mut:#5c6670; --accent:#0b62d6; --accent-fg:#fff; --warn-bg:#fff6e0; --warn-line:#e6b94a; --code:#eef1f4; }
+  :root { --bg:#f6f7f9; --card:#fff; --line:#dfe3e8; --fg:#1b1f24; --mut:#5c6670; --accent:#0b62d6; --accent-fg:#fff; --warn-bg:#fff6e0; --warn-line:#e6b94a; --code:#eef1f4; --danger:#c22a2a; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#14161a; --card:#1d2026; --line:#2b2f37; --fg:#e8eaed; --mut:#9aa0aa; --accent:#4f9cf8; --accent-fg:#0b0d10; --warn-bg:#2b2412; --warn-line:#8a6a1c; --code:#262a31; }
+    :root { --bg:#14161a; --card:#1d2026; --line:#2b2f37; --fg:#e8eaed; --mut:#9aa0aa; --accent:#4f9cf8; --accent-fg:#0b0d10; --warn-bg:#2b2412; --warn-line:#8a6a1c; --code:#262a31; --danger:#ff7b72; }
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 -apple-system,"Segoe UI",Roboto,sans-serif; }
@@ -35,6 +35,20 @@
   dt { color:var(--mut); font-size:14px; }
   dd { margin:0; font-weight:600; overflow-wrap:anywhere; }
   dd.big { font-size:30px; letter-spacing:.12em; line-height:1.1; }
+  h3 { font-size:14px; margin:20px 0 8px; color:var(--mut); text-transform:uppercase; letter-spacing:.05em; }
+  .btns { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .btns button, .btns input, .btns select { font:inherit; font-size:14px; padding:8px 12px; border:1px solid var(--line); border-radius:9px; background:var(--card); color:var(--fg); }
+  .btns button { cursor:pointer; font-weight:600; }
+  .btns button:hover { border-color:var(--accent); }
+  .btns button.danger { color:var(--danger); }
+  .btns input { width:76px; }
+  .btns label { font-size:13px; color:var(--mut); }
+  fieldset { border:0; margin:0; padding:0; min-width:0; }
+  fieldset:disabled { opacity:.45; }
+  fieldset:disabled button { cursor:default; }
+  .note { color:var(--mut); font-size:13px; margin:8px 0 0; }
+  #log { background:var(--code); border-radius:9px; padding:10px 12px; height:220px; overflow:auto; font:12px/1.45 ui-monospace,Menlo,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; margin:0 0 8px; }
+  #cmd { flex:1; width:auto; min-width:140px; font-family:ui-monospace,Menlo,Consolas,monospace; }
   footer { color:var(--mut); font-size:13px; margin-top:24px; }
 </style>
 </head>
@@ -66,16 +80,89 @@
     <p class="meta">Firmware <span id="ver">…</span></p>
   </div>
 
-  <div class="card" id="details-card">
-    <h2>After installing: your board's details</h2>
-    <p>Each board makes its own sensor and pod. Close the installer, then read the pairing code straight from the board.</p>
-    <p><button id="details-btn" class="secondary">Show my board's details</button> <span id="details-msg" class="meta"></span></p>
+  <div class="card" id="control-card">
+    <h2>Control the board over USB</h2>
+    <p>See the pairing code and trigger test situations straight over the cable. No Wi‑Fi needed. Close the installer first; only one thing can use the port at a time.</p>
+    <p><button id="connect-btn" class="secondary">Connect to the board</button> <span id="conn-msg" class="meta"></span></p>
     <dl id="details" hidden>
       <dt>G7 sensor</dt><dd id="d-name"></dd>
       <dt>G7 pairing code</dt><dd id="d-code" class="big"></dd>
+      <dt>Latest reading</dt><dd id="d-latest"></dd>
+      <dt>Glucose pattern</dt><dd id="d-mode"></dd>
       <dt>Pod</dt><dd id="d-pod"></dd>
       <dt>Board's Wi‑Fi</dt><dd id="d-wifi"></dd>
     </dl>
+    <fieldset id="controls" disabled>
+      <h3>CGM glucose</h3>
+      <div class="btns">
+        <button data-cmd="glucose fixed 110">Steady 110</button>
+        <button data-cmd="glucose fixed 65">Low 65</button>
+        <button data-cmd="glucose fixed 45">Urgent low 45</button>
+        <button data-cmd="glucose fixed 250">High 250</button>
+        <button data-cmd="glucose fixed 380">Very high 380</button>
+        <button data-cmd="glucose sine 120 50 90">Wave 120 ± 50, 90 min</button>
+        <button data-cmd="glucose walk 120">Random walk</button>
+      </div>
+      <div class="btns" style="margin-top:8px">
+        <select id="g-kind" aria-label="Pattern"><option value="fixed">Steady</option><option value="sine">Wave</option><option value="walk">Random walk</option></select>
+        <label>mg/dL <input id="g-value" type="number" min="40" max="400" value="120"></label>
+        <label class="g-sine" hidden>± <input id="g-amp" type="number" min="0" max="180" value="50"></label>
+        <label class="g-sine" hidden>every (min) <input id="g-period" type="number" min="10" max="1440" value="90"></label>
+        <button id="g-set">Set</button>
+      </div>
+      <p class="note">The sensor makes a reading every 5 minutes, like a real G7. A change shows up at the next reading<span id="next-in"></span>.</p>
+
+      <h3>Sensor state</h3>
+      <div class="btns">
+        <button data-cmd="algo 0">Normal</button>
+        <button data-cmd="algo 2">Warmup</button>
+        <button data-cmd="algo 18">Temporary sensor issue</button>
+        <button data-cmd="algo 3">Excess noise</button>
+        <button data-cmd="algo 24">Expired</button>
+        <button data-cmd="algo 25">Sensor failed</button>
+      </div>
+      <p class="note">Every reading reports this state until you press Normal.</p>
+
+      <h3>Pod</h3>
+      <div class="btns">
+        <button data-cmd="pod reservoir 200">Reservoir full</button>
+        <button data-cmd="pod reservoir 30">Reservoir 30 U</button>
+        <button data-cmd="pod reservoir 5">Reservoir 5 U</button>
+        <button data-cmd="pod reservoir 0">Reservoir empty</button>
+      </div>
+      <div class="btns" style="margin-top:8px">
+        <button data-cmd="pod alerts 16">Low reservoir alert</button>
+        <button data-cmd="pod alerts 8">Expiration reminder</button>
+        <button data-cmd="pod alerts 4">Shutdown imminent</button>
+        <button data-cmd="pod alerts 0">Clear alerts</button>
+      </div>
+      <div class="btns" style="margin-top:8px">
+        <button data-cmd="pod age 4290">Age 71.5 h</button>
+        <button data-cmd="pod age 4320">Age 72 h (expires)</button>
+        <button data-cmd="pod age 4740">Age 79 h</button>
+        <button class="danger" data-cmd="pod age 4800" data-confirm="Set the pod's age to 80 hours? It faults at the next command and the app will ask you to replace it.">Age 80 h (shuts down)</button>
+      </div>
+      <div class="btns" style="margin-top:8px">
+        <button class="danger" data-cmd="pod fault 20" data-confirm="Raise an occlusion fault? The app will ask you to replace the pod.">Occlusion fault</button>
+        <button data-cmd="pod fault 0">Clear fault</button>
+      </div>
+
+      <h3>Start over</h3>
+      <div class="btns">
+        <button class="danger" data-cmd="forget" data-confirm="Unpair every phone from the G7 sensor? You'll pair it in the app again with the same code.">Unpair the sensor</button>
+        <button class="danger" data-cmd="new" data-confirm="Replace the sensor with a new one? It gets a new name and pairing code, and the board restarts.">New sensor</button>
+        <button class="danger" data-cmd="pod type dash" data-confirm="Replace the pod with a new, unpaired DASH pod? Discard the current pod in the app first.">New DASH pod</button>
+        <button class="danger" data-cmd="pod type o5" data-confirm="Replace the pod with a new, unpaired Omnipod 5 pod? Discard the current pod in the app first.">New Omnipod 5 pod</button>
+      </div>
+
+      <h3>Console</h3>
+      <pre id="log" aria-label="Board log"></pre>
+      <form id="cmd-form" class="btns">
+        <input id="cmd" placeholder="Type a command, e.g. help" autocomplete="off" spellcheck="false" aria-label="Command">
+        <button>Send</button>
+        <button type="button" data-cmd="status">Refresh</button>
+      </form>
+    </fieldset>
   </div>
 
   <div class="card">
@@ -84,7 +171,7 @@
       <li>Plug the board into the computer and press <strong>Connect and install</strong>.</li>
       <li>Pick the board's port. It is usually listed as <em>USB JTAG/serial debug unit</em>.</li>
       <li>Choose <strong>Install</strong>. Tick <em>Erase device</em> for a fresh start; leave it unticked to update a board and keep its paired sensor and pod.</li>
-      <li>When it finishes, close the installer and press <strong>Show my board's details</strong> above. It shows the G7's name and 4-digit <strong>pairing code</strong>, the pod type, and the board's Wi‑Fi name and password.</li>
+      <li>When it finishes, close the installer and press <strong>Connect to the board</strong> above. It shows the G7's name and 4-digit <strong>pairing code</strong> and the pod type, and gives you buttons for test situations: lows, highs, sensor errors, pod alerts and faults.</li>
       <li>In the app, pair an Omnipod DASH pod and add a Dexcom G7 with that code.</li>
     </ol>
   </div>
@@ -95,7 +182,7 @@
       <li><strong>No port listed:</strong> try another cable or USB port. If the board has two USB sockets, use the one marked <em>USB</em>, not <em>UART</em> or <em>COM</em>.</li>
       <li><strong>Stuck on "Preparing installation", or it won't connect:</strong> the board hasn't entered download mode. Close the dialog, hold the board's <strong>BOOT</strong> button, tap <strong>RESET</strong>, release BOOT, then reload this page and try again. After installing, press RESET once to start the firmware.</li>
       <li><strong>Nothing after installing:</strong> press RESET, or unplug the board and plug it back in.</li>
-      <li>The console accepts commands. Type <code>help</code> for the list, <code>status</code> for the pairing code.</li>
+      <li><strong>"The port is busy":</strong> something else has the board open: the installer window, another tab, or a serial monitor in a terminal. Close it and connect again.</li>
     </ul>
   </div>
 
@@ -105,80 +192,185 @@
 </main>
 <script type="module" src="vendor/esp-web-tools/install-button.js?module"></script>
 <script>
-  // Reads the board's own details over USB: sends the console's `status`
-  // command and picks the answers out of the reply (or out of the boot log,
-  // if opening the port restarted the board).
-  function parseBoardDetails(text) {
-    const pick = (...res) => { for (const re of res) { const m = text.match(re); if (m) return m[1]; } return null; };
-    const d = {
-      name: pick(/"name":\s*"([^"]+)"/, /\b(DX[A-Z0-9]{2}[a-z]{2}) \(/),
-      code: pick(/"code":\s*"(\d{4})"/, /PAIRING CODE (\d{4})/),
-      podType: pick(/"podType":\s*"([^"]+)"/, /pod: (?:a new|restored the) (DASH|Omnipod 5) pod/),
-      podPaired: null, reservoir: pick(/"reservoir":\s*([\d.]+)/),
-      apName: pick(/access point "([^"]+)"/, /access point ([^\s):,]+)/),
-      apPassword: pick(/password "([^"]+)"/),
-      webUrl: pick(/web: (http:\/\/[\d.]+\/)/),
-    };
-    const paired = pick(/"paired":\s*(true|false)/);
-    if (paired) d.podPaired = paired === 'true';
-    else if (/pod: [^\n]*not paired/.test(text)) d.podPaired = false;
-    else if (/pod: restored[^\n]*: paired/.test(text)) d.podPaired = true;
-    return d;
+  // Control panel: holds the board's USB serial port open, shows its log,
+  // sends console commands from the buttons, and reads the answers to `status`.
+  const $ = id => document.getElementById(id);
+  const STATES = { 1:'Stopped', 2:'Warmup', 3:'Excess noise', 6:'Normal', 7:'Needs calibration', 15:'Session expired', 18:'Temporary sensor issue', 24:'Expired', 25:'Sensor failed' };
+  const ALERTS = ['Auto-off', 'Unused', 'Shutdown imminent', 'Expiration reminder', 'Low reservoir', 'Suspended reminder', 'Suspend expired', 'Lifecycle'];
+  const board = { sensor: null, pod: null, ap: null, web: null, bootCode: null, nextAt: 0 };
+  let port = null, reader = null, writer = null, pending = '', logText = '', retry = null;
+
+  // Picks what it can out of the console text: the pretty-printed sensor
+  // status, the one-line pod status, and the Wi-Fi line.
+  function parseBoardText(text) {
+    const out = {};
+    const last = re => { let m, r = null; while ((m = re.exec(text))) r = m; return r; };
+    let m = last(/(?:^|\n)(\{\n[\s\S]*?\n\})\n/g);
+    if (m) try { out.sensor = JSON.parse(m[1]); } catch (e) {}
+    m = last(/(?:^|\n)pod: (\{.*\})\n/g);
+    if (m) try { out.pod = JSON.parse(m[1]); } catch (e) {}
+    m = last(/access point "([^"]+)", password "([^"]+)"/g);
+    if (m) out.ap = { name: m[1], password: m[2] };
+    m = last(/(?:^|\n)web: (http:\/\/[\d.]+\/)/g);
+    if (m) out.web = m[1];
+    m = last(/PAIRING CODE (\d{4})/g);
+    if (m) out.bootCode = m[1];
+    return out;
   }
 
-  async function readBoard() {
-    const port = await navigator.serial.requestPort();
-    await port.open({ baudRate: 115200 });
-    let text = '';
-    const reader = port.readable.getReader();
+  function arrow(t) { return t > 3 ? '⇈' : t > 2 ? '↑' : t > 1 ? '↗' : t >= -1 ? '→' : t >= -2 ? '↘' : t >= -3 ? '↓' : '⇊'; }
+
+  function render() {
+    const s = board.sensor, p = board.pod;
+    if (!s && !p && !board.bootCode) return;
+    $('details').hidden = false;
+    if (s) {
+      $('d-name').textContent = s.name;
+      $('d-code').textContent = s.code;
+      const l = s.latest, g = s.glucoseMode || {};
+      $('d-latest').textContent = !l ? 'none yet'
+        : (l.glucose != null ? l.glucose + ' mg/dL' + (l.trend != null ? ' ' + arrow(l.trend) : '') : 'no glucose')
+          + (l.state !== 6 ? ' · ' + (STATES[l.state] || 'state ' + l.state) : '');
+      $('d-mode').textContent = (g.kind === 'fixed' ? 'Steady ' + g.value
+        : g.kind === 'sine' ? 'Wave ' + g.value + ' ± ' + g.amplitude + ' every ' + g.periodMinutes + ' min'
+        : g.kind === 'walk' ? 'Random walk around ' + g.value : g.kind)
+        + (g.algorithmState ? ' · reporting ' + (STATES[g.algorithmState] || 'state ' + g.algorithmState) : '');
+    } else if (board.bootCode) {
+      $('d-code').textContent = board.bootCode;
+    }
+    if (p) {
+      const alerts = ALERTS.filter((_, i) => p.alerts & (1 << i));
+      $('d-pod').textContent = [p.podType, p.paired ? 'paired' : 'not paired yet',
+        p.reservoir != null ? Number(p.reservoir) + ' U' : null,
+        alerts.length ? 'alerts: ' + alerts.join(', ') : null,
+        p.fault ? 'FAULT ' + p.fault : null].filter(Boolean).join(' · ');
+    }
+    $('d-wifi').textContent = board.web ? 'On your network: ' + board.web
+      : board.ap ? 'Network "' + board.ap.name + '", password "' + board.ap.password + '", then open http://192.168.4.1/'
+      : '—';
+  }
+
+  setInterval(() => {
+    const left = Math.round((board.nextAt - Date.now()) / 1000);
+    $('next-in').textContent = port && board.nextAt && left > 0 && left <= 300
+      ? ', in about ' + Math.floor(left / 60) + ':' + String(left % 60).padStart(2, '0') : '';
+  }, 1000);
+
+  function onText(chunk) {
+    chunk = chunk.replace(/\r/g, '');
+    const log = $('log'), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+    logText = (logText + chunk).slice(-30000);
+    log.textContent = logText;
+    if (atEnd) log.scrollTop = log.scrollHeight;
+
+    pending += chunk;
+    const cut = pending.lastIndexOf('\n');
+    if (cut < 0) return;
+    const found = parseBoardText(pending.slice(0, cut + 1));
+    // Keep an unfinished status block for the next chunk; drop the rest.
+    const open = pending.lastIndexOf('\n{\n');
+    const closed = pending.lastIndexOf('\n}\n');
+    pending = open > closed ? pending.slice(open) : pending.slice(cut);
+    if (/(?:^|\n)reading \d+:/.test(chunk)) setTimeout(() => send('status', true), 300);
+    if (found.sensor) {
+      const l = found.sensor.latest;
+      board.nextAt = l ? Date.now() + (l.time + 300 - found.sensor.ageSeconds) * 1000 : 0;
+      clearInterval(retry);
+      $('conn-msg').textContent = 'Connected.';
+    }
+    Object.assign(board, found);
+    render();
+  }
+
+  async function send(cmd, quiet) {
+    if (!writer) return;
     try {
-      const writer = port.writable.getWriter();
-      await writer.write(new TextEncoder().encode('\nstatus\n'));
-      writer.releaseLock();
-      const decoder = new TextDecoder();
-      const stop = setTimeout(() => reader.cancel().catch(() => {}), 5000);
+      await writer.write(new TextEncoder().encode(cmd + '\n'));
+    } catch (e) { return; }
+    // Glucose and state commands answer with one log line; ask for the full picture.
+    if (!quiet && /^(glucose|algo|forget)\b/.test(cmd)) setTimeout(() => send('status', true), 400);
+  }
+
+  async function readLoop() {
+    const decoder = new TextDecoder();
+    try {
       for (;;) {
         const { value, done } = await reader.read();
         if (done) break;
-        text += decoder.decode(value, { stream: true });
-        if (/"code":/.test(text) && /pod: \{[^\n]*\}\s*\n/.test(text)) break;
+        onText(decoder.decode(value, { stream: true }));
       }
-      clearTimeout(stop);
-    } finally {
-      try { await reader.cancel(); } catch (e) {}
-      reader.releaseLock();
-      await port.close();
-    }
-    return text;
+    } catch (e) {}
+    disconnect('The board disconnected. If it restarted, connect again.');
   }
 
-  const btn = document.getElementById('details-btn'), msg = document.getElementById('details-msg');
-  if (!('serial' in navigator)) {
-    btn.disabled = true;
-    msg.textContent = 'Needs Chrome or Edge on a computer.';
+  async function connect() {
+    const p = await navigator.serial.requestPort();
+    await p.open({ baudRate: 115200 });
+    port = p;
+    reader = port.readable.getReader();
+    writer = port.writable.getWriter();
+    pending = '\n';
+    $('controls').disabled = false;
+    $('connect-btn').textContent = 'Disconnect';
+    $('conn-msg').textContent = 'Connected. Asking the board for its details…';
+    readLoop();
+    // Opening the port can restart the board, so ask until it answers.
+    let tries = 0;
+    const ask = () => { if (++tries > 6) { clearInterval(retry); if (!board.sensor) $('conn-msg').textContent = 'Connected, but the board is not answering. Press its RESET button.'; } else send('status', true); };
+    setTimeout(ask, 300);
+    clearInterval(retry);
+    retry = setInterval(ask, 2500);
   }
-  btn.onclick = async () => {
-    btn.disabled = true;
-    msg.textContent = 'Reading from the board…';
+
+  async function disconnect(why) {
+    if (!port) return;
+    const p = port, r = reader, w = writer;
+    port = reader = writer = null;
+    clearInterval(retry);
+    $('controls').disabled = true;
+    $('connect-btn').textContent = 'Connect to the board';
+    $('conn-msg').textContent = why || 'Disconnected.';
+    try { await r.cancel(); } catch (e) {}
+    try { r.releaseLock(); } catch (e) {}
+    try { w.releaseLock(); } catch (e) {}
+    try { await p.close(); } catch (e) {}
+  }
+
+  if (!('serial' in navigator)) {
+    $('connect-btn').disabled = true;
+    $('conn-msg').textContent = 'Needs Chrome or Edge on a computer.';
+  }
+  $('connect-btn').onclick = async () => {
+    if (port) return disconnect();
     try {
-      const d = parseBoardDetails(await readBoard());
-      if (!d.code) throw new Error('The board did not answer. Press its RESET button and try again.');
-      const set = (id, v) => { document.getElementById(id).textContent = v; };
-      set('d-name', d.name || 'unknown');
-      set('d-code', d.code);
-      set('d-pod', (d.podType || 'unknown') + (d.podPaired === null ? '' : d.podPaired ? ', paired' : ', not paired yet')
-        + (d.reservoir ? ', ' + Number(d.reservoir) + ' U' : ''));
-      set('d-wifi', d.webUrl ? 'On your network: ' + d.webUrl
-        : d.apName ? 'Network "' + d.apName + '"' + (d.apPassword ? ', password "' + d.apPassword + '", then open http://192.168.4.1/' : ' (password is in the console log at start-up)')
-        : 'not available');
-      document.getElementById('details').hidden = false;
-      msg.textContent = '';
+      await connect();
     } catch (e) {
-      msg.textContent = e.name === 'NotFoundError' ? 'No port picked.'
-        : e.name === 'InvalidStateError' || e.name === 'NetworkError' ? 'The port is busy. Close the installer window first, then try again.'
+      $('conn-msg').textContent = e.name === 'NotFoundError' ? 'No port picked.'
+        : e.name === 'InvalidStateError' || e.name === 'NetworkError' ? 'The port is busy. Close the installer window, other tabs and any serial monitor, then try again.'
         : e.message;
     }
-    btn.disabled = false;
+  };
+  // The installer needs the port to itself.
+  document.querySelector('esp-web-install-button').addEventListener('click', () => disconnect('Disconnected for the installer.'), true);
+
+  $('controls').addEventListener('click', e => {
+    const b = e.target.closest('button[data-cmd]');
+    if (!b) return;
+    if (b.dataset.confirm && !confirm(b.dataset.confirm)) return;
+    send(b.dataset.cmd);
+  });
+  const sineOnly = () => document.querySelectorAll('.g-sine').forEach(el => { el.hidden = $('g-kind').value !== 'sine'; });
+  $('g-kind').onchange = sineOnly;
+  sineOnly();
+  $('g-set').onclick = () => {
+    const kind = $('g-kind').value, v = Math.min(400, Math.max(40, +$('g-value').value || 120));
+    send(kind === 'sine' ? `glucose sine ${v} ${+$('g-amp').value || 0} ${+$('g-period').value || 240}` : `glucose ${kind} ${v}`);
+  };
+  $('cmd-form').onsubmit = e => {
+    e.preventDefault();
+    const c = $('cmd').value.trim();
+    if (c) send(c);
+    $('cmd').value = '';
   };
 
   fetch('manifest.json').then(r => r.json()).then(m => {
