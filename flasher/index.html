@@ -124,6 +124,10 @@
       <p class="note">Every reading reports this state until you press Normal.</p>
 
       <h3>Pod</h3>
+      <div class="btns" style="margin-bottom:8px">
+        <span id="pod-type-now">Pod type: reading…</span>
+        <button class="danger" id="pod-type-btn" disabled>Switch</button>
+      </div>
       <div class="btns">
         <button data-cmd="pod changeReservoir 200">Reservoir full</button>
         <button data-cmd="pod changeReservoir 30">Reservoir 30 U</button>
@@ -158,8 +162,7 @@
       <div class="btns">
         <button class="danger" data-cmd="forget" data-confirm="Unpair every phone from the G7 sensor? You'll pair it in the app again with the same code.">Unpair the sensor</button>
         <button class="danger" data-cmd="new" data-confirm="Replace the sensor with a new one? It gets a new name and pairing code, and the board restarts.">New sensor</button>
-        <button class="danger" data-cmd="pod mode dash" data-confirm="Replace the pod with a new, unpaired DASH pod? Discard the current pod in the app first.">New DASH pod</button>
-        <button class="danger" data-cmd="pod mode o5" data-confirm="Replace the pod with a new, unpaired Omnipod 5 pod? Discard the current pod in the app first.">New Omnipod 5 pod</button>
+        <button class="danger" data-cmd="pod fresh" data-confirm="Replace the pod with a new, unpaired one of the same type? Discard the current pod in the app first.">New pod</button>
       </div>
 
       <h3>Console</h3>
@@ -179,7 +182,7 @@
       <li>Pick the board's port. It is usually listed as <em>USB JTAG/serial debug unit</em>.</li>
       <li>Choose <strong>Install</strong>. Tick <em>Erase device</em> for a fresh start; leave it unticked to update a board and keep its paired sensor and pod.</li>
       <li>When it finishes, close the installer and press <strong>Connect to the board</strong> above. It shows the G7's name and 4-digit <strong>pairing code</strong> and the pod type, and gives you buttons for test situations: lows, highs, sensor errors, pod alerts and faults.</li>
-      <li>In the app, pair an Omnipod DASH pod and add a Dexcom G7 with that code.</li>
+      <li>In the app, pair an Omnipod 5 pod and add a Dexcom G7 with that code. A new board is an Omnipod 5; to test DASH, press <strong>Switch to DASH</strong> in the panel above first.</li>
     </ol>
   </div>
 
@@ -251,6 +254,12 @@
         p.reservoir != null ? Number(p.reservoir) + ' U' : null,
         alerts.length ? 'alerts: ' + alerts.join(', ') : null,
         p.fault ? 'FAULT ' + p.fault : null].filter(Boolean).join(' · ');
+    }
+    if (p) {
+      const o5 = p.podType === 'Omnipod 5';
+      $('pod-type-now').textContent = 'Pod type: ' + (o5 ? 'Omnipod 5' : 'Omnipod DASH') + (p.paired ? ', paired' : ', not paired yet');
+      $('pod-type-btn').textContent = 'Switch to ' + (o5 ? 'DASH' : 'Omnipod 5');
+      $('pod-type-btn').disabled = false;
     }
     $('d-wifi').textContent = board.web ? 'On your network: ' + board.web
       : board.ap ? 'Network "' + board.ap.name + '", password "' + board.ap.password + '", then open http://192.168.4.1/'
@@ -366,6 +375,16 @@
     if (b.dataset.confirm && !confirm(b.dataset.confirm)) return;
     send(b.dataset.cmd);
   });
+  // One button that offers the other pod type. Switching starts a new,
+  // unpaired pod, so a paired one gets a stronger warning.
+  $('pod-type-btn').onclick = () => {
+    const p = board.pod;
+    if (!p) return;
+    const o5 = p.podType === 'Omnipod 5', next = o5 ? 'DASH' : 'Omnipod 5';
+    if (!confirm((p.paired ? 'This ' + p.podType + ' pod is paired with a phone, and switching ends it. Discard it in the app first.\n\n' : '')
+      + 'Become a new, unpaired ' + next + ' pod?')) return;
+    send('pod mode ' + (o5 ? 'dash' : 'o5'));
+  };
   const sineOnly = () => document.querySelectorAll('.g-sine').forEach(el => { el.hidden = $('g-kind').value !== 'sine'; });
   $('g-kind').onchange = sineOnly;
   sineOnly();

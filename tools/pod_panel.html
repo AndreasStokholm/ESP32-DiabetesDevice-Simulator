@@ -121,10 +121,9 @@
 
   <section class="card" aria-labelledby="h-type">
     <h2 id="h-type">Pod type</h2>
-    <label for="typeIn">Simulate</label>
-    <select id="typeIn"><option value="0">Omnipod DASH</option><option value="1">Omnipod 5</option></select>
-    <div class="actions"><button class="danger" id="typeSet">Switch to a new pod of this type</button></div>
-    <div class="muted" style="margin-top:8px">Switching forgets the current pod. Omnipod 5 pairs with apps whose OmnipodKit supports it, such as Loop 3.14.7 and Trio 1.0 or later.</div>
+    <div id="typeNow">This is a pod.</div>
+    <div class="actions"><button class="danger" id="typeSet" disabled>Switch</button></div>
+    <div class="muted" style="margin-top:8px">A new board starts as an Omnipod 5. Switching forgets the current pod and starts a new, unpaired one of the other type: discard the current pod in the app first. Omnipod 5 pairs with apps whose OmnipodKit supports it, such as Loop 3.14.7 and Trio 1.0 or later.</div>
   </section>
 
   <section class="card" aria-labelledby="h-newpod">
@@ -316,9 +315,10 @@ $('faultClear').onclick = ()=>send({command:'setFault', value:0}, 'Fault cleared
 $('crashBefore').onclick = ()=>send({command:'crashNextCommand', beforeProcessing:true}, 'Armed');
 $('crashAfter').onclick = ()=>send({command:'crashNextCommand', beforeProcessing:false}, 'Armed');
 
-$('typeSet').onclick = ()=>{ const v=+$('typeIn').value, name=v ? 'Omnipod 5' : 'DASH';
-  if(confirm('Forget this pod and become a new '+name+' pod?')) { edited.type=false; send({command:'setPodType', value:v}, 'Now a new '+name+' pod'); } };
-$('typeIn').onchange = ()=>edited.type=true;
+$('typeSet').onclick = ()=>{ const o5 = last.podType === 'Omnipod 5', name = o5 ? 'DASH' : 'Omnipod 5';
+  if(confirm((last.paired ? 'This '+last.podType+' pod is paired with a phone, and switching ends it. Discard it in the app first.\n\n' : '')
+      +'Forget this pod and become a new, unpaired '+name+' pod?'))
+    send({command:'setPodType', value:o5 ? 0 : 1}, 'Now a new '+name+' pod'); };
 $('newPod').onclick = ()=>{ if(confirm('Forget this pod? The phone will need to pair a new one.')) send({command:'resetPod'}, 'New pod ready'); };
 async function wifi(body, done){
   try { const r = await fetch('/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -331,7 +331,9 @@ function chip(el, text, cls){ el.textContent=text; el.className='chip '+(cls||''
 function show(s){
   last = s;
   $('title').textContent = (s.podType || 'DASH') + ' pod';
-  if(!edited.type) $('typeIn').value = s.podType === 'Omnipod 5' ? '1' : '0';
+  $('typeNow').textContent = 'This is an '+(s.podType === 'Omnipod 5' ? 'Omnipod 5' : 'Omnipod DASH')+' pod, '+(s.paired ? 'paired with a phone.' : 'not paired yet.');
+  $('typeSet').textContent = 'Switch to '+(s.podType === 'Omnipod 5' ? 'DASH' : 'Omnipod 5');
+  $('typeSet').disabled = false;
   $('podid').textContent = s.id ? 'id '+s.id : (s.paired ? '' : 'not paired');
   chip($('link'), s.connected ? 'connected' : 'not connected', s.connected ? 'ok' : '');
   $('reservoir').textContent = Math.round(s.reservoir*100)/100;

@@ -1,5 +1,5 @@
 """Builds src/pod_html.h from ESP-Sim's control panel (tools/pod_panel.html,
-main/panel.html in nightscout/ESP-Sim, unmodified): the pod's panel is served
+main/panel.html in nightscout/ESP-Sim, with a one-button pod type switch): the pod's panel is served
 under /pod here, beside the G7's at /."""
 import os, sys
 here = os.path.dirname(os.path.abspath(__file__))

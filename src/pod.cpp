@@ -130,7 +130,10 @@ void begin() {
          thePod.st.pod_type == DASH_POD_O5 ? "Omnipod 5" : "DASH", thePod.st.paired ? "paired" : "not paired",
          thePod.st.progress, thePod.st.reservoir * 0.05);
   } else {
-    logf("pod: a new DASH pod: not paired, 150 U (the pod panel switches it to Omnipod 5)");
+    // A board with no pod yet starts as an Omnipod 5. (The pod core's own
+    // default is a DASH; `pod mode dash` or either panel switches.)
+    dash_state_fresh(&thePod.st, io.now_ms(io.ctx), DASH_POD_O5);
+    logf("pod: a new Omnipod 5 pod: not paired, 150 U (pod mode dash, or either panel, switches it to DASH)");
     saveState(nullptr, &thePod.st);
   }
 }

@@ -118,8 +118,9 @@ its readings collected every 5 minutes.
 ## Pair
 
 - **G7:** add a Dexcom G7 in the app and enter the 4-digit pairing code the console prints.
-- **Pod:** pair a new Omnipod DASH pod. For Omnipod 5, switch the pod type first (pod
-  panel, or `pod mode o5`).
+- **Pod:** pair a new Omnipod 5 pod, which is what a new board starts as. For DASH, switch
+  the pod type first: the **Switch to DASH** button on either panel, or `pod mode dash`.
+  The button always offers the other type, and switching starts a new, unpaired pod.
 
 Use a **test phone**, never one that runs a real sensor or pod.
 
