@@ -62,11 +62,13 @@ static bool configFromJson(JsonVariantConst j, SensorConfig& c) {
 }
 
 static bool modeFromJson(JsonVariantConst j, GlucoseMode& m) {
+  // As g7sim decodes it: any kind but "fixed" and "walk" is a sine, and an
+  // omitted number is 0 (a sine's period of 0 means 240 minutes).
   m.kind = j["kind"] | "";
-  if (m.kind != "fixed" && m.kind != "sine" && m.kind != "walk") return false;
-  m.value = j["value"] | 120.0;
-  m.amplitude = j["amplitude"] | 50.0;
-  m.periodMinutes = j["periodMinutes"] | 240.0;
+  if (m.kind.empty()) return false;
+  m.value = j["value"] | 0.0;
+  m.amplitude = j["amplitude"] | 0.0;
+  m.periodMinutes = j["periodMinutes"] | 0.0;
   m.algorithmState = j["algorithmState"] | 0;
   return true;
 }
@@ -289,13 +291,13 @@ static void help() {
       "ESP-Sim + G7 console. Test equipment only: simulated data, no insulin.\n"
       "G7 sensor:\n"
       "  status                              sensor, pairing code, latest reading, slots\n"
-      "  glucose fixed <mg/dL>               a constant value\n"
-      "  glucose sine <mean> [amp] [period]  the default: 120 50 240 (period in minutes)\n"
-      "  glucose walk <target>               a mean-reverting random walk\n"
-      "  algo <state>                        report an algorithm state (0 normal, 18 temp issue, 25 failed...)\n"
-      "  forget                              drop every display's key (the next connection re-pairs)\n"
-      "  new [model=g7|oneplus|stelo] [code=1234] [serial=N] [age=MIN] [days=10|15]\n"
-      "      [lifetime=HOURS] [warmup=MIN]   start a new sensor (restarts)\n"
+      "  glucose {\"kind\":\"fixed\",\"value\":65}  g7sim's POST /glucose: kind fixed|sine|walk, value,\n"
+      "                                      amplitude, periodMinutes, algorithmState (18 temp issue, 25 failed)\n"
+      "  forget                              g7sim's POST /forget: drop every display's key\n"
+      "  new {\"model\":\"stelo\",\"code\":\"1234\"}   g7sim's POST /new (restarts): model g7|oneplus|stelo, days, code,\n"
+      "                                      serial, ageMinutes, lifetimeHours, warmupMinutes; or new key=value ...\n"
+      "  shorthand, keeping the algorithm state: glucose fixed <mg/dL> | glucose sine <mean> [amp] [period]\n"
+      "      | glucose walk <target> | algo <state>\n"
       "Omnipod pod:\n"
       "  pod                                 the pod's status\n"
       "  pod fresh                           forget the pod and start as a new, unpaired one\n"
@@ -333,10 +335,26 @@ static void command(const std::string& line) {
   const std::string& cmd = a[0];
   auto num = [&](size_t i, double def) { return i < a.size() ? atof(a[i].c_str()) : def; };
 
+  // What follows the command word, for the commands that take g7sim's JSON.
+  size_t sp = line.find_first_of(" \t");
+  std::string rest = sp == std::string::npos ? "" : line.substr(line.find_first_not_of(" \t", sp) == std::string::npos ? line.size() : line.find_first_not_of(" \t", sp));
+  bool jsonArg = !rest.empty() && rest[0] == '{';
+
   if (cmd == "help" || cmd == "?") {
     help();
   } else if (cmd == "status") {
     printStatus();
+  } else if (cmd == "glucose" && jsonArg) {
+    // g7sim's POST /glucose, body and all: the mode is replaced whole, so
+    // leaving out algorithmState returns the sensor to normal.
+    JsonDocument j;
+    GlucoseMode m;
+    if (deserializeJson(j, rest) || !modeFromJson(j, m)) {
+      Serial.println("bad glucose mode");
+      return;
+    }
+    sensor->setGlucoseMode(m);
+    logf("glucose mode now %s %.0f, algorithm state %u (from the next reading)", m.kind.c_str(), m.value, m.algorithmState);
   } else if (cmd == "glucose" && a.size() >= 2) {
     JsonDocument cur;
     sensor->status(cur);
@@ -366,7 +384,15 @@ static void command(const std::string& line) {
     logf("forgot every display's key");
   } else if (cmd == "new") {
     SensorConfig c;
-    for (size_t i = 1; i < a.size(); i++) {
+    JsonDocument j;
+    if (jsonArg) {  // g7sim's POST /new
+      if (deserializeJson(j, rest)) {
+        Serial.println("bad sensor config");
+        return;
+      }
+      configFromJson(j, c);
+    }
+    for (size_t i = 1; !jsonArg && i < a.size(); i++) {
       size_t eq = a[i].find('=');
       if (eq == std::string::npos) {
         Serial.printf("new: expected key=value, got %s\n", a[i].c_str());
@@ -376,10 +402,10 @@ static void command(const std::string& line) {
       if (k == "model") c.model = v;
       else if (k == "code") c.code = v;
       else if (k == "serial") c.serial = strtoull(v.c_str(), nullptr, 10);
-      else if (k == "age") c.ageMinutes = atof(v.c_str());
+      else if (k == "ageMinutes" || k == "age") c.ageMinutes = atof(v.c_str());
       else if (k == "days") c.days = atoi(v.c_str());
-      else if (k == "lifetime") c.lifetimeHours = atof(v.c_str());
-      else if (k == "warmup") c.warmupMinutes = atof(v.c_str());
+      else if (k == "lifetimeHours" || k == "lifetime") c.lifetimeHours = atof(v.c_str());
+      else if (k == "warmupMinutes" || k == "warmup") c.warmupMinutes = atof(v.c_str());
       else {
         Serial.printf("new: unknown key %s\n", k.c_str());
         return;

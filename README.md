@@ -180,24 +180,49 @@ Either way, start with `help` to list the commands, or `status` to see the pairi
 
 ### Console commands: G7 sensor
 
-| Command | What it does |
+The sensor's commands are [LoopKit/g7sim](https://github.com/LoopKit/g7sim)'s control
+API: the same four requests, with the same JSON fields. On the console, type the request's
+name followed by the body you would post to g7sim.
+
+| Console | g7sim | What it does |
+|---|---|---|
+| `status` | `GET /status` | Sensor name, pairing code, latest reading, plus the pod and Wi‑Fi details |
+| `glucose {"kind":"fixed","value":65}` | `POST /glucose` | Hold glucose at one value (mg/dL) |
+| `glucose {"kind":"sine","value":120,"amplitude":50,"periodMinutes":240}` | `POST /glucose` | Swing around 120 by ±50 over 240 minutes |
+| `glucose {"kind":"walk","value":140}` | `POST /glucose` | Drift randomly toward 140 |
+| `glucose {"kind":"fixed","value":120,"algorithmState":18}` | `POST /glucose` | Report a sensor error: 18 is a temporary issue, 25 a failed sensor |
+| `forget` | `POST /forget` | Unpair every phone from the sensor. It then advertises continuously until paired again. |
+| `new {"model":"stelo","code":"1234","ageMinutes":0}` | `POST /new` | Replace the sensor with a new one. The board restarts. |
+
+As in g7sim, `glucose` replaces the whole mode: a number you leave out is 0, and leaving
+out `algorithmState` returns the sensor to normal. `new` takes `model` (`g7`, `oneplus` or
+`stelo`), `days` (10 or 15), `code` (four digits), `serial`, `ageMinutes` (0 starts in
+warmup; the default is 120), `lifetimeHours` and `warmupMinutes`; anything left out picks
+g7sim's default. `new` alone makes a sensor with a random name and code.
+
+The same requests work over Wi‑Fi exactly as g7sim documents them, for example
+`curl -XPOST esp-sim.local/glucose -d '{"kind":"fixed","value":65}'`.
+
+Shorter forms for typing, which g7sim does not have:
+
+| Shorthand | What it does |
 |---|---|
+| `glucose fixed 55` | Hold glucose at one value, keeping the current algorithm state |
+| `glucose sine 120 50 90` | Mean, swing and period in minutes, keeping the algorithm state |
+| `glucose walk 120` | Random walk, keeping the algorithm state |
+| `algo 18` | Change only the algorithm state. `algo 0` returns to normal. |
+| `new code=1234 ageMinutes=0` | The fields of `new` as `key=value` |
 | `help` | List all commands |
-| `status` | Sensor name, pairing code, latest reading, pod state, Wi‑Fi details |
-| `glucose fixed 55` | Hold glucose at one value (mg/dL) |
-| `glucose sine 120 50 240` | Swing around 120 by ±50 over 240 minutes. This is the default. |
-| `glucose walk 120` | Drift randomly toward 120 |
-| `algo 18` | Report a sensor error: 18 is a temporary issue, 25 a failed sensor. `algo 0` returns to normal. |
-| `forget` | Unpair every phone from the sensor. It then advertises continuously until paired again. |
-| `new` | Start a new sensor with a random name and pairing code. The board restarts. |
-| `new code=1234 age=0` | A new sensor with options, in any combination (see below) |
 
-Options for `new`: `model=g7`, `oneplus` or `stelo`; `code=` four digits; `serial=` a
-number; `age=` minutes since activation (0 starts in warmup; the default is 120);
-`days=10` or `15`; `lifetime=` hours; `warmup=` minutes.
+Glucose changes take effect at the next 5-minute reading. After `forget` or `new`, pair
+the sensor in the app again.
 
-Glucose and `algo` changes take effect at the next 5-minute reading. After `forget` or
-`new`, pair the sensor in the app again.
+Not carried over from g7sim: `POST /force-quit` and the `-transport`, `-socket`,
+`-simulator`, `-relaunch`, `-suspend` and `-dylib` flags, which only apply to its iOS
+Simulator transport, and `-max-connections`, since the board serves one phone at a time.
+`/status` reports times as seconds of sensor age (`ageSeconds`, `lastSeenAgoSeconds`,
+`lockedForSeconds`) where g7sim gives clock times, because the board has no clock without
+Wi‑Fi.
 
 ### Console commands: Omnipod pod
 
