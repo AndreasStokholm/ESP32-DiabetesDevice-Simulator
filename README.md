@@ -136,19 +136,119 @@ and takes the time from NTP.
 The JSON APIs are the originals': g7sim's at `/status`, `/glucose`, `/forget`, `/new`, and
 ESP-Sim's under `/pod` (`/pod/status`, `/pod/command`, `/pod/wifi`).
 
-**Console** (USB serial; `help` lists everything):
+The console commands below do everything the panels do, and more.
+
+## Commands
+
+There are two kinds: commands you type **into the board's console** to control the
+simulators, and commands you run **on your computer** to build and flash.
+
+### Opening the board's console
+
+The board must be plugged in by USB. Only one program can use its port at a time, so
+close one console before opening another.
+
+**In a browser (Logs & Console).** Nothing to install; needs Chrome or Edge on a computer.
+
+1. Open **https://loudestnoi.se/esp-sim/** and press **Connect and install**.
+2. Pick the board's port, usually *USB JTAG/serial debug unit*.
+3. Choose **Logs & Console**. (Don't choose Install; that reflashes the board.)
+4. Type a command in the box at the bottom and press Enter. The reply appears in the log.
+5. Close the window when you're done, so the port is free again.
+
+**In a terminal.** Needs [PlatformIO](https://platformio.org) and a copy of this repo.
+
+```bash
+cd ESP-Sim
+pio device monitor
+```
+
+Type a command and press Enter. What you type may not be shown until you press Enter.
+Press **Ctrl+C** to quit.
+
+Either way, start with `help` to list the commands, or `status` to see the pairing code.
+
+### Console commands: G7 sensor
 
 | Command | What it does |
 |---|---|
-| `status` | Both devices: sensor, pairing code, latest reading, pod state |
-| `glucose fixed 55` / `sine 120 50 240` / `walk 120` | Set the glucose model |
-| `algo 18` | Report a sensor error (`algo 0` is normal) |
-| `forget` / `new code=1234 age=0` | Unpair the sensor's phones / start a new sensor |
+| `help` | List all commands |
+| `status` | Sensor name, pairing code, latest reading, pod state, Wi‑Fi details |
+| `glucose fixed 55` | Hold glucose at one value (mg/dL) |
+| `glucose sine 120 50 240` | Swing around 120 by ±50 over 240 minutes. This is the default. |
+| `glucose walk 120` | Drift randomly toward 120 |
+| `algo 18` | Report a sensor error: 18 is a temporary issue, 25 a failed sensor. `algo 0` returns to normal. |
+| `forget` | Unpair every phone from the sensor. It then advertises continuously until paired again. |
+| `new` | Start a new sensor with a random name and pairing code. The board restarts. |
+| `new code=1234 age=0` | A new sensor with options, in any combination (see below) |
+
+Options for `new`: `model=g7`, `oneplus` or `stelo`; `code=` four digits; `serial=` a
+number; `age=` minutes since activation (0 starts in warmup; the default is 120);
+`days=10` or `15`; `lifetime=` hours; `warmup=` minutes.
+
+Glucose and `algo` changes take effect at the next 5-minute reading. After `forget` or
+`new`, pair the sensor in the app again.
+
+### Console commands: Omnipod pod
+
+| Command | What it does |
+|---|---|
 | `pod` | The pod's status |
-| `pod new` / `pod type dash\|o5` | A new, unpaired pod |
-| `pod reservoir 30` / `pod age 4200` / `pod fault 20` / `pod alerts 4` | Pod conditions |
-| `pod selftest` | Check the pod's crypto on this board |
-| `wifi <name> [password]` / `wifi off` | Join or forget a Wi‑Fi network |
+| `pod new` | Forget the pod and become a new, unpaired one of the same type |
+| `pod type dash` | Become a new, unpaired DASH pod |
+| `pod type o5` | Become a new, unpaired Omnipod 5 pod |
+| `pod reservoir 30` | Set the reservoir, 0 to 200 U |
+| `pod age 4200` | Set how long the pod has been active, in minutes |
+| `pod fault 20` | Raise a fault with that code. `pod fault 0` clears it. |
+| `pod alerts 4` | Raise alert slots (a bit mask, 0 to 255). `pod alerts 0` clears them. |
+| `pod selftest` | Check the pod's cryptography on this board |
+
+`pod new` and `pod type` end the pod the app is using: discard it in the app, then pair
+the new one.
+
+### Console commands: the board
+
+| Command | What it does |
+|---|---|
+| `wifi MyNetwork mypassword` | Join a Wi‑Fi network. The board restarts and prints its address. |
+| `wifi off` | Forget the network and go back to the board's own access point |
+| `scan` | List the Wi‑Fi networks the board can see (2.4 GHz only) |
+| `reboot` | Restart the board. Sensor, pod and pairings are kept. |
+
+### On your computer: build and flash
+
+Run these in a terminal, from the repo's folder. They need PlatformIO.
+
+| Command | What it does |
+|---|---|
+| `pio run` | Build the firmware without flashing |
+| `pio run -t upload` | Build and flash. Keeps the board's sensor, pod, pairings and Wi‑Fi. |
+| `pio run -t erase` | Wipe the board completely. Follow with `pio run -t upload`. |
+| `pio device monitor` | Open the board's console |
+| `pio device list` | List connected boards and their ports |
+| `pio run -t upload --upload-port /dev/cu.usbmodemXXXX` | Flash one board when several are plugged in |
+| `tools/make_flasher.sh` | Build the browser flasher into `flasher/dist` |
+| `tools/make_flasher.sh user@host:folder` | Build it and upload it with rsync |
+
+`make_flasher.sh` stops if there are uncommitted changes, because the flasher names the
+commit it was built from.
+
+### On your computer: test clients
+
+Two Python scripts play the phone's side over Bluetooth from a Mac. Set them up once:
+
+```bash
+python3 -m venv venv
+venv/bin/pip install bleak cryptography
+```
+
+| Command | What it does |
+|---|---|
+| `venv/bin/python tools/podcheck.py` | Find the pod and check that it answers |
+| `G7NAME=DXCMab venv/bin/python tools/g7client.py 1234` | Pair with the G7 as a phone would. Use your board's name and code. |
+
+`g7client.py` takes the sensor's phone slot, so the app has to pair again afterwards. Both
+need the board free: one phone or computer can be connected at a time.
 
 ## Good to know
 
