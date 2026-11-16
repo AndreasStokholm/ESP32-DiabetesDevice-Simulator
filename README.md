@@ -1,4 +1,4 @@
-# ESP-Sim + G7
+# ESP32 Diabetes Device Simulator
 
 One ESP32-S3 that is both an **Omnipod pod simulator** (DASH or Omnipod 5) and a
 **Dexcom G7 sensor simulator**. Pair both from Loop or Trio on a test phone and the app has
@@ -65,8 +65,8 @@ flash.
    get the code:
 
    ```bash
-   git clone https://github.com/loudestnoise/ESP-Sim
-   cd ESP-Sim
+   git clone https://github.com/loudestnoise/ESP32-DiabetesDevice-Simulator
+   cd ESP32-DiabetesDevice-Simulator
    ```
 
 2. Plug in the board, then build and flash. The first build downloads the toolchain and
@@ -196,7 +196,7 @@ Don't choose Install there unless you mean to reflash the board.
 **In a terminal.** Needs [PlatformIO](https://platformio.org) and a copy of this repo.
 
 ```bash
-cd ESP-Sim
+cd ESP32-DiabetesDevice-Simulator
 pio device monitor
 ```
 
@@ -342,6 +342,17 @@ need the board free: one phone or computer can be connected at a time.
   pod they had).
 - The ESP32 is 2.4 GHz only, and can't sign in to captive-portal Wi‑Fi (hotels). Use its
   own access point or a phone hotspot.
+
+## To-Do
+
+Devices we want to add:
+
+- [x] Omnipod DASH
+- [x] Omnipod 5
+- [x] Dexcom G7 (also ONE+ and Stelo)
+- [ ] Medtrum
+- [ ] FreeStyle Libre 3 Plus (L3P)
+- [ ] More to come!
 
 ## Differences from the originals
 
