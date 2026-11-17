@@ -45,7 +45,7 @@ cat > "$OUT/manifest.json" <<JSON
   ]
 }
 JSON
-cp flasher/index.html "$OUT/"
+cp flasher/index.html flasher/og.png "$OUT/"
 
 # ESP Web Tools, pinned and served from the same site, so the page does not
 # depend on a CDN.
