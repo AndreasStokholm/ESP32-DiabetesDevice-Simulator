@@ -5,6 +5,7 @@
 
 #include <mutex>
 
+#include "adv_rotation.h"
 #include "dash_internal.h"
 #include "link.h"
 
@@ -343,22 +344,22 @@ void tick() {
   // is switched on and no phone is connected. One advertising set, so when
   // more than one wants to be found they take turns.
   bool connected = conn != BLE_HS_CONN_HANDLE_NONE;
-  enum { ADV_G7, ADV_POD, ADV_MED };
-  int want[3], n = 0;
-  if (m != AdvertMode::Off) want[n++] = ADV_G7;
-  if (!podData.empty() && (!connected || !paired)) want[n++] = ADV_POD;
-  if (medOn && !medData.empty() && !connected) want[n++] = ADV_MED;
+  adv_wants_t wants = {
+      .g7 = m != AdvertMode::Off,
+      .pod = !podData.empty() && (!connected || !paired),
+      .med = medOn && !medData.empty() && !connected,
+  };
+  int choice = adv_rotation_slot(&wants, monoMs());
 
   static std::string current;
   bool active = ble_gap_ext_adv_active(inst);
-  if (n == 0) {
+  if (choice == ADV_NONE) {
     if (active) NimBLEDevice::getAdvertising()->stop(inst);
     current.clear();
     return;
   }
   // The order (G7, pod, Medtrum) keeps the pod's payload byte-exact: it is the
   // same string it always was, only now sharing the set three ways.
-  int choice = want[(monoMs() / 1500) % n];
   std::string data = choice == ADV_G7 ? g7Advertisement(m, t) : choice == ADV_POD ? podData : medData;
   if (active && data == current) return;
   bool ok = choice == ADV_G7 ? advertise(data, named(sensor->name()), sensor->timing.advertisingInterval * 1000 / 625)

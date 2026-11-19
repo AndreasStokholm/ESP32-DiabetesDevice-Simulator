@@ -161,7 +161,10 @@ static void onWrite(const uint8_t* data, size_t n) {
 // MARK: - The run loop
 
 static void medtrumTask(void*) {
-  for (;;) {
+  // A stop flag rather than `return` inside LOCKED: the mutex must always be
+  // given back, even when the host tests ask the loop to end.
+  bool stop = false;
+  while (!stop) {
     medtrum_ev_t ev;
     bool got = io.next_event(io.ctx, &ev, 1000);
     LOCKED({
@@ -182,7 +185,8 @@ static void medtrumTask(void*) {
             onWrite(ev.data, ev.len);
             break;
           case MEDTRUM_EV_STOP:
-            return;
+            stop = true;
+            break;
           default:
             break;
         }

@@ -182,8 +182,12 @@ static void startWeb() {
   web.on("/medtrum/command", HTTP_POST, [] {
     String body = web.arg("plain");
     // The patch core has no crash hook, so the base reboots itself: the phone
-    // loses its in-flight command and finds the base again.
-    if (body.indexOf("medtrumCrash") >= 0) {
+    // loses its in-flight command and finds the base again. Compare the JSON
+    // `command` field exactly, as the pod's panel does; a stray token in any
+    // other field must not reboot the board.
+    JsonDocument j;
+    if (!deserializeJson(j, body) && j["command"].is<const char*>() &&
+        strcmp(j["command"].as<const char*>(), "medtrumCrash") == 0) {
       web.send(200, "application/json", medtrum::statusJson().c_str());
       restartAt = monoMs() + 1500;
       return;
