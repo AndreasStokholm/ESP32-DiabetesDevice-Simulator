@@ -27,6 +27,8 @@
 
 #include "crypto.h"
 #include "index_html.h"
+#include "medtrum_app.h"
+#include "medtrum_html.h"
 #include "pod.h"
 #include "pod_html.h"
 #include "radio.h"
@@ -157,6 +159,42 @@ static void startWeb() {
     web.send(200, "application/json", pod::statusJson().c_str());
   });
   web.on("/pod/wifi", HTTP_POST, [] {
+    JsonDocument j;
+    if (deserializeJson(j, web.arg("plain")) || !j["ssid"].is<const char*>() || !j["password"].is<const char*>()) {
+      web.send(400, "text/plain", "want {\"ssid\": ..., \"password\": ...}");
+      return;
+    }
+    String ssid = j["ssid"].as<const char*>(), pass = j["password"].as<const char*>();
+    if (ssid.length() && pass.length() && pass.length() < 8) {
+      web.send(400, "text/plain", "a WPA2 password has at least 8 characters");
+      return;
+    }
+    saveWifi(ssid, pass);
+    web.send(200, "text/plain", "saved; restarting\n");
+    restartAt = monoMs() + 1000;
+  });
+  // The Medtrum patch's panel and API (under /medtrum).
+  web.on("/medtrum", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", medtrumHTML); });
+  web.on("/medtrum/status", HTTP_GET, [] {
+    web.sendHeader("Cache-Control", "no-store");
+    web.send(200, "application/json", medtrum::statusJson().c_str());
+  });
+  web.on("/medtrum/command", HTTP_POST, [] {
+    String body = web.arg("plain");
+    // The patch core has no crash hook, so the base reboots itself: the phone
+    // loses its in-flight command and finds the base again.
+    if (body.indexOf("medtrumCrash") >= 0) {
+      web.send(200, "application/json", medtrum::statusJson().c_str());
+      restartAt = monoMs() + 1500;
+      return;
+    }
+    if (const char* err = medtrum::command(body.c_str())) {
+      web.send(400, "text/plain", err);
+      return;
+    }
+    web.send(200, "application/json", medtrum::statusJson().c_str());
+  });
+  web.on("/medtrum/wifi", HTTP_POST, [] {
     JsonDocument j;
     if (deserializeJson(j, web.arg("plain")) || !j["ssid"].is<const char*>() || !j["password"].is<const char*>()) {
       web.send(400, "text/plain", "want {\"ssid\": ..., \"password\": ...}");
@@ -519,10 +557,12 @@ void setup() {
   logf("PAIRING CODE %s", sensor->pairingCode().c_str());
 
   pod::begin();
+  medtrum::begin();
   startWifi();
   startWeb();
   radio::begin(sensor);
   pod::start();
+  medtrum::start();
   logf("ready — type 'help' on this console");
 }
 
