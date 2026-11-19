@@ -1,7 +1,7 @@
 # Host tests for the portable Medtrum patch core.
 #
 # The core is portable C: no mbedTLS, no ESP-IDF, no PlatformIO. This builds
-# the core sources plus the test with plain cc and runs them.
+# the core sources plus the tests with plain cc and runs them.
 #
 #   make -C test/medtrum        builds and runs them
 
@@ -11,13 +11,19 @@ CFLAGS ?= -O1 -g
 WARN := -Wall -Wextra -Werror
 CFLAGS += -std=c11 -D_DEFAULT_SOURCE -I$(MED)/include -I.
 
-all: medtrum_tests
+all: medtrum_tests adv_tests
 	./medtrum_tests
+	./adv_tests
 
 medtrum_tests: $(SRCS) $(wildcard $(MED)/include/*.h) test.h
 	$(CC) $(CFLAGS) $(WARN) -o $@ $(SRCS)
 
+# The 3-way advertising rotation is chosen in src/radio.cpp (NimBLE/Arduino),
+# so adv_rotation.h mirrors that selection as a pure function for this test.
+adv_tests: test_adv.c adv_rotation.h
+	$(CC) $(CFLAGS) $(WARN) -o $@ test_adv.c
+
 clean:
-	rm -f medtrum_tests
+	rm -f medtrum_tests adv_tests
 
 .PHONY: all clean
