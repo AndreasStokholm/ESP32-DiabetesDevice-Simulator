@@ -1,5 +1,7 @@
-/* Host tests for the advertising rotation (adv_rotation.h): the 3-way choice
- * src/radio.cpp's tick() makes over the one advertising set.
+/* Host tests for the advertising rotation: the 3-way choice src/radio.cpp's
+ * tick() makes over the one advertising set. It includes the production header
+ * (../../src/adv_rotation.h, pure C) so the tested selection is the code the
+ * firmware runs.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #include <stdio.h>

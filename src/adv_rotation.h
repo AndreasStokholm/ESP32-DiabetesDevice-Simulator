@@ -1,15 +1,18 @@
-/* The one advertising set's 3-way rotation, as src/radio.cpp's tick() picks
- * it: the wanted devices in order (G7, pod, Medtrum), indexed by
- * (now_ms / 1500) % n. The selection itself lives in radio.cpp, which pulls in
- * NimBLE and Arduino and so cannot be built for the host; this header is the
- * same choice written as a pure function, so the host tests can cover it
- * (including that the old G7/pod alternation is preserved).
+/* The one advertising set's rotation, shared by the firmware (src/radio.cpp)
+ * and the host tests. Pure C/C++: no Arduino, no NimBLE.
+ *
+ * The board advertises the pod, the G7 and the Medtrum patch on one set, so
+ * when more than one wants to be found they take turns. The wanted devices are
+ * listed in a fixed order (G7, pod, Medtrum) and the clock picks the slot.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 
-/* The three choices match radio.cpp's local enum; ADV_NONE is this header's
- * sentinel for "nobody wants the set". */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* The three devices, in rotation order; ADV_NONE is "nobody wants the set". */
 enum {
     ADV_G7 = 0,
     ADV_POD,
@@ -24,7 +27,8 @@ typedef struct {
     int med; /* the Medtrum pump base is on and no phone is connected */
 } adv_wants_t;
 
-/* The device that gets the set this tick, or ADV_NONE when nobody wants it. */
+/* The device that gets the set this tick: the wanted ones in order (G7, pod,
+ * Medtrum), indexed by (now_ms / 1500) % n. ADV_NONE when nobody wants it. */
 static inline int adv_rotation_slot(const adv_wants_t *w, long long now_ms) {
     int want[3], n = 0;
     if (w->g7) want[n++] = ADV_G7;
@@ -33,3 +37,7 @@ static inline int adv_rotation_slot(const adv_wants_t *w, long long now_ms) {
     if (n == 0) return ADV_NONE;
     return want[(now_ms / 1500) % n];
 }
+
+#ifdef __cplusplus
+}
+#endif

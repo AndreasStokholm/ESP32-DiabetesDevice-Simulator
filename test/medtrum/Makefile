@@ -18,10 +18,11 @@ all: medtrum_tests adv_tests
 medtrum_tests: $(SRCS) $(wildcard $(MED)/include/*.h) test.h
 	$(CC) $(CFLAGS) $(WARN) -o $@ $(SRCS)
 
-# The 3-way advertising rotation is chosen in src/radio.cpp (NimBLE/Arduino),
-# so adv_rotation.h mirrors that selection as a pure function for this test.
-adv_tests: test_adv.c adv_rotation.h
-	$(CC) $(CFLAGS) $(WARN) -o $@ test_adv.c
+# The 3-way advertising rotation is chosen by src/adv_rotation.h, the same
+# pure header src/radio.cpp's tick() uses, so this tests the production
+# selection rather than a copy.
+adv_tests: test_adv.c ../../src/adv_rotation.h
+	$(CC) $(CFLAGS) $(WARN) -I../../src -o $@ test_adv.c
 
 clean:
 	rm -f medtrum_tests adv_tests
