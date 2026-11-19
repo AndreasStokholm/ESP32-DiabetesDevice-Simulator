@@ -33,6 +33,12 @@ static const char* podCmdUUID = "1a7e2441-e3ed-4464-8b7e-751e03d0dc5f";
 static const char* podDataUUID = "1a7e2442-e3ed-4464-8b7e-751e03d0dc5f";    // DASH
 static const char* podO5DataUUID = "1a7e2443-e3ed-4464-8b7e-751e03d0dc5f";  // Omnipod 5
 
+// MARK: - The Medtrum patch's GATT layout (ESP-Sim's ble.c)
+
+static const char* medtrumServiceUUID = "669A9001-0008-968F-E311-6050405558B3";
+static const char* medtrumReadUUID = "669a9120-0008-968F-E311-6050405558B3";   // status notifications
+static const char* medtrumWriteUUID = "669a9101-0008-968F-E311-6050405558B3";  // responses
+
 static Sensor* sensor;
 static NimBLEServer* server;
 static NimBLECharacteristic* chars[4];
@@ -49,6 +55,13 @@ static uint16_t podCmdHandle, podDataHandle, podO5DataHandle;
 static std::string podAdvData;  // guarded by mu
 static bool podIsO5 = false, podPaired = false;
 static volatile int64_t podLastTraffic = 0;
+
+// The Medtrum patch's side of the link.
+static QueueHandle_t medtrumEvents;
+static uint16_t medtrumReadHandle, medtrumWriteHandle;
+static volatile bool medtrumStatusNotify = false;
+static std::string medtrumAdvData;  // guarded by mu
+static bool medtrumAdvOn = false;
 
 static std::shared_ptr<Link> currentLink(uint16_t handle) {
   std::lock_guard<std::mutex> l(mu);
@@ -67,6 +80,15 @@ static void podPush(uint8_t type, const uint8_t* data, size_t n) {
   ev.len = (uint8_t)n;
   if (n) memcpy(ev.data, data, n);
   if (xQueueSend(podEvents, &ev, 0) != pdTRUE) logf("pod: event queue full: a packet from the phone was dropped");
+}
+
+static void medtrumPush(uint8_t type, const uint8_t* data, size_t n) {
+  medtrum_ev_t ev = {};
+  ev.type = type;
+  ev.len = (uint8_t)n;
+  if (n) memcpy(ev.data, data, n);
+  if (xQueueSend(medtrumEvents, &ev, 0) != pdTRUE)
+    logf("medtrum: event queue full: a packet from the phone was dropped");
 }
 
 class ServerCallbacks : public NimBLEServerCallbacks {
@@ -94,6 +116,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     conn = desc->conn_handle;
     startHandler(l, sensor);
     podPush(DASH_EV_CONNECTED, nullptr, 0);
+    medtrumPush(MEDTRUM_EV_CONNECTED, nullptr, 0);
   }
 
   void onDisconnect(NimBLEServer*, ble_gap_conn_desc* desc) override {
@@ -110,7 +133,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       logf("%s disconnected", l->addr.c_str());
     }
     sensor->linkClosed();
+    medtrumStatusNotify = false;
     podPush(DASH_EV_DISCONNECTED, nullptr, 0);
+    medtrumPush(MEDTRUM_EV_DISCONNECTED, nullptr, 0);
   }
 };
 
@@ -159,6 +184,21 @@ class PodCallbacks : public NimBLECharacteristicCallbacks {
   bool cmd;
 };
 
+class MedtrumWriteCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
+    if (desc->conn_handle != conn) return;
+    NimBLEAttValue v = ch->getValue();
+    if (v.length() > MEDTRUM_FRAME_MAX) return;
+    medtrumPush(MEDTRUM_EV_WRITE, v.data(), v.length());
+  }
+};
+
+class MedtrumReadCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc*, uint16_t subValue) override {
+    medtrumStatusNotify = subValue != 0;
+  }
+};
+
 static const uint32_t rw = NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY |
                            NIMBLE_PROPERTY::INDICATE;
 static const uint32_t podRw = NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY;
@@ -166,6 +206,7 @@ static const uint32_t podRw = NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
 void begin(Sensor* s) {
   sensor = s;
   podEvents = xQueueCreate(64, sizeof(dash_ev_t));
+  medtrumEvents = xQueueCreate(16, sizeof(medtrum_ev_t));
 
   // The GAP device name is the sensor's: the app's G7 code knows its sensor
   // by name, and its pod code only looks for one particular name.
@@ -197,14 +238,24 @@ void begin(Sensor* s) {
   pd->setCallbacks(new PodCallbacks(false));
   po->setCallbacks(new PodCallbacks(false));
 
+  NimBLEService* med = server->createService(medtrumServiceUUID);
+  NimBLECharacteristic* mr =
+      med->createCharacteristic(medtrumReadUUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  NimBLECharacteristic* mw = med->createCharacteristic(medtrumWriteUUID, podRw);
+  mr->setCallbacks(new MedtrumReadCallbacks());
+  mw->setCallbacks(new MedtrumWriteCallbacks());
+
   cgm->start();
   b->start();
   pod->start();
+  med->start();
   server->start();
   for (int i = 0; i < 4; i++) charHandles[i] = chars[i]->getHandle();
   podCmdHandle = pc->getHandle();
   podDataHandle = pd->getHandle();
   podO5DataHandle = po->getHandle();
+  medtrumReadHandle = mr->getHandle();
+  medtrumWriteHandle = mw->getHandle();
 }
 
 // MARK: - Advertising
@@ -282,27 +333,37 @@ void tick() {
   types = t;
   std::string podData = podAdvData;
   bool paired = podPaired;
+  std::string medData = medtrumAdvData;
+  bool medOn = medtrumAdvOn;
   l.unlock();
   if (changed) logf("G7 advertising %s (types in use %02x)", advertModeName(m), t);
 
   // Who needs to be found? The G7 on its own schedule; the pod whenever no
-  // phone is connected, and until it is paired. When both do, they take turns.
+  // phone is connected, and until it is paired; the Medtrum patch whenever it
+  // is switched on and no phone is connected. One advertising set, so when
+  // more than one wants to be found they take turns.
   bool connected = conn != BLE_HS_CONN_HANDLE_NONE;
-  bool wantG7 = m != AdvertMode::Off;
-  bool wantPod = !podData.empty() && (!connected || !paired);
-  if (wantG7 && wantPod) (monoMs() / 1500) % 2 ? wantG7 = false : wantPod = false;
+  enum { ADV_G7, ADV_POD, ADV_MED };
+  int want[3], n = 0;
+  if (m != AdvertMode::Off) want[n++] = ADV_G7;
+  if (!podData.empty() && (!connected || !paired)) want[n++] = ADV_POD;
+  if (medOn && !medData.empty() && !connected) want[n++] = ADV_MED;
 
   static std::string current;
   bool active = ble_gap_ext_adv_active(inst);
-  if (!wantG7 && !wantPod) {
+  if (n == 0) {
     if (active) NimBLEDevice::getAdvertising()->stop(inst);
     current.clear();
     return;
   }
-  std::string data = wantG7 ? g7Advertisement(m, t) : podData;
+  // The order (G7, pod, Medtrum) keeps the pod's payload byte-exact: it is the
+  // same string it always was, only now sharing the set three ways.
+  int choice = want[(monoMs() / 1500) % n];
+  std::string data = choice == ADV_G7 ? g7Advertisement(m, t) : choice == ADV_POD ? podData : medData;
   if (active && data == current) return;
-  bool ok = wantG7 ? advertise(data, named(sensor->name()), sensor->timing.advertisingInterval * 1000 / 625)
-                   : advertise(data, named(DASH_ADVERTISED_NAME), 0x00f4);  // 152.5 ms, as ESP-Sim
+  bool ok = choice == ADV_G7 ? advertise(data, named(sensor->name()), sensor->timing.advertisingInterval * 1000 / 625)
+            : choice == ADV_POD ? advertise(data, named(DASH_ADVERTISED_NAME), 0x00f4)
+                                : advertise(data, named("MT"), 0x00f4);  // 152.5 ms, as ESP-Sim
   if (ok) {
     current = data;
   } else {
@@ -383,6 +444,65 @@ void podAdvertise(const dash_adv_t* adv) {
   }
   logf("pod: advertising as %s %s pod (fault 0x%02x, alerts 0x%02x)", paired ? "a paired" : "an unpaired",
        o5 ? "Omnipod 5" : "DASH", adv->fault, adv->alerts);
+}
+
+// MARK: - The Medtrum patch's radio
+
+bool medtrumConnected() { return conn != BLE_HS_CONN_HANDLE_NONE; }
+
+bool medtrumNextEvent(medtrum_ev_t* ev, uint32_t timeoutMs) {
+  TickType_t t = timeoutMs == MEDTRUM_WAIT_FOREVER ? portMAX_DELAY : pdMS_TO_TICKS(timeoutMs);
+  if (t == 0 && timeoutMs > 0) t = 1;
+  return xQueueReceive(medtrumEvents, ev, t) == pdTRUE;
+}
+
+static void medtrumNotifyRaw(uint16_t handle, const uint8_t* p, size_t n) {
+  uint16_t c = conn;
+  if (c == BLE_HS_CONN_HANDLE_NONE) return;
+  // With a dozen fragments queued, NimBLE can run short of buffers for a
+  // moment: wait for them rather than lose a fragment.
+  for (int tries = 0; tries < 100; tries++) {
+    os_mbuf* om = ble_hs_mbuf_from_flat(p, (uint16_t)n);
+    if (om) {
+      int rc = ble_gattc_notify_custom(c, handle, om);
+      if (rc == 0) return;
+      if (rc != BLE_HS_ENOMEM) {
+        logf("medtrum: notification failed: %d", rc);
+        return;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  logf("medtrum: notification dropped: no buffers");
+}
+
+// A command response, on the WRITE characteristic.
+void medtrumNotify(const uint8_t* p, size_t n) { medtrumNotifyRaw(medtrumWriteHandle, p, n); }
+
+// A status notification, on the READ characteristic, once the phone subscribed.
+void medtrumNotifyStatus(const uint8_t* p, size_t n) {
+  if (medtrumStatusNotify) medtrumNotifyRaw(medtrumReadHandle, p, n);
+}
+
+void medtrumDisconnect() {
+  uint16_t c = conn;
+  if (c != BLE_HS_CONN_HANDLE_NONE) ble_gap_terminate(c, BLE_ERR_REM_USER_CONN_TERM);
+}
+
+void medtrumAdvertise(bool on, const uint8_t sn[4]) {
+  uint8_t snv[4] = {0, 0, 0, 0};
+  if (sn) memcpy(snv, sn, 4);
+  // Flags, the name "MT", and the manufacturer data the app reads the base
+  // serial, device type and version from.
+  std::string p = {0x02, 0x01, 0x06, 0x03, 0x09, 'M', 'T'};
+  p += {0x09, (char)0xFF, 0x00, 0x00, (char)snv[0], (char)snv[1], (char)snv[2], (char)snv[3], 0x01, 0x01};
+  {
+    std::lock_guard<std::mutex> l(mu);
+    medtrumAdvOn = on;
+    medtrumAdvData = p;
+  }
+  logf("medtrum: %s, serial %02X%02X%02X%02X", on ? "advertising" : "not advertising", snv[0], snv[1], snv[2],
+       snv[3]);
 }
 
 }  // namespace radio

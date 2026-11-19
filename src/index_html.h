@@ -53,6 +53,7 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
   <span class="meta" id="code"></span>
   <span class="meta" id="age"></span>
   <a class="meta" href="/pod" style="margin-left:auto;color:var(--accent)">Pod panel &rarr;</a>
+  <a class="meta" href="/medtrum" style="color:var(--accent)">Medtrum patch panel &rarr;</a>
 </header>
 <main>
   <div class="card">

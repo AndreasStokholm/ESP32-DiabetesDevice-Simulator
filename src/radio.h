@@ -16,6 +16,7 @@
 //   the G7 code collects the new reading.
 
 #include "dash.h"
+#include "medtrum.h"
 #include "sensor.h"
 
 namespace radio {
@@ -32,4 +33,12 @@ void podNotifyData(const uint8_t* p, size_t n);
 void podDisconnect();
 void podAdvertise(const dash_adv_t* adv);
 bool podConnected();
+
+// The Medtrum patch's radio (the radio half of ESP-Sim's medtrum_io_t).
+bool medtrumNextEvent(medtrum_ev_t* ev, uint32_t timeoutMs);
+void medtrumNotify(const uint8_t* p, size_t n);        // WRITE: responses
+void medtrumNotifyStatus(const uint8_t* p, size_t n);  // READ: notifications
+void medtrumDisconnect();
+void medtrumAdvertise(bool on, const uint8_t sn[4]);
+bool medtrumConnected();
 }  // namespace radio
