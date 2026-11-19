@@ -350,7 +350,7 @@ Devices we want to add:
 - [x] Omnipod DASH
 - [x] Omnipod 5
 - [x] Dexcom G7 (also ONE+ and Stelo)
-- [ ] Medtrum
+- [x] Medtrum
 - [ ] FreeStyle Libre 3 Plus (L3P)
 - [ ] More to come!
 
@@ -362,6 +362,12 @@ Devices we want to add:
   button. A new board starts as an Omnipod 5, where ESP-Sim starts as a DASH. The pod core
   gained loopkit/pod's `ignoreNextMessages` and `failNextConnects` commands. ESP-Sim's
   host tests are not included: run them in ESP-Sim itself.
+- **ESP-Sim's Medtrum patch** is ported here as a third device. Its portable patch core
+  (`lib/medtrumpatch`, plain C with no ESP-IDF or mbedTLS) runs under Arduino/PlatformIO
+  with new board glue (`src/medtrum_app.cpp`, and the patch's side of `src/radio.cpp`).
+  The one radio now takes turns between the pod's, the G7's and the Medtrum pump base's
+  advertisements. The patch's panel is at `/medtrum`, and its host tests run with
+  `make -C test/medtrum`.
 - **g7simESP32**'s radio is rewritten to share one connection with the pod, and its
   session stays open on that connection instead of hanging up after a few idle seconds.
   `/glucose` now fills in omitted fields as g7sim does (0, not g7simESP32's 120, 50 and
@@ -372,15 +378,20 @@ Devices we want to add:
 | Path | What |
 |---|---|
 | `lib/dashpod/` | ESP-Sim's pod core with two commands added (GPL-3.0-or-later) |
+| `lib/medtrumpatch/` | ESP-Sim's portable Medtrum patch core (GPL-3.0-or-later) |
 | `src/pod.cpp` | The pod's clock, storage and task |
-| `src/radio.cpp` | One Bluetooth device for both |
+| `src/medtrum_app.cpp` | The Medtrum pump base's clock, storage and task |
+| `src/radio.cpp` | One Bluetooth device for the pod, the G7 and the patch |
 | `src/sensor.cpp`, `handler.cpp`, `crypto.cpp` | The G7 (from g7simESP32) |
 | `src/main.cpp` | Boot, Wi‑Fi, web panels, console |
+| `test/medtrum/` | Host tests for the portable Medtrum patch core |
 | `flasher/`, `tools/make_flasher.sh` | The browser flasher |
+| `tools/medtrum_panel.html`, `tools/gen_medtrum_panel.py` | The patch's web panel and its generator |
 | `tools/g7client.py`, `tools/podcheck.py` | Test clients for a Mac |
 
 ## License
 
 GPL-3.0-or-later (see `LICENSE`), as ESP-Sim's pod core requires of a combined work. The G7
 files come from MIT-licensed code (LoopKit/g7sim and g7simESP32); their notice is in
-`LICENSE-g7sim-MIT`.
+`LICENSE-g7sim-MIT`. The Medtrum patch core carries MedtrumKit's CRC-8 and Rijndael tables
+(MIT, Copyright (c) 2024 J. Bunt); that notice is in `lib/medtrumpatch/LICENSE.medtrumkit`.
