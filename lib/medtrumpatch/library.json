@@ -1,0 +1,10 @@
+{
+  "name": "medtrumpatch",
+  "version": "0.0.0",
+  "description": "ESP-Sim's portable Medtrum patch core (github.com/nightscout/ESP-Sim), unmodified. GPL-3.0-or-later.",
+  "license": "GPL-3.0-or-later",
+  "build": {
+    "srcDir": "src",
+    "includeDir": "include"
+  }
+}
