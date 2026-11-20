@@ -147,6 +147,22 @@ static const char podHTML[] PROGMEM = R"PODHTML(<!doctype html>
     <div class="actions" style="margin-top:0"><button class="danger" id="newPod">Forget this pod and start a new one</button></div>
     <div class="muted" style="margin-top:8px">Clears pairing and delivery: the next phone pairs it as a fresh pod. Deactivating the pod from the app does the same.</div>
   </section>
+
+  <section class="card" aria-labelledby="h-fail">
+    <h2 id="h-fail">Failure injection</h2>
+    <div class="row">
+      <div><label for="failRefuse">Refuse connects</label><input type="number" id="failRefuse" min="0" max="1000" step="1" value="0"></div>
+      <div><label for="failQuiet">Go quiet (s)</label><input type="number" id="failQuiet" min="0" max="86400" step="1" value="0"></div>
+      <div><label for="failDelay">Delay each notification (ms)</label><input type="number" id="failDelay" min="0" max="60000" step="10" value="0"></div>
+    </div>
+    <div class="actions">
+      <button class="danger" id="failDrop" type="button">Drop next connect</button>
+      <button class="primary" id="failApply" type="button">Apply</button>
+      <button id="failClear" type="button">Clear</button>
+    </div>
+    <div class="muted" id="failMsg" style="margin-top:8px">One BLE link is shared by all three simulators, so drop and refuse act on the next connection whichever device asked; quiet removes only this device from advertising; delay holds each outgoing notification.</div>
+  </section>
+
   <section class="card" aria-labelledby="h-comms">
     <h2 id="h-comms">Comms</h2>
     <table><tbody>
@@ -362,6 +378,24 @@ function show(s){
 
 async function refresh(){ try { show(await (await fetch('/pod/status')).json()); } catch(e){} }
 refresh(); setInterval(refresh, 1000);
+
+async function fail(body, done) {
+  const msg = $('failMsg');
+  msg.textContent = 'Applying…';
+  try {
+    const r = await fetch('/fail',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const t = await r.text();
+    if(!r.ok) throw new Error(t.trim());
+    msg.textContent = done;
+    setTimeout(()=>{ if(msg.textContent===done) msg.textContent=''; }, 2500);
+  } catch(e){ msg.textContent = 'Failed — '+e.message; }
+}
+$('failDrop').onclick = ()=>fail({device:'pod', drop:true}, 'Next connection will be dropped');
+$('failApply').onclick = ()=>fail({device:'pod',
+  refuse:+$('failRefuse').value,
+  quietMs:+$('failQuiet').value*1000,
+  delayMs:+$('failDelay').value}, 'Failure set');
+$('failClear').onclick = ()=>fail({device:'pod', drop:false, refuse:0, quietMs:0, delayMs:0, ignore:0}, 'Failures cleared');
 </script>
 </body>
 </html>)PODHTML";

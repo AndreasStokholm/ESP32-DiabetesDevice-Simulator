@@ -29,6 +29,7 @@
 #include <esp_sntp.h>
 
 #include "crypto.h"
+#include "fail.h"
 #include "home_html.h"
 #include "index_html.h"
 #include "medtrum_app.h"
@@ -103,6 +104,25 @@ static void sendStatus() {
   JsonDocument d;
   sensor->status(d);
   sendJson(200, d);
+}
+
+// MARK: - Failure injection
+
+static String failStateJson() {
+  JsonDocument d;
+  int64_t now = monoMs();
+  for (int i = 0; i < FAIL_DEVICE_COUNT; i++) {
+    FailState s = fail_get((FailDevice)i);
+    JsonObject o = d[fail_device_name((FailDevice)i)].to<JsonObject>();
+    o["drop"] = s.dropPending != 0;
+    o["refuse"] = s.refuseConnects;
+    o["quietMs"] = s.quietUntilMs > now ? s.quietUntilMs - now : 0;
+    o["delayMs"] = s.delayMs;
+    o["ignore"] = s.ignoreMessages;
+  }
+  String out;
+  serializeJsonPretty(d, out);
+  return out;
 }
 
 static void saveWifi(const String& ssid, const String& pass) {
@@ -251,6 +271,69 @@ static void startWeb() {
   web.on("/settings/reboot", HTTP_POST, [] {
     web.send(200, "text/plain", "rebooting\n");
     restartAt = monoMs() + 1000;
+  });
+  web.on("/fail", HTTP_POST, [] {
+    JsonDocument j;
+    if (deserializeJson(j, web.arg("plain")) || !j["device"].is<const char*>()) {
+      web.send(400, "text/plain", "want {\"device\":\"pod|g7|medtrum|all\", ...}\n");
+      return;
+    }
+    const char* name = j["device"].as<const char*>();
+    int dev = fail_device_from_name(name);
+    bool all = strcmp(name, "all") == 0;
+    const char* err = nullptr;
+    if (dev < 0 && !all)
+      err = "device is pod, g7, medtrum or all";
+    else if (!j["drop"].isNull() && !j["drop"].is<bool>())
+      err = "drop is true or false";
+    else if (!j["refuse"].isNull() && (!j["refuse"].is<int>() || j["refuse"].as<int>() < 0 || j["refuse"].as<int>() > 1000))
+      err = "refuse is 0-1000 connects";
+    else if (!j["quietMs"].isNull() &&
+             (!j["quietMs"].is<int>() || j["quietMs"].as<int>() < 0 || j["quietMs"].as<int>() > 86400000))
+      err = "quietMs is 0-86400000 ms";
+    else if (!j["delayMs"].isNull() &&
+             (!j["delayMs"].is<int>() || j["delayMs"].as<int>() < 0 || j["delayMs"].as<int>() > 60000))
+      err = "delayMs is 0-60000 ms";
+    else if (!j["ignore"].isNull() && (!j["ignore"].is<int>() || j["ignore"].as<int>() < 0 || j["ignore"].as<int>() > 1000))
+      err = "ignore is 0-1000 messages";
+    if (err) {
+      web.send(400, "text/plain", err);
+      return;
+    }
+    int64_t now = monoMs();
+    auto applyOne = [&](FailDevice d) {
+      if (!j["drop"].isNull()) {
+        bool on = j["drop"].as<bool>();
+        fail_set_drop(d, on ? 1 : 0);
+        logf("fail: %s %s", fail_device_name(d), on ? "drops the next connect" : "drop cleared");
+      }
+      if (!j["refuse"].isNull()) {
+        unsigned n = j["refuse"].as<unsigned>();
+        fail_set_refuse(d, n);
+        logf("fail: %s refuses %u connects", fail_device_name(d), n);
+      }
+      if (!j["quietMs"].isNull()) {
+        unsigned ms = j["quietMs"].as<unsigned>();
+        fail_set_quiet_for(d, ms, now);
+        logf("fail: %s quiet for %u ms", fail_device_name(d), ms);
+      }
+      if (!j["delayMs"].isNull()) {
+        unsigned ms = j["delayMs"].as<unsigned>();
+        fail_set_delay(d, ms);
+        logf("fail: %s delays notifications by %u ms", fail_device_name(d), ms);
+      }
+      if (!j["ignore"].isNull()) {
+        unsigned n = j["ignore"].as<unsigned>();
+        fail_set_ignore(d, n);
+        logf("fail: %s ignores %u messages", fail_device_name(d), n);
+      }
+    };
+    if (all) {
+      for (int i = 0; i < FAIL_DEVICE_COUNT; i++) applyOne((FailDevice)i);
+    } else {
+      applyOne((FailDevice)dev);
+    }
+    web.send(200, "application/json", failStateJson());
   });
   web.on("/status", HTTP_GET, sendStatus);
   web.on("/glucose", HTTP_POST, [] {
@@ -491,6 +574,13 @@ static void help() {
       "  pod ignoreNextMessages <count>      stay connected but leave that many messages unanswered\n"
       "  pod failNextConnects <count> [sec]  loopkit/pod's command; needs its ImpossiBLE transport\n"
       "  pod selftest                        check the pod's crypto on this board\n"
+      "Failure injection (one radio, one decision set per device):\n"
+      "  fail <pod|g7|medtrum|all> drop     drop the next connection once\n"
+      "  fail <device> refuse <n>           drop the next n connections\n"
+      "  fail <device> quiet <ms>           stop advertising that device for ms\n"
+      "  fail <device> delay <ms>           delay each notification from that device\n"
+      "  fail <device> ignore <n>           drop the next n messages to that device\n"
+      "  fail <device> clear                clear every knob for that device\n"
       "Board:\n"
       "  wifi <ssid> [password] | wifi off   join Wi-Fi for the web panels + NTP (restarts)\n"
       "  scan                                list the Wi-Fi networks the board can see\n"
@@ -600,6 +690,78 @@ static void command(const std::string& line) {
     }
     logf("replacing %s with a new %s sensor, code %s", sensor->name().c_str(), next.model.c_str(), next.code.c_str());
     replaceSensor(next);
+  } else if (cmd == "fail") {
+    if (a.size() < 3) {
+      Serial.println("fail: want fail <pod|g7|medtrum|all> <drop|refuse|quiet|delay|ignore|clear> [n]");
+      return;
+    }
+    bool all = a[1] == "all";
+    int dev = fail_device_from_name(a[1].c_str());
+    if (dev < 0 && !all) {
+      Serial.println("fail: device is pod, g7, medtrum or all");
+      return;
+    }
+    const std::string& what = a[2];
+    if (what == "clear") {
+      if (all) fail_clear_all();
+      else fail_clear((FailDevice)dev);
+      logf("fail: %s cleared", all ? "every device" : a[1].c_str());
+      Serial.println(failStateJson().c_str());
+      return;
+    }
+    if (what != "drop" && what != "refuse" && what != "quiet" && what != "delay" && what != "ignore") {
+      Serial.println("fail: want drop, refuse, quiet, delay, ignore or clear");
+      return;
+    }
+    if (what == "drop") {
+      auto applyOne = [&](FailDevice d) {
+        fail_set_drop(d, 1);
+        logf("fail: %s drops the next connect", fail_device_name(d));
+      };
+      if (all) for (int i = 0; i < FAIL_DEVICE_COUNT; i++) applyOne((FailDevice)i);
+      else applyOne((FailDevice)dev);
+      Serial.println(failStateJson().c_str());
+      return;
+    }
+    if (a.size() < 4) {
+      Serial.println("fail: want a number for refuse, quiet, delay or ignore");
+      return;
+    }
+    double v = atof(a[3].c_str());
+    if (!(v >= 0) || v > 86400000.0) {
+      Serial.println("fail: number is out of range");
+      return;
+    }
+    unsigned n = (unsigned)v;
+    if ((what == "refuse" || what == "ignore") && n > 1000) {
+      Serial.println("fail: refuse/ignore is 0-1000");
+      return;
+    }
+    if (what == "delay" && n > 60000) {
+      Serial.println("fail: delay is 0-60000 ms");
+      return;
+    }
+    auto applyOne = [&](FailDevice d) {
+      if (what == "refuse") {
+        fail_set_refuse(d, n);
+        logf("fail: %s refuses %u connects", fail_device_name(d), n);
+      } else if (what == "quiet") {
+        fail_set_quiet_for(d, n, monoMs());
+        logf("fail: %s quiet for %u ms", fail_device_name(d), n);
+      } else if (what == "delay") {
+        fail_set_delay(d, n);
+        logf("fail: %s delays notifications by %u ms", fail_device_name(d), n);
+      } else {
+        fail_set_ignore(d, n);
+        logf("fail: %s ignores %u messages", fail_device_name(d), n);
+      }
+    };
+    if (all) {
+      for (int i = 0; i < FAIL_DEVICE_COUNT; i++) applyOne((FailDevice)i);
+    } else {
+      applyOne((FailDevice)dev);
+    }
+    Serial.println(failStateJson().c_str());
   } else if (cmd == "pod") {
     std::string sub = a.size() >= 2 ? a[1] : "";
     std::string v = a.size() >= 3 ? a[2] : "";

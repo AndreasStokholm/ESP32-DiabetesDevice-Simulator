@@ -122,6 +122,21 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
   </div>
 
   <div class="card">
+    <h2>Failure injection</h2>
+    <div class="row">
+      <div><label for="failRefuse">Refuse connects</label><input type="number" id="failRefuse" min="0" max="1000" step="1" value="0"></div>
+      <div><label for="failQuiet">Go quiet (s)</label><input type="number" id="failQuiet" min="0" max="86400" step="1" value="0"></div>
+      <div><label for="failDelay">Delay each notification (ms)</label><input type="number" id="failDelay" min="0" max="60000" step="10" value="0"></div>
+    </div>
+    <div style="margin-top:14px; display:flex; flex-wrap:wrap; gap:8px 12px">
+      <button class="danger" id="failDrop" type="button">Drop next connect</button>
+      <button class="primary" id="failApply" type="button">Apply</button>
+      <button id="failClear" type="button">Clear</button>
+    </div>
+    <div class="muted" id="failMsg" style="margin-top:8px">One BLE link is shared by all three simulators, so drop and refuse act on the next connection whichever device asked; quiet removes only this device from advertising for the chosen time. The G7's notifications are sent by the sensor task, so a delay is recorded but not applied to them.</div>
+  </div>
+
+  <div class="card">
     <h2>Display slots</h2>
     <table><thead><tr><th>Type</th><th>Held</th><th>Last seen</th><th>Misses</th></tr></thead>
     <tbody id="slots"><tr><td colspan="4" class="muted">none yet</td></tr></tbody></table>
@@ -264,6 +279,24 @@ field('nsStart').onclick = async()=>{
   } catch(e){ msg.textContent = 'Failed — '+e.message; }
 };
 showPreset();
+
+async function fail(body, done) {
+  const msg = document.getElementById('failMsg');
+  msg.textContent = 'Applying…';
+  try {
+    const r = await fetch('/fail',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const t = await r.text();
+    if(!r.ok) throw new Error(t.trim());
+    msg.textContent = done;
+    setTimeout(()=>{ if(msg.textContent===done) msg.textContent=''; }, 2500);
+  } catch(e){ msg.textContent = 'Failed — '+e.message; }
+}
+document.getElementById('failDrop').onclick = ()=>fail({device:'g7', drop:true}, 'Next connection will be dropped');
+document.getElementById('failApply').onclick = ()=>fail({device:'g7',
+  refuse:+document.getElementById('failRefuse').value,
+  quietMs:+document.getElementById('failQuiet').value*1000,
+  delayMs:+document.getElementById('failDelay').value}, 'Failure set');
+document.getElementById('failClear').onclick = ()=>fail({device:'g7', drop:false, refuse:0, quietMs:0, delayMs:0, ignore:0}, 'Failures cleared');
 setKind('sine'); refresh(); setInterval(refresh, 2000);
 </script>
 </body>
