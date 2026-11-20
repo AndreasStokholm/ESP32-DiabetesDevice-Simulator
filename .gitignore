@@ -5,3 +5,4 @@ test/portal/portal_tests
 test/portal/*.o
 test/fail/fail_tests
 test/fail/*.o
+test/cgm/cgm_tests
