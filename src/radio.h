@@ -1,30 +1,41 @@
 #pragma once
-// The Bluetooth side: one peripheral that is both a G7 sensor and a pod.
+// The Bluetooth side: one peripheral that is both a CGM (Dexcom G6 or G7) and
+// a pod.
 //
 // A phone cannot hold two connections to one radio, so the board cannot be
 // two Bluetooth devices to the same phone. It is one device, at the chip's
-// own address, whose GATT table carries both the G7's services and the pod's.
-// The app's G7 code and its pod code each connect to "their" device and share
+// own address, whose GATT table carries both the CGM's services and the pod's.
+// The app's CGM code and its pod code each connect to "their" device and share
 // the one link underneath.
 //
-// - Advertising: one set. Its payload is the pod's advertisement, the G7's,
+// - Advertising: one set. Its payload is the pod's advertisement, the CGM's,
 //   or the two taking turns, depending on who needs to be found (the pod's
 //   must carry exactly its own service list, so they cannot be merged).
-// - The link: a real G7 hangs up after every reading, and the app's G7 code
-//   only asks for a reading after connecting. So once per reading, when the
-//   pod is quiet, the board drops the link; both sides reconnect at once and
-//   the G7 code collects the new reading.
+// - The link: a real CGM ends the session when the phone has its reading, and
+//   the app's code only asks for a reading after connecting. So the core ends
+//   the link by itself (cgmDisconnect, done from tick()), and both sides
+//   reconnect at once.
 
+#include "cgm.h"
 #include "dash.h"
 #include "medtrum.h"
-#include "sensor.h"
 
 namespace radio {
-void begin(Sensor* sensor);
-// Call every ~50 ms: follows the sensor's advertising schedule and keeps the
-// pod advertising.
+// Sets up the GATT table and the advertising set. Call once the core has
+// started (sensor::begin()) and before the pod's and patch's tasks.
+void begin();
+// Call every ~50 ms: applies a hang-up the CGM asked for, and keeps the one
+// advertising set rotating between the CGM, the pod and the Medtrum patch.
 void tick();
 int openLinks();
+
+// The CGM core's radio (the radio half of cgm_io_t, and the glue's own view of
+// the link). cgmDisconnect only marks the hang-up: the core calls it from
+// inside its own mutex, so the link is terminated from tick() instead.
+void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n);
+void cgmDisconnect();
+void cgmAdvertise(bool on, const char* name, const uint8_t addr[6]);
+bool cgmConnected();
 
 // The pod's radio (the radio half of ESP-Sim's dash_io_t).
 bool podNextEvent(dash_ev_t* ev, uint32_t timeoutMs);

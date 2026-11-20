@@ -23,72 +23,15 @@
 #include <string.h>
 #include <sys/time.h>
 
+#include "radio.h"
 #include "util.h"
 
-// TODO(assembly) wire-g6: implement these in src/radio.{h,cpp}. They are
-// declared here (and nowhere else yet) so the glue compiles now; this unit
-// must not edit radio.*. The radio side of the CGM core is exactly:
-//
-//   void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n);
-//       Send a notification on the characteristic the phone subscribed to.
-//   void cgmDisconnect();
-//       Drop the current link.
-//   void cgmAdvertise(bool on, const char* name, const uint8_t addr[6]);
-//       Start/stop the CGM's advertising payload. A phone filters its scan on
-//       the 16-bit service UUID 0xFEBC, so the advert MUST carry it. Build it
-//       as a legacy connectable+scannable advert, exactly (all hex):
-//
-//         advertisement:  02 01 06          flags: LE general discoverable,
-//                                           BR/EDR not supported
-//                         03 03 BC FE       complete list of 16-bit UUIDs:
-//                                           0xFEBC, little-endian
-//                         LL 09 <name>      complete local name; LL =
-//                                           strlen(name) + 1
-//         scan response:  LL 09 <name>      the same name field
-//
-//       `name` is sensor::name() ("DXCM"+2 for G7, "Dexcom"+last 2 for G6),
-//       at most 15 characters, so the whole advert fits the 31-byte limit.
-//       Set `name` in both the advertisement and the scan response, as
-//       ESP-Sim's main/ble.c does. Do NOT add the old G7 advert's 0xFF
-//       manufacturer/CRC block: it is not in the reference's CGM advert and
-//       the apps do not need it. On this board's single advertising set the
-//       radio keeps the chip's own address; `addr` is only for the
-//       reference's second extended-adv instance. Keep the existing G7
-//       advertising window/interval schedule around this payload.
-//   bool cgmConnected();
-//       Whether a phone is connected (the panel shows this next to the core's
-//       own view of the link).
-//
-// and the radio must call back into the glue on every CGM GATT event:
-//
-//   sensor::onConnect();
-//   sensor::onDisconnect();
-//   sensor::onSubscribe(cgm_chr_t chr, bool on);
-//   sensor::onWrite(cgm_chr_t chr, const uint8_t* p, size_t n);
-//   size_t sensor::onRead(cgm_chr_t chr, uint8_t* out, size_t cap);
-//
-// The characteristics, as cgm.h numbers them: CGM_CHR_COMM = F8083533,
-// CGM_CHR_CONTROL = F8083534, CGM_CHR_AUTH = F8083535, CGM_CHR_BACKFILL =
-// F8083536 (all under service F8083532). Map by UUID, NOT by casting the
-// existing src/link.h Char enum: Char has Auth=0, Control=1, Backfill=2, so a
-// cast would send auth to COMM. Store the COMM (F8083533) handle too; the
-// current chars[4] has no slot for it. A write is the characteristic's value;
-// a read returns the auth challenge's bytes and length. src/radio.* therefore
-// needs "cgm.h" on its include path (PlatformIO supplies it from lib/cgmsim).
-// Do NOT hold radio's mutex while calling the sensor:: callbacks: the core
-// calls radio::cgmNotify/cgmDisconnect/cgmAdvertise from inside the glue's
-// mutex. In particular, radio::cgmDisconnect must terminate the link
-// asynchronously: the core calls it from inside the glue's mutex, so it must
-// not call sensor::onDisconnect before returning. Likewise cgmNotify should
-// notify once (the reference's ble_cgm_send has no retry loop); a pod-style
-// 100x5ms BLE_HS_ENOMEM loop would spin while the glue mutex is held.
-
-namespace radio {
-void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n);
-void cgmDisconnect();
-void cgmAdvertise(bool on, const char* name, const uint8_t addr[6]);
-bool cgmConnected();
-}  // namespace radio
+// The radio side of the core lives in src/radio.{h,cpp}: cgmNotify sends on
+// the characteristic the phone subscribed to (once, as the reference does),
+// cgmDisconnect only marks a hang-up for the radio's tick() to carry out (the
+// core calls it from inside this file's mutex), and cgmAdvertise builds the
+// FEBC advertisement under sensor::name(). Every CGM GATT event calls back in
+// here: onConnect, onDisconnect, onSubscribe, onWrite and onRead.
 
 namespace sensor {
 
@@ -567,17 +510,52 @@ std::string name() {
   return std::string(nm);
 }
 
+int64_t now() {
+  int64_t t = 0;
+  LOCKED({ t = nowSeconds(nullptr); });
+  return t;
+}
+
+int glucose() {
+  int g = 0;
+  LOCKED({ g = c.st.glucose; });
+  return g;
+}
+
+int trend() {
+  int t = 0;
+  LOCKED({ t = c.st.trend; });
+  return t;
+}
+
+int forcedState() {
+  int s = 0;
+  LOCKED({ s = c.st.forced_state; });
+  return s;
+}
+
 std::string statusJson() {
   bool radioUp = radio::cgmConnected();
   char json[1024];
   size_t n = 0;
-  LOCKED({ n = cgm_status_json(&c, json, sizeof json); });
+  int64_t now = 0, activated = 0, warmupDone = 0;
+  LOCKED({
+    n = cgm_status_json(&c, json, sizeof json);
+    now = nowSeconds(nullptr);
+    activated = c.st.activated;
+    warmupDone = c.st.warmup_done;
+  });
   if (n == 0 || n >= sizeof json) return "{}";
   std::string s(json, n);
   if (!s.empty() && s.back() == '}') s.pop_back();
   s += ",\"radioConnected\":";
   s += radioUp ? "true" : "false";
-  s += '}';
+  // The core reports clock times (Unix seconds); the panel shows the age, so
+  // it does not have to trust the browser's clock against an NTP-less board.
+  char extra[128];
+  snprintf(extra, sizeof extra, ",\"now\":%lld,\"ageSeconds\":%lld,\"warmupLeftSeconds\":%lld}", (long long)now,
+           (long long)(now - activated), (long long)(warmupDone > now ? warmupDone - now : 0));
+  s += extra;
   return s;
 }
 
@@ -672,6 +650,11 @@ const char* command(const std::string& json) {
              strcmp(cmd, "cgmSetId") == 0) {
     bool haveKind = jsonNumber(body, "kind", &v);
     bool haveId = jsonStr(body, "id", id, sizeof id);
+    // The core starts a new sensor now; a panel that wants an older one says
+    // how many minutes old (g7sim's ageMinutes).
+    long ageMinutes = 0;
+    bool haveAge = jsonNumber(body, "ageMinutes", &ageMinutes) && ageMinutes > 0;
+    if (haveAge && ageMinutes > 100 * 24 * 60) return "ageMinutes is 0 to 144000";
     if (!haveKind && strcmp(cmd, "cgmSetKind") == 0) return "kind is 0, 6 or 7";
     if (!haveId && strcmp(cmd, "cgmSetId") == 0) return "id is 6 characters (G6) or 2 (G7)";
     if (haveKind && v != 0 && v != 6 && v != 7) return "kind is 0, 6 or 7";
@@ -694,10 +677,28 @@ const char* command(const std::string& json) {
           memcpy(c.st.id, id, 2);
           c.st.id[2] = 0;
         }
+        if (haveAge) {
+          int64_t t = (int64_t)ageMinutes * 60;
+          int64_t now = nowSeconds(nullptr);
+          c.st.activated = now - t;
+          c.st.session_start = c.st.activated;
+          c.st.warmup_done = c.st.activated + (c.st.kind == CGM_G6 ? 2 * 3600 : 27 * 60);
+          c.st.next_n = (uint32_t)(t / CGM_READING_INTERVAL);
+        }
         persistNowLocked();  // the HTTP thread: commit the new identity now
         logf("sensor: new CGM, id %.8s (%s)", c.st.id, k == CGM_G6 ? "G6" : k == CGM_G7 ? "G7" : "off");
       });
     }
+  } else if (strcmp(cmd, "cgmSetCalibration") == 0) {
+    // What a G6 calibration write does on the control characteristic: the
+    // reading the panel last calibrated to, and the next reading set to it.
+    if (!jsonNumber(body, "glucose", &v) || v < 40 || v > 400) return "glucose is 40 to 400";
+    LOCKED({
+      c.st.calibration = (uint16_t)v;
+      c.st.calibration_t = (uint32_t)nowSeconds(nullptr);
+      c.st.glucose = (uint16_t)v;
+      persistNowLocked();
+    });
   } else if (strcmp(cmd, "cgmForget") == 0) {
     // The core has no pairing slots: it is authenticated-and-bonded for every
     // phone. "Forget" can only drop the current link (outside the glue's

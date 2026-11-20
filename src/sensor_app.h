@@ -12,8 +12,8 @@
 #include "cgm.h"
 
 // NOTE(assembly): C++ cannot have both this namespace and a global variable
-// named `sensor` in one translation unit. src/main.cpp's `Sensor* sensor`
-// must be renamed (e.g. `g7`) when it includes this header.
+// named `sensor` in one translation unit, so src/main.cpp has no global of
+// that name: the CGM is reached through this namespace only.
 
 namespace sensor {
 #define SENSOR_STATE_MAGIC 0x43474d31u /* "CGM1" */
@@ -38,7 +38,7 @@ void begin();
 void start();
 
 // The control panel's /g7 status JSON (the core's, plus the radio's own view
-// of the link).
+// of the link and the sensor's age).
 std::string statusJson();
 // One control-panel command ({"command": ...}); returns an error message, or
 // nullptr.
@@ -47,6 +47,13 @@ const char* command(const std::string& json);
 // What the panel and the radio ask about.
 cgm_kind_t kind();
 std::string name();
+// The simulated clock's Unix seconds (the readings' and activation's time).
+int64_t now();
+// What the panel set: the next reading's glucose and trend (tenths of mg/dL
+// per minute), and the forced algorithm state (0: from the session's age).
+int glucose();
+int trend();
+int forcedState();
 
 // From the radio, one call per GATT event. These take the core's mutex; the
 // radio must not hold its own lock while calling them (the core calls back
