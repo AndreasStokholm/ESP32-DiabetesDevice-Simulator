@@ -11,12 +11,15 @@
 //
 // Control: the USB serial console (type `help`) and the web panels, the G7's
 // at / and the pod's at /pod. With no Wi-Fi network saved, the board runs its
-// own access point (name and password are printed at boot).
+// own access point (name and password are printed at boot) and answers every
+// HTTP probe as a captive portal, so a phone that joins it gets the Wi-Fi
+// sheet at /setup.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <LittleFS.h>
 #include <Preferences.h>
@@ -31,8 +34,10 @@
 #include "medtrum_html.h"
 #include "pod.h"
 #include "pod_html.h"
+#include "portal.h"
 #include "radio.h"
 #include "sensor.h"
+#include "setup_html.h"
 
 static Sensor* sensor;
 static WebServer web(80);
@@ -40,6 +45,8 @@ static bool clockSynced = false, wifiConfigured = false, apStarted = false;
 static volatile int staFailures = 0;
 static int64_t restartAt = 0;
 static String apSsid, apPass;
+static DNSServer dns;
+static bool dnsStarted = false;
 
 // MARK: - Commands shared by the console and the API
 
@@ -103,8 +110,104 @@ static void saveWifi(const String& ssid, const String& pass) {
   p.end();
 }
 
+// MARK: - The captive portal
+
+// The `setup=done` cookie that "Continue without joining" sets: once present,
+// / in AP mode serves the app instead of redirecting back to the sheet.
+static bool setupDone() {
+  String cookies = web.header("Cookie");
+  int start = 0;
+  while (start < (int)cookies.length()) {
+    int end = cookies.indexOf(';', start);
+    if (end < 0) end = cookies.length();
+    String kv = cookies.substring(start, end);
+    kv.trim();
+    int eq = kv.indexOf('=');
+    if (eq > 0) {
+      String name = kv.substring(0, eq), value = kv.substring(eq + 1);
+      name.trim();
+      value.trim();
+      if (name == "setup" && value == "done") return true;
+    }
+    start = end + 1;
+  }
+  return false;
+}
+
+// A saved network the board is actually on. In AP mode, or while a saved
+// network is unreachable and the AP has taken over, this is false.
+static bool hasNetwork() { return wifiConfigured && WiFi.status() == WL_CONNECTED; }
+
+// The one Wi-Fi save handler: /pod/wifi, /medtrum/wifi and /setup/wifi all
+// land here (and /settings/wifi will too). Save, then let the loop restart.
+static void sendWifiSaved() {
+  JsonDocument j;
+  if (deserializeJson(j, web.arg("plain")) || !j["ssid"].is<const char*>() || !j["password"].is<const char*>()) {
+    web.send(400, "text/plain", "want {\"ssid\": ..., \"password\": ...}");
+    return;
+  }
+  String ssid = j["ssid"].as<const char*>(), pass = j["password"].as<const char*>();
+  if (ssid.length() && pass.length() && pass.length() < 8) {
+    web.send(400, "text/plain", "a WPA2 password has at least 8 characters");
+    return;
+  }
+  saveWifi(ssid, pass);
+  web.send(200, "text/plain", "saved; restarting\n");
+  restartAt = monoMs() + 1000;
+}
+
+// The OS probes: answer each one the way that closes (or opens) its sheet.
+static void sendPortalProbe() {
+  switch (portalDecide(web.uri().c_str(), "GET", hasNetwork() ? 1 : 0, setupDone() ? 1 : 0)) {
+    case PORTAL_PROBE_APPLE_HTML:
+      web.send_P(200, "text/html; charset=utf-8", setupHTML);
+      break;
+    case PORTAL_PROBE_APPLE_SUCCESS:
+      web.send_P(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+      break;
+    case PORTAL_PROBE_ANDROID_204:
+      web.send(204, "text/plain", "");
+      break;
+    case PORTAL_PROBE_CONNECTTEST:
+      web.send_P(200, "text/plain", "Microsoft Connect Test");
+      break;
+    case PORTAL_PROBE_NCSI:
+      web.send_P(200, "text/plain", "Microsoft NCSI");
+      break;
+    case PORTAL_PROBE_FWLINK:
+      web.sendHeader("Location", "/setup");
+      web.send(302, "text/plain", "");
+      break;
+    default:
+      web.send(404, "text/plain", "not found\n");
+      break;
+  }
+}
+
 static void startWeb() {
-  web.on("/", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", indexHTML); });
+  // The captive portal's own pages.
+  web.on("/", HTTP_GET, [] {
+    if (portalDecide("/", "GET", hasNetwork() ? 1 : 0, setupDone() ? 1 : 0) == PORTAL_REDIRECT_SETUP) {
+      web.sendHeader("Location", "/setup");
+      web.send(302, "text/plain", "");
+      return;
+    }
+    web.send_P(200, "text/html; charset=utf-8", indexHTML);
+  });
+  web.on("/setup", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", setupHTML); });
+  web.on("/setup/wifi", HTTP_POST, sendWifiSaved);
+  web.on("/setup/dismiss", HTTP_POST, [] {
+    web.sendHeader("Set-Cookie", "setup=done; Path=/; Max-Age=604800");
+    web.send(200, "text/plain", "dismissed\n");
+  });
+  web.on("/hotspot-detect.html", HTTP_GET, sendPortalProbe);
+  web.on("/library/test/success.html", HTTP_GET, sendPortalProbe);
+  web.on("/generate_204", HTTP_GET, sendPortalProbe);
+  web.on("/gen_204", HTTP_GET, sendPortalProbe);
+  web.on("/connecttest.txt", HTTP_GET, sendPortalProbe);
+  web.on("/ncsi.txt", HTTP_GET, sendPortalProbe);
+  web.on("/fwlink/", HTTP_GET, sendPortalProbe);
+  web.on("/fwlink", HTTP_GET, sendPortalProbe);
   web.on("/status", HTTP_GET, sendStatus);
   web.on("/glucose", HTTP_POST, [] {
     JsonDocument j;
@@ -158,21 +261,7 @@ static void startWeb() {
     }
     web.send(200, "application/json", pod::statusJson().c_str());
   });
-  web.on("/pod/wifi", HTTP_POST, [] {
-    JsonDocument j;
-    if (deserializeJson(j, web.arg("plain")) || !j["ssid"].is<const char*>() || !j["password"].is<const char*>()) {
-      web.send(400, "text/plain", "want {\"ssid\": ..., \"password\": ...}");
-      return;
-    }
-    String ssid = j["ssid"].as<const char*>(), pass = j["password"].as<const char*>();
-    if (ssid.length() && pass.length() && pass.length() < 8) {
-      web.send(400, "text/plain", "a WPA2 password has at least 8 characters");
-      return;
-    }
-    saveWifi(ssid, pass);
-    web.send(200, "text/plain", "saved; restarting\n");
-    restartAt = monoMs() + 1000;
-  });
+  web.on("/pod/wifi", HTTP_POST, sendWifiSaved);
   // The Medtrum patch's panel and API (under /medtrum).
   web.on("/medtrum", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", medtrumHTML); });
   web.on("/medtrum/status", HTTP_GET, [] {
@@ -198,21 +287,7 @@ static void startWeb() {
     }
     web.send(200, "application/json", medtrum::statusJson().c_str());
   });
-  web.on("/medtrum/wifi", HTTP_POST, [] {
-    JsonDocument j;
-    if (deserializeJson(j, web.arg("plain")) || !j["ssid"].is<const char*>() || !j["password"].is<const char*>()) {
-      web.send(400, "text/plain", "want {\"ssid\": ..., \"password\": ...}");
-      return;
-    }
-    String ssid = j["ssid"].as<const char*>(), pass = j["password"].as<const char*>();
-    if (ssid.length() && pass.length() && pass.length() < 8) {
-      web.send(400, "text/plain", "a WPA2 password has at least 8 characters");
-      return;
-    }
-    saveWifi(ssid, pass);
-    web.send(200, "text/plain", "saved; restarting\n");
-    restartAt = monoMs() + 1000;
-  });
+  web.on("/medtrum/wifi", HTTP_POST, sendWifiSaved);
   web.onNotFound([] { web.send(404, "text/plain", "not found\n"); });
   web.begin();
   MDNS.begin("esp-sim");
@@ -226,6 +301,24 @@ static void startWeb() {
 // ESP-Sim does): its password comes from the chip's MAC and is printed on the
 // console, so no credential is built into the firmware.
 
+// The captive DNS: every A record answers with the board's own AP address,
+// so a probe for any name lands here. It only runs while the AP is up.
+static void startDns() {
+  if (dnsStarted) return;
+  IPAddress ip = WiFi.softAPIP();
+  if (ip[0] == 0) return;
+  dns.start(53, "*", ip);
+  dnsStarted = true;
+  logf("Wi-Fi: DNS answers every name with %s", ip.toString().c_str());
+}
+
+static void stopDns() {
+  if (!dnsStarted) return;
+  dns.stop();
+  dnsStarted = false;
+  logf("Wi-Fi: captive DNS stopped");
+}
+
 static void startAP() {
   if (apStarted) return;
   apStarted = true;
@@ -238,6 +331,7 @@ static void startAP() {
   WiFi.softAP(ssid, pass, 1, 0, 4);
   apSsid = ssid;
   apPass = pass;
+  startDns();
   logf("Wi-Fi: access point \"%s\", password \"%s\": panels at http://192.168.4.1/", ssid, pass);
 }
 
@@ -282,6 +376,7 @@ static void pollWifi() {
   bool up = WiFi.status() == WL_CONNECTED;
   if (up && !wasUp) {
     staFailures = 0;
+    stopDns();
     logf("Wi-Fi up: panels at http://%s/  (http://esp-sim.local/)", WiFi.localIP().toString().c_str());
   }
   wasUp = up;
@@ -579,6 +674,7 @@ void loop() {
   }
   pollConsole();
   if (wifiConfigured) pollWifi();
+  if (dnsStarted) dns.processNextRequest();
   web.handleClient();
   if (restartAt && now >= restartAt) {
     sensor->persist();

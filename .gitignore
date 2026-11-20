@@ -1,3 +1,5 @@
 .pio/
 .vscode/
 flasher/dist/
+test/portal/portal_tests
+test/portal/*.o
