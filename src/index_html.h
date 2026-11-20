@@ -13,6 +13,11 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
   header { padding:16px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:4px 20px; align-items:baseline; }
   header h1 { font-size:18px; margin:0; }
   header .meta { color:var(--mut); font-size:13px; }
+  nav { display:flex; flex-wrap:wrap; gap:2px 18px; align-items:baseline; padding:12px 16px; border-bottom:1px solid var(--line); max-width:760px; margin:0 auto; }
+  nav .brand { font-weight:600; margin-right:auto; }
+  nav a { color:var(--mut); text-decoration:none; font-size:14px; }
+  nav a:hover { color:var(--fg); }
+  nav a.active { color:var(--accent); }
   main { max-width:760px; margin:0 auto; padding:16px; display:grid; gap:16px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
   .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin:0 0 12px; }
@@ -46,14 +51,20 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
 </style>
 </head>
 <body>
+<nav>
+  <span class="brand">ESP-Sim</span>
+  <a href="/">Home</a>
+  <a class="active" href="/g7">G7</a>
+  <a href="/pod">Pod</a>
+  <a href="/medtrum">Medtrum</a>
+  <a href="/settings">Settings</a>
+</nav>
 <header>
   <h1 id="name">G7 sensor</h1>
   <span class="meta" id="model"></span>
   <span class="meta" id="serial"></span>
   <span class="meta" id="code"></span>
   <span class="meta" id="age"></span>
-  <a class="meta" href="/pod" style="margin-left:auto;color:var(--accent)">Pod panel &rarr;</a>
-  <a class="meta" href="/medtrum" style="color:var(--accent)">Medtrum patch panel &rarr;</a>
 </header>
 <main>
   <div class="card">
@@ -108,6 +119,21 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
       <option value="1">Stopped</option>
     </select>
     <div class="muted" style="margin-top:8px">Any non-normal state is sent as-is; the error states report no glucose.</div>
+  </div>
+
+  <div class="card">
+    <h2>Failure injection</h2>
+    <div class="row">
+      <div><label for="failRefuse">Refuse connects</label><input type="number" id="failRefuse" min="0" max="1000" step="1" value="0"></div>
+      <div><label for="failQuiet">Go quiet (s)</label><input type="number" id="failQuiet" min="0" max="86400" step="1" value="0"></div>
+      <div><label for="failDelay">Delay each notification (ms)</label><input type="number" id="failDelay" min="0" max="60000" step="10" value="0"></div>
+    </div>
+    <div style="margin-top:14px; display:flex; flex-wrap:wrap; gap:8px 12px">
+      <button class="danger" id="failDrop" type="button">Drop next connect</button>
+      <button class="primary" id="failApply" type="button">Apply</button>
+      <button id="failClear" type="button">Clear</button>
+    </div>
+    <div class="muted" id="failMsg" style="margin-top:8px">One BLE link is shared by all three simulators, so drop and refuse act on the next connection whichever device asked; quiet removes only this device from advertising for the chosen time. The G7's notifications are sent by the sensor task, so a delay is recorded but not applied to them.</div>
   </div>
 
   <div class="card">
@@ -253,6 +279,24 @@ field('nsStart').onclick = async()=>{
   } catch(e){ msg.textContent = 'Failed — '+e.message; }
 };
 showPreset();
+
+async function fail(body, done) {
+  const msg = document.getElementById('failMsg');
+  msg.textContent = 'Applying…';
+  try {
+    const r = await fetch('/fail',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const t = await r.text();
+    if(!r.ok) throw new Error(t.trim());
+    msg.textContent = done;
+    setTimeout(()=>{ if(msg.textContent===done) msg.textContent=''; }, 2500);
+  } catch(e){ msg.textContent = 'Failed — '+e.message; }
+}
+document.getElementById('failDrop').onclick = ()=>fail({device:'g7', drop:true}, 'Next connection will be dropped');
+document.getElementById('failApply').onclick = ()=>fail({device:'g7',
+  refuse:+document.getElementById('failRefuse').value,
+  quietMs:+document.getElementById('failQuiet').value*1000,
+  delayMs:+document.getElementById('failDelay').value}, 'Failure set');
+document.getElementById('failClear').onclick = ()=>fail({device:'g7', drop:false, refuse:0, quietMs:0, delayMs:0, ignore:0}, 'Failures cleared');
 setKind('sine'); refresh(); setInterval(refresh, 2000);
 </script>
 </body>

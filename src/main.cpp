@@ -9,14 +9,17 @@
 // insulin and every value it reports is made up. Never use it, or an app
 // paired to it, for therapy.
 //
-// Control: the USB serial console (type `help`) and the web panels, the G7's
-// at / and the pod's at /pod. With no Wi-Fi network saved, the board runs its
-// own access point (name and password are printed at boot).
+// Control: the USB serial console (type `help`) and the web pages: the home
+// page at /, the G7's at /g7 and the pod's at /pod. With no Wi-Fi network saved,
+// the board runs its own access point (name and password are printed at boot)
+// and answers every HTTP probe as a captive portal, so a phone that joins it
+// gets the Wi-Fi sheet at /setup.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <LittleFS.h>
 #include <Preferences.h>
@@ -26,13 +29,25 @@
 #include <esp_sntp.h>
 
 #include "crypto.h"
+#include "fail.h"
+#include "home_html.h"
 #include "index_html.h"
 #include "medtrum_app.h"
 #include "medtrum_html.h"
 #include "pod.h"
 #include "pod_html.h"
+#include "portal.h"
 #include "radio.h"
 #include "sensor.h"
+#include "settings_html.h"
+#include "setup_html.h"
+
+// The firmware's commit. tools/make_flasher.sh pins one for the flasher's
+// manifest, but the PlatformIO build has no hook to pass it to the firmware
+// yet, so a plain `pio run` says "unknown" instead of inventing a hash.
+#ifndef ESP_SIM_COMMIT
+#define ESP_SIM_COMMIT "unknown"
+#endif
 
 static Sensor* sensor;
 static WebServer web(80);
@@ -40,6 +55,8 @@ static bool clockSynced = false, wifiConfigured = false, apStarted = false;
 static volatile int staFailures = 0;
 static int64_t restartAt = 0;
 static String apSsid, apPass;
+static DNSServer dns;
+static bool dnsStarted = false;
 
 // MARK: - Commands shared by the console and the API
 
@@ -89,6 +106,25 @@ static void sendStatus() {
   sendJson(200, d);
 }
 
+// MARK: - Failure injection
+
+static String failStateJson() {
+  JsonDocument d;
+  int64_t now = monoMs();
+  for (int i = 0; i < FAIL_DEVICE_COUNT; i++) {
+    FailState s = fail_get((FailDevice)i);
+    JsonObject o = d[fail_device_name((FailDevice)i)].to<JsonObject>();
+    o["drop"] = s.dropPending != 0;
+    o["refuse"] = s.refuseConnects;
+    o["quietMs"] = s.quietUntilMs > now ? s.quietUntilMs - now : 0;
+    o["delayMs"] = s.delayMs;
+    o["ignore"] = s.ignoreMessages;
+  }
+  String out;
+  serializeJsonPretty(d, out);
+  return out;
+}
+
 static void saveWifi(const String& ssid, const String& pass) {
   Preferences p;
   p.begin("net", false);
@@ -103,8 +139,212 @@ static void saveWifi(const String& ssid, const String& pass) {
   p.end();
 }
 
+// MARK: - The captive portal
+
+// The `setup=done` cookie that "Continue without joining" sets: once present,
+// / in AP mode serves the app instead of redirecting back to the sheet.
+static bool setupDone() {
+  String cookies = web.header("Cookie");
+  int start = 0;
+  while (start < (int)cookies.length()) {
+    int end = cookies.indexOf(';', start);
+    if (end < 0) end = cookies.length();
+    String kv = cookies.substring(start, end);
+    kv.trim();
+    int eq = kv.indexOf('=');
+    if (eq > 0) {
+      String name = kv.substring(0, eq), value = kv.substring(eq + 1);
+      name.trim();
+      value.trim();
+      if (name == "setup" && value == "done") return true;
+    }
+    start = end + 1;
+  }
+  return false;
+}
+
+// A saved network the board is actually on. In AP mode, or while a saved
+// network is unreachable and the AP has taken over, this is false.
+static bool hasNetwork() { return wifiConfigured && WiFi.status() == WL_CONNECTED; }
+
+// The one Wi-Fi save handler: /settings/wifi is its home, and /setup/wifi,
+// /pod/wifi and /medtrum/wifi stay as aliases to the SAME handler. Save, then
+// let the loop restart.
+static void sendWifiSaved() {
+  JsonDocument j;
+  if (deserializeJson(j, web.arg("plain")) || !j["ssid"].is<const char*>() || !j["password"].is<const char*>()) {
+    web.send(400, "text/plain", "want {\"ssid\": ..., \"password\": ...}");
+    return;
+  }
+  String ssid = j["ssid"].as<const char*>(), pass = j["password"].as<const char*>();
+  if (ssid.length() && pass.length() && pass.length() < 8) {
+    web.send(400, "text/plain", "a WPA2 password has at least 8 characters");
+    return;
+  }
+  saveWifi(ssid, pass);
+  web.send(200, "text/plain", "saved; restarting\n");
+  restartAt = monoMs() + 1000;
+}
+
+// MARK: - The board's own page: Network + Board
+
+static String savedSsid() {
+  Preferences p;
+  p.begin("net", true);
+  String ssid = p.isKey("ssid") ? p.getString("ssid") : "";
+  p.end();
+  return ssid;
+}
+
+static void sendSettingsStatus() {
+  JsonDocument d;
+  d["wifi"]["ssid"] = savedSsid();
+  d["wifi"]["joined"] = hasNetwork();
+  d["ip"] = hasNetwork() ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  d["clock"] = wallMs() ? "set from NTP" : "not set (NTP never ran)";
+  d["firmware"]["commit"] = ESP_SIM_COMMIT;
+  d["firmware"]["built"] = __DATE__ " " __TIME__;
+  sendJson(200, d);
+}
+
+// The OS probes: answer each one the way that closes (or opens) its sheet.
+static void sendPortalProbe() {
+  switch (portalDecide(web.uri().c_str(), "GET", hasNetwork() ? 1 : 0, setupDone() ? 1 : 0)) {
+    case PORTAL_PROBE_APPLE_HTML:
+      web.send_P(200, "text/html; charset=utf-8", setupHTML);
+      break;
+    case PORTAL_PROBE_APPLE_SUCCESS:
+      web.send_P(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+      break;
+    case PORTAL_PROBE_ANDROID_REDIRECT:
+    case PORTAL_PROBE_WINDOWS_REDIRECT:
+    case PORTAL_PROBE_FWLINK:
+      web.sendHeader("Location", "/setup");
+      web.send(302, "text/plain", "");
+      break;
+    case PORTAL_PROBE_ANDROID_204:
+      web.send(204, "text/plain", "");
+      break;
+    case PORTAL_PROBE_CONNECTTEST:
+      web.send_P(200, "text/plain", "Microsoft Connect Test");
+      break;
+    case PORTAL_PROBE_NCSI:
+      web.send_P(200, "text/plain", "Microsoft NCSI");
+      break;
+    default:
+      web.send(404, "text/plain", "not found\n");
+      break;
+  }
+}
+
 static void startWeb() {
-  web.on("/", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", indexHTML); });
+  // The captive portal's own pages.
+  web.on("/", HTTP_GET, [] {
+    if (portalDecide("/", "GET", hasNetwork() ? 1 : 0, setupDone() ? 1 : 0) == PORTAL_REDIRECT_SETUP) {
+      web.sendHeader("Location", "/setup");
+      web.send(302, "text/plain", "");
+      return;
+    }
+    web.send_P(200, "text/html; charset=utf-8", homeHTML);
+  });
+  web.on("/g7", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", indexHTML); });
+  web.on("/setup", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", setupHTML); });
+  web.on("/setup/wifi", HTTP_POST, sendWifiSaved);
+  web.on("/setup/dismiss", HTTP_POST, [] {
+    web.sendHeader("Set-Cookie", "setup=done; Path=/; Max-Age=604800");
+    web.send(200, "text/plain", "dismissed\n");
+  });
+  web.on("/hotspot-detect.html", HTTP_GET, sendPortalProbe);
+  web.on("/library/test/success.html", HTTP_GET, sendPortalProbe);
+  web.on("/generate_204", HTTP_GET, sendPortalProbe);
+  web.on("/gen_204", HTTP_GET, sendPortalProbe);
+  web.on("/connecttest.txt", HTTP_GET, sendPortalProbe);
+  web.on("/ncsi.txt", HTTP_GET, sendPortalProbe);
+  web.on("/fwlink/", HTTP_GET, sendPortalProbe);
+  web.on("/fwlink", HTTP_GET, sendPortalProbe);
+  web.on("/settings", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", settingsHTML); });
+  web.on("/settings/status", HTTP_GET, sendSettingsStatus);
+  web.on("/settings/wifi", HTTP_POST, sendWifiSaved);
+  web.on("/settings/forget", HTTP_POST, [] {
+    saveWifi("", "");
+    web.send(200, "text/plain", "forgotten; restarting\n");
+    restartAt = monoMs() + 1000;
+  });
+  web.on("/settings/reboot", HTTP_POST, [] {
+    web.send(200, "text/plain", "rebooting\n");
+    restartAt = monoMs() + 1000;
+  });
+  web.on("/fail", HTTP_POST, [] {
+    JsonDocument j;
+    if (deserializeJson(j, web.arg("plain")) || !j["device"].is<const char*>()) {
+      web.send(400, "text/plain", "want {\"device\":\"pod|g7|medtrum|all\", ...}\n");
+      return;
+    }
+    const char* name = j["device"].as<const char*>();
+    int dev = fail_device_from_name(name);
+    bool all = strcmp(name, "all") == 0;
+    if (dev < 0 && !all) {
+      web.send(400, "text/plain", "device is pod, g7, medtrum or all");
+      return;
+    }
+    FailRequest r = {FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT};
+    if (!j["drop"].isNull()) {
+      if (!j["drop"].is<bool>()) {
+        web.send(400, "text/plain", "drop is true or false");
+        return;
+      }
+      r.drop = j["drop"].as<bool>() ? 1 : 0;
+    }
+    if (!j["refuse"].isNull()) {
+      if (!j["refuse"].is<int>() || j["refuse"].as<int>() < 0) {
+        web.send(400, "text/plain", "refuse is 0-1000 connects");
+        return;
+      }
+      r.refuse = j["refuse"].as<int>();
+    }
+    if (!j["quietMs"].isNull()) {
+      if (!j["quietMs"].is<int>() || j["quietMs"].as<int>() < 0) {
+        web.send(400, "text/plain", "quietMs is 0-86400000 ms");
+        return;
+      }
+      r.quietMs = j["quietMs"].as<int>();
+    }
+    if (!j["delayMs"].isNull()) {
+      if (!j["delayMs"].is<int>() || j["delayMs"].as<int>() < 0) {
+        web.send(400, "text/plain", "delayMs is 0-60000 ms");
+        return;
+      }
+      r.delayMs = j["delayMs"].as<int>();
+    }
+    if (!j["ignore"].isNull()) {
+      if (!j["ignore"].is<int>() || j["ignore"].as<int>() < 0) {
+        web.send(400, "text/plain", "ignore is 0-1000 messages");
+        return;
+      }
+      r.ignore = j["ignore"].as<int>();
+    }
+    int64_t now = monoMs();
+    const char* err = nullptr;
+    auto applyOne = [&](FailDevice d) {
+      if (!err) err = fail_apply(d, &r, now);
+    };
+    if (all) {
+      for (int i = 0; i < FAIL_DEVICE_COUNT; i++) applyOne((FailDevice)i);
+    } else {
+      applyOne((FailDevice)dev);
+    }
+    if (err) {
+      web.send(400, "text/plain", err);
+      return;
+    }
+    const char* who = all ? "all" : name;
+    if (r.drop >= 0) logf("fail: %s %s", who, r.drop ? "drops the next connect" : "drop cleared");
+    if (r.refuse >= 0) logf("fail: %s refuses %d connects", who, r.refuse);
+    if (r.quietMs >= 0) logf("fail: %s quiet for %d ms", who, r.quietMs);
+    if (r.delayMs >= 0) logf("fail: %s delays notifications by %d ms", who, r.delayMs);
+    if (r.ignore >= 0) logf("fail: %s ignores %d messages", who, r.ignore);
+    web.send(200, "application/json", failStateJson());
+  });
   web.on("/status", HTTP_GET, sendStatus);
   web.on("/glucose", HTTP_POST, [] {
     JsonDocument j;
@@ -158,21 +398,7 @@ static void startWeb() {
     }
     web.send(200, "application/json", pod::statusJson().c_str());
   });
-  web.on("/pod/wifi", HTTP_POST, [] {
-    JsonDocument j;
-    if (deserializeJson(j, web.arg("plain")) || !j["ssid"].is<const char*>() || !j["password"].is<const char*>()) {
-      web.send(400, "text/plain", "want {\"ssid\": ..., \"password\": ...}");
-      return;
-    }
-    String ssid = j["ssid"].as<const char*>(), pass = j["password"].as<const char*>();
-    if (ssid.length() && pass.length() && pass.length() < 8) {
-      web.send(400, "text/plain", "a WPA2 password has at least 8 characters");
-      return;
-    }
-    saveWifi(ssid, pass);
-    web.send(200, "text/plain", "saved; restarting\n");
-    restartAt = monoMs() + 1000;
-  });
+  web.on("/pod/wifi", HTTP_POST, sendWifiSaved);
   // The Medtrum patch's panel and API (under /medtrum).
   web.on("/medtrum", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", medtrumHTML); });
   web.on("/medtrum/status", HTTP_GET, [] {
@@ -198,21 +424,7 @@ static void startWeb() {
     }
     web.send(200, "application/json", medtrum::statusJson().c_str());
   });
-  web.on("/medtrum/wifi", HTTP_POST, [] {
-    JsonDocument j;
-    if (deserializeJson(j, web.arg("plain")) || !j["ssid"].is<const char*>() || !j["password"].is<const char*>()) {
-      web.send(400, "text/plain", "want {\"ssid\": ..., \"password\": ...}");
-      return;
-    }
-    String ssid = j["ssid"].as<const char*>(), pass = j["password"].as<const char*>();
-    if (ssid.length() && pass.length() && pass.length() < 8) {
-      web.send(400, "text/plain", "a WPA2 password has at least 8 characters");
-      return;
-    }
-    saveWifi(ssid, pass);
-    web.send(200, "text/plain", "saved; restarting\n");
-    restartAt = monoMs() + 1000;
-  });
+  web.on("/medtrum/wifi", HTTP_POST, sendWifiSaved);
   web.onNotFound([] { web.send(404, "text/plain", "not found\n"); });
   web.begin();
   MDNS.begin("esp-sim");
@@ -226,6 +438,24 @@ static void startWeb() {
 // ESP-Sim does): its password comes from the chip's MAC and is printed on the
 // console, so no credential is built into the firmware.
 
+// The captive DNS: every A record answers with the board's own AP address,
+// so a probe for any name lands here. It only runs while the AP is up.
+static void startDns() {
+  if (dnsStarted) return;
+  IPAddress ip = WiFi.softAPIP();
+  if (ip[0] == 0) return;
+  dns.start(53, "*", ip);
+  dnsStarted = true;
+  logf("Wi-Fi: DNS answers every name with %s", ip.toString().c_str());
+}
+
+static void stopDns() {
+  if (!dnsStarted) return;
+  dns.stop();
+  dnsStarted = false;
+  logf("Wi-Fi: captive DNS stopped");
+}
+
 static void startAP() {
   if (apStarted) return;
   apStarted = true;
@@ -238,6 +468,7 @@ static void startAP() {
   WiFi.softAP(ssid, pass, 1, 0, 4);
   apSsid = ssid;
   apPass = pass;
+  startDns();
   logf("Wi-Fi: access point \"%s\", password \"%s\": panels at http://192.168.4.1/", ssid, pass);
 }
 
@@ -282,12 +513,18 @@ static void pollWifi() {
   bool up = WiFi.status() == WL_CONNECTED;
   if (up && !wasUp) {
     staFailures = 0;
+    stopDns();
     logf("Wi-Fi up: panels at http://%s/  (http://esp-sim.local/)", WiFi.localIP().toString().c_str());
   }
   wasUp = up;
   if (!up && staFailures >= 5 && !apStarted) {
     logf("Wi-Fi: could not join the saved network: starting the access point too");
     startAP();
+  }
+  // The AP may still be up after a later drop (a sleeping hotspot), and the
+  // sheet needs its wildcard DNS again; it was stopped when the board joined.
+  if (!up && apStarted && !dnsStarted) {
+    startDns();
   }
   // Keep trying while the network is away (e.g. a phone hotspot that sleeps).
   static int64_t lastTry = monoMs();
@@ -352,6 +589,13 @@ static void help() {
       "  pod ignoreNextMessages <count>      stay connected but leave that many messages unanswered\n"
       "  pod failNextConnects <count> [sec]  loopkit/pod's command; needs its ImpossiBLE transport\n"
       "  pod selftest                        check the pod's crypto on this board\n"
+      "Failure injection (one radio, one decision set per device):\n"
+      "  fail <pod|g7|medtrum|all> drop     drop the next connection once\n"
+      "  fail <device> refuse <n>           drop the next n connections\n"
+      "  fail <device> quiet <ms>           stop advertising that device for ms\n"
+      "  fail <device> delay <ms>           delay each notification from that device\n"
+      "  fail <device> ignore <n>           drop the next n messages to that device\n"
+      "  fail <device> clear                clear every knob for that device\n"
       "Board:\n"
       "  wifi <ssid> [password] | wifi off   join Wi-Fi for the web panels + NTP (restarts)\n"
       "  scan                                list the Wi-Fi networks the board can see\n"
@@ -461,6 +705,70 @@ static void command(const std::string& line) {
     }
     logf("replacing %s with a new %s sensor, code %s", sensor->name().c_str(), next.model.c_str(), next.code.c_str());
     replaceSensor(next);
+  } else if (cmd == "fail") {
+    if (a.size() < 3) {
+      Serial.println("fail: want fail <pod|g7|medtrum|all> <drop|refuse|quiet|delay|ignore|clear> [n]");
+      return;
+    }
+    bool all = a[1] == "all";
+    int dev = fail_device_from_name(a[1].c_str());
+    if (dev < 0 && !all) {
+      Serial.println("fail: device is pod, g7, medtrum or all");
+      return;
+    }
+    const std::string& what = a[2];
+    if (what == "clear") {
+      if (all) fail_clear_all();
+      else fail_clear((FailDevice)dev);
+      logf("fail: %s cleared", all ? "every device" : a[1].c_str());
+      Serial.println(failStateJson().c_str());
+      return;
+    }
+    if (what != "drop" && what != "refuse" && what != "quiet" && what != "delay" && what != "ignore") {
+      Serial.println("fail: want drop, refuse, quiet, delay, ignore or clear");
+      return;
+    }
+    FailRequest r = {FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT};
+    int n = 0;
+    if (what == "drop") {
+      r.drop = 1;
+    } else {
+      if (a.size() < 4) {
+        Serial.println("fail: want a number for refuse, quiet, delay or ignore");
+        return;
+      }
+      double v = atof(a[3].c_str());
+      if (!(v >= 0) || v > 86400000.0) {
+        Serial.println("fail: number is out of range");
+        return;
+      }
+      n = (int)v;
+      if (what == "refuse") r.refuse = n;
+      else if (what == "quiet") r.quietMs = n;
+      else if (what == "delay") r.delayMs = n;
+      else r.ignore = n;
+    }
+    int64_t now = monoMs();
+    const char* err = nullptr;
+    auto applyOne = [&](FailDevice d) {
+      if (!err) err = fail_apply(d, &r, now);
+    };
+    if (all) {
+      for (int i = 0; i < FAIL_DEVICE_COUNT; i++) applyOne((FailDevice)i);
+    } else {
+      applyOne((FailDevice)dev);
+    }
+    if (err) {
+      Serial.printf("fail: %s\n", err);
+      return;
+    }
+    const char* who = all ? "all" : a[1].c_str();
+    if (r.drop >= 0) logf("fail: %s drops the next connect", who);
+    else if (r.refuse >= 0) logf("fail: %s refuses %d connects", who, n);
+    else if (r.quietMs >= 0) logf("fail: %s quiet for %d ms", who, n);
+    else if (r.delayMs >= 0) logf("fail: %s delays notifications by %d ms", who, n);
+    else if (r.ignore >= 0) logf("fail: %s ignores %d messages", who, n);
+    Serial.println(failStateJson().c_str());
   } else if (cmd == "pod") {
     std::string sub = a.size() >= 2 ? a[1] : "";
     std::string v = a.size() >= 3 ? a[2] : "";
@@ -579,6 +887,7 @@ void loop() {
   }
   pollConsole();
   if (wifiConfigured) pollWifi();
+  if (dnsStarted) dns.processNextRequest();
   web.handleClient();
   if (restartAt && now >= restartAt) {
     sensor->persist();
