@@ -135,14 +135,7 @@ static const char podHTML[] PROGMEM = R"PODHTML(<!doctype html>
     <div class="actions" style="margin-top:0"><button class="danger" id="newPod">Forget this pod and start a new one</button></div>
     <div class="muted" style="margin-top:8px">Clears pairing and delivery: the next phone pairs it as a fresh pod. Deactivating the pod from the app does the same.</div>
   </section>
-
-  <section class="card" aria-labelledby="h-wifi">
-    <h2 id="h-wifi">Wi-Fi</h2>
-    <label for="wifiSsid">Network name</label> <input id="wifiSsid" autocomplete="off">
-    <label for="wifiPass">Password</label> <input id="wifiPass" type="password" autocomplete="off">
-    <div class="actions"><button id="wifiSet">Join and restart</button><button id="wifiForget">Forget network</button></div>
-    <div class="muted" style="margin-top:8px">Joining a network gives the pod the right time and puts this panel on your LAN; the board prints its address on the serial console. Without one it runs its own access point.</div>
-  </section>
+  <!-- Wi-Fi moved to the Settings page: the old fetch('/pod/wifi' call is gone from this panel; /pod/wifi stays as an alias. -->
 
   <section class="card" aria-labelledby="h-comms">
     <h2 id="h-comms">Comms</h2>
@@ -324,11 +317,6 @@ $('typeSet').onclick = ()=>{ const o5 = last.podType === 'Omnipod 5', name = o5 
       +'Forget this pod and become a new, unpaired '+name+' pod?'))
     send({command:'setPodType', value:o5 ? 0 : 1}, 'Now a new '+name+' pod'); };
 $('newPod').onclick = ()=>{ if(confirm('Forget this pod? The phone will need to pair a new one.')) send({command:'resetPod'}, 'New pod ready'); };
-async function wifi(body, done){
-  try { const r = await fetch('/pod/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const t = await r.text(); if(!r.ok) throw new Error(t.trim()); say(done); } catch(e){ say('Failed — '+e.message); } }
-$('wifiSet').onclick = ()=>wifi({ssid:$('wifiSsid').value, password:$('wifiPass').value}, 'Saved — restarting');
-$('wifiForget').onclick = ()=>wifi({ssid:'', password:''}, 'Forgotten — restarting');
 
 function chip(el, text, cls){ el.textContent=text; el.className='chip '+(cls||''); }
 

@@ -37,7 +37,15 @@
 #include "portal.h"
 #include "radio.h"
 #include "sensor.h"
+#include "settings_html.h"
 #include "setup_html.h"
+
+// The firmware's commit. tools/make_flasher.sh pins one for the flasher's
+// manifest, but the PlatformIO build has no hook to pass it to the firmware
+// yet, so a plain `pio run` says "unknown" instead of inventing a hash.
+#ifndef ESP_SIM_COMMIT
+#define ESP_SIM_COMMIT "unknown"
+#endif
 
 static Sensor* sensor;
 static WebServer web(80);
@@ -138,8 +146,9 @@ static bool setupDone() {
 // network is unreachable and the AP has taken over, this is false.
 static bool hasNetwork() { return wifiConfigured && WiFi.status() == WL_CONNECTED; }
 
-// The one Wi-Fi save handler: /pod/wifi, /medtrum/wifi and /setup/wifi all
-// land here (and /settings/wifi will too). Save, then let the loop restart.
+// The one Wi-Fi save handler: /settings/wifi is its home, and /setup/wifi,
+// /pod/wifi and /medtrum/wifi stay as aliases to the SAME handler. Save, then
+// let the loop restart.
 static void sendWifiSaved() {
   JsonDocument j;
   if (deserializeJson(j, web.arg("plain")) || !j["ssid"].is<const char*>() || !j["password"].is<const char*>()) {
@@ -154,6 +163,27 @@ static void sendWifiSaved() {
   saveWifi(ssid, pass);
   web.send(200, "text/plain", "saved; restarting\n");
   restartAt = monoMs() + 1000;
+}
+
+// MARK: - The board's own page: Network + Board
+
+static String savedSsid() {
+  Preferences p;
+  p.begin("net", true);
+  String ssid = p.isKey("ssid") ? p.getString("ssid") : "";
+  p.end();
+  return ssid;
+}
+
+static void sendSettingsStatus() {
+  JsonDocument d;
+  d["wifi"]["ssid"] = savedSsid();
+  d["wifi"]["joined"] = hasNetwork();
+  d["ip"] = hasNetwork() ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
+  d["clock"] = wallMs() ? "set from NTP" : "not set (NTP never ran)";
+  d["firmware"]["commit"] = ESP_SIM_COMMIT;
+  d["firmware"]["built"] = __DATE__ " " __TIME__;
+  sendJson(200, d);
 }
 
 // The OS probes: answer each one the way that closes (or opens) its sheet.
@@ -208,6 +238,18 @@ static void startWeb() {
   web.on("/ncsi.txt", HTTP_GET, sendPortalProbe);
   web.on("/fwlink/", HTTP_GET, sendPortalProbe);
   web.on("/fwlink", HTTP_GET, sendPortalProbe);
+  web.on("/settings", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", settingsHTML); });
+  web.on("/settings/status", HTTP_GET, sendSettingsStatus);
+  web.on("/settings/wifi", HTTP_POST, sendWifiSaved);
+  web.on("/settings/forget", HTTP_POST, [] {
+    saveWifi("", "");
+    web.send(200, "text/plain", "forgotten; restarting\n");
+    restartAt = monoMs() + 1000;
+  });
+  web.on("/settings/reboot", HTTP_POST, [] {
+    web.send(200, "text/plain", "rebooting\n");
+    restartAt = monoMs() + 1000;
+  });
   web.on("/status", HTTP_GET, sendStatus);
   web.on("/glucose", HTTP_POST, [] {
     JsonDocument j;

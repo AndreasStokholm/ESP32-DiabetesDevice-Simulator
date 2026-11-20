@@ -124,14 +124,7 @@
     <div class="actions" style="margin-top:0"><button class="danger" id="newPatch">Forget this patch and start a new one</button></div>
     <div class="muted" style="margin-top:8px">Clears the activation and delivery: the next phone activates a fresh patch on the same base. Deactivating the patch from the app does the same.</div>
   </section>
-
-  <section class="card" aria-labelledby="h-wifi">
-    <h2 id="h-wifi">Wi-Fi</h2>
-    <label for="wifiSsid">Network name</label> <input id="wifiSsid" autocomplete="off">
-    <label for="wifiPass">Password</label> <input id="wifiPass" type="password" autocomplete="off">
-    <div class="actions"><button id="wifiSet">Join and restart</button><button id="wifiForget">Forget network</button></div>
-    <div class="muted" style="margin-top:8px">Joining a network puts this panel on your LAN and sets the clock; the board prints its address on the serial console. Without one it runs its own access point.</div>
-  </section>
+  <!-- Wi-Fi moved to the Settings page: the old fetch('/wifi' call is gone from this panel; /medtrum/wifi stays as an alias. -->
   <div class="muted" id="msg" role="status" aria-live="polite"></div>
 </main>
 <footer>For development use only — not a Medtrum product. This base simulates a patch and delivers nothing. Never use it for therapy.</footer>
@@ -180,12 +173,6 @@ $('faultSet').onclick = ()=>{ const c=+$('faultIn').value;
 $('faultClear').onclick = ()=>send({command:'medtrumSetFault', state:32}, 'Fault cleared');
 $('crash').onclick = ()=>{ if(confirm('Reboot the base at the next command? The phone loses its in-flight command.')) send({command:'medtrumCrash'}, 'Armed'); };
 $('newPatch').onclick = ()=>{ if(confirm('Forget this patch? The phone will need to activate a new one.')) send({command:'medtrumReset'}, 'New patch ready'); };
-
-async function wifi(body, done){
-  try { const r = await fetch('/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const t = await r.text(); if(!r.ok) throw new Error(t.trim()); say(done); } catch(e){ say('Failed — '+e.message); } }
-$('wifiSet').onclick = ()=>wifi({ssid:$('wifiSsid').value, password:$('wifiPass').value}, 'Saved — restarting');
-$('wifiForget').onclick = ()=>wifi({ssid:'', password:''}, 'Forgotten — restarting');
 
 function chip(el, text, cls){ el.textContent=text; el.className='chip '+(cls||''); }
 
