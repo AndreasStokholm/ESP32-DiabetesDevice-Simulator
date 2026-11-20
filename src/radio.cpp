@@ -382,7 +382,7 @@ static std::string named(const std::string& name) {
 }
 
 // (Re)configures the advertising set as a legacy connectable advert and starts it.
-static bool advertise(const std::string& data, const std::string& scanRsp, uint32_t interval) {
+static bool advertise(const std::string& data, const std::string& scanRsp, uint32_t interval, const char* label) {
   NimBLEExtAdvertising* adv = NimBLEDevice::getAdvertising();
   if (ble_gap_ext_adv_active(inst)) adv->stop(inst);
   NimBLEExtAdvertisement a;
@@ -398,8 +398,7 @@ static bool advertise(const std::string& data, const std::string& scanRsp, uint3
   r.setLegacyAdvertising(true);
   r.setData((const uint8_t*)scanRsp.data(), scanRsp.size());
   if (!adv->setScanResponseData(inst, r)) return false;
-  return adv->start(inst);
-}
+  return adv->start(inst);}
 
 void cgmAdvertise(bool on, const char* name, const uint8_t addr[6]) {
   // One advertising set, on the chip's own address: the core's per-sensor
@@ -468,6 +467,8 @@ void tick() {
   bool paired = podPaired;
   std::string medData = medtrumAdvData;
   bool medOn = medtrumAdvOn;
+  bool force = advForce;
+  advForce = false;
   l.unlock();
 
   // Who needs to be found? The CGM on the core's schedule (it opens a window
@@ -511,29 +512,41 @@ void tick() {
   // The order (CGM, pod, Medtrum) keeps the pod's payload byte-exact: it is
   // the same string it always was, only now sharing the set three ways.
   std::string data, scanRsp;
+  const char* label;
   uint32_t interval;
   if (choice == ADV_CGM) {
     data = cgmData;
     scanRsp = named(cgmNm);
     interval = cgmAdvInterval;  // the CGM's 160 ms
+    label = "CGM";
   } else if (choice == ADV_POD) {
     data = podData;
     scanRsp = named(DASH_ADVERTISED_NAME);
     interval = 0x00f4;
+    label = "pod";
   } else {
     data = medData;
     scanRsp = named("MT");
     interval = 0x00f4;  // 152.5 ms, as ESP-Sim
+    label = "Medtrum";
   }
-  if (active && data == current) return;
-  bool ok = advertise(data, scanRsp, interval);
+  if (!force && active && data == current) return;
+  bool ok = advertise(data, scanRsp, interval, label);
   if (ok) {
     current = data;
+    // Once per device per boot: proves the set really carried it, without a line
+    // every 1.5 s while the rotation is running.
+    static unsigned seen = 0;
+    unsigned bit = choice == ADV_CGM ? 1u : choice == ADV_POD ? 2u : 4u;
+    if (!(seen & bit)) {
+      seen |= bit;
+      logf("advertising %s (%u bytes)", label, (unsigned)data.size());
+    }
   } else {
     static int64_t last = -60000;
     if (monoMs() - last > 10000) {
       last = monoMs();
-      logf("advertising could not start");
+      logf("advertising %s could not start (%u bytes)", label, (unsigned)data.size());
     }
   }
 }
