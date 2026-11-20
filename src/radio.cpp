@@ -64,10 +64,15 @@ static bool cgmAdvOn = false;
 // happen here before that call returns. The link is the pod's too, so the
 // hang-up waits for a pause in the pod's traffic, with a 20 s deadline.
 static volatile bool cgmDrop = false;
-static volatile uint32_t cgmDropAt = 0;  // 32-bit: written by two tasks
-// The CGM was used on the current link (any of its GATT events). The core ends
-// a session after CONN_MAX; a link the CGM never touched is the pod's or the
-// patch's, and must not be torn down by that timer.
+// The 20 s deadline: a separate flag, so a zero timestamp is not also "no
+// deadline" (tick is the only writer while the drop is pending; cgmDisconnect
+// starts a fresh one when a new request arrives).
+static volatile bool cgmDropTimed = false;
+static volatile uint32_t cgmDropAt = 0;  // 32-bit monotonic ms; tick's clock
+// The CGM was told about the current link (its first GATT event). The core is
+// not told at connect time: a link the CGM never touches is the pod's or the
+// patch's, and the core's own session timer (CONN_MAX) would end it, logging a
+// hang-up every second until it did (see cgmLinkUp()).
 static volatile bool cgmUsed = false;
 // A new value for every connection, so a notification queued (or delayed) for
 // the old link cannot reach a new phone that happens to reuse the handle.
@@ -152,20 +157,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     logf("%s connected", addr.c_str());
     conn = desc->conn_handle;
     ++linkGen;  // anything queued for the old link is stale now
+    // The CGM is told about the link on its first GATT event, not here (see
+    // cgmLinkUp()): a link it never touches is the pod's or the patch's, and
+    // the core's CONN_MAX timer must not end it.
     cgmUsed = false;
-    // The core marks its own advertising off when it sees the connection
-    // (cgm_on_connect) without calling advertise(false), so the radio's copy is
-    // cleared here to match: otherwise the rotation would keep advertising the
-    // CGM outside the core's 60-second window, and signal loss could not stop
-    // it.
-    {
-      std::lock_guard<std::mutex> l(mu);
-      cgmAdvOn = false;
-    }
-    // The core does not hold the radio's mutex, and this callback holds none
-    // of it either: it may send (cgmNotify) and hang up (cgmDisconnect, which
-    // tick() carries out) from inside its own mutex.
-    sensor::onConnect();
     podPush(DASH_EV_CONNECTED, nullptr, 0);
     medtrumPush(MEDTRUM_EV_CONNECTED, nullptr, 0);
   }
@@ -174,14 +169,17 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     if (desc->conn_handle != conn) return;
     conn = BLE_HS_CONN_HANDLE_NONE;
     cgmDrop = false;
-    cgmDropAt = 0;
+    cgmDropTimed = false;
+    bool hadCgm = cgmUsed;
     cgmUsed = false;
     // No stale CCCD: a notification that was queued for this link is dropped
     // (the generation check), and a new phone has to subscribe afresh.
     for (int i = 0; i < CGM_CHR_COUNT; i++) cgmSubs[i] = 0;
     std::string addr = addrString(desc->peer_ota_addr);
     logf("%s disconnected", addr.c_str());
-    sensor::onDisconnect();
+    // Only a link the CGM knew about is the CGM's to close; the core logs a
+    // disconnect for every call.
+    if (hadCgm) sensor::onDisconnect();
     medtrumStatusNotify = false;
     podPush(DASH_EV_DISCONNECTED, nullptr, 0);
     medtrumPush(MEDTRUM_EV_DISCONNECTED, nullptr, 0);
@@ -190,13 +188,33 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
 // One GATT event each way for the core: the core's own protocol runs inside
 // sensor::, so the radio only maps UUID to cgm_chr_t and hands the bytes over.
+
+// The CGM's first event on a link: tell the core, then mirror its
+// advertising-off. cgm_on_connect() sets the core's c->advertising = false
+// without calling advertise(false), so the radio's copy is cleared here to
+// match; otherwise the rotation would keep advertising the CGM outside the
+// core's 60-second window, and signal loss could not stop it.
+//
+// The clear comes AFTER sensor::onConnect() returns, and that order is what
+// makes it race-safe: a sensor task already inside cgm_tick -> advertise(true)
+// holds the core's mutex, so it finishes its cgmAdvertise() before onConnect
+// can return, and once the core is connected cgm_tick makes no further
+// advertise(true) call. So both orders end with radio false / core false.
+static void cgmLinkUp() {
+  if (cgmUsed) return;
+  cgmUsed = true;
+  sensor::onConnect();
+  std::lock_guard<std::mutex> l(mu);
+  cgmAdvOn = false;
+}
+
 class CgmCallbacks : public NimBLECharacteristicCallbacks {
  public:
   explicit CgmCallbacks(cgm_chr_t chr) : chr(chr) {}
 
   void onWrite(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
     if (desc->conn_handle != conn) return;
-    cgmUsed = true;
+    cgmLinkUp();
     if (fail_decide(FAIL_CGM, FAIL_CONSUME_MESSAGE, 0)) {
       logf("cgm: injected failure: message ignored");
       return;
@@ -207,7 +225,7 @@ class CgmCallbacks : public NimBLECharacteristicCallbacks {
 
   void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc* desc, uint16_t subValue) override {
     if (desc && desc->conn_handle != conn) return;
-    cgmUsed = true;
+    cgmLinkUp();
     // The core answers a subscription at once (the auth status, the reading), so
     // the CCCD value is recorded first: cgmNotify sends only to a subscriber.
     cgmSubs[chr] = subValue;
@@ -216,7 +234,7 @@ class CgmCallbacks : public NimBLECharacteristicCallbacks {
 
   void onRead(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
     if (desc && desc->conn_handle != conn) return;
-    cgmUsed = true;
+    cgmLinkUp();
     uint8_t buf[64];
     size_t n = sensor::onRead(chr, buf, sizeof buf);
     if (n) ch->setValue(buf, n);
@@ -406,26 +424,32 @@ void tick() {
   // call that asked (the core holds its mutex there, and the NimBLE disconnect
   // callback calls back into the core). The one link is the pod's as well, so
   // the CGM's hang-up waits for the pod's traffic to pause first, as it always
-  // did, and gives up waiting after 20 s. A link the CGM never touched is not
-  // the CGM's to end: the core's 30 s session cap must not tear down a pod or
-  // patch session (P1: the cap is the core's, but the link is shared).
+  // did, and gives up waiting after 20 s.
   int64_t now = monoMs();
-  uint32_t now32 = (uint32_t)now;  // the cross-task deadlines are 32-bit
+  uint32_t now32 = (uint32_t)now;  // the cross-task timestamps are 32-bit
   if (cgmDrop) {
     uint16_t c = conn;
-    if (c == BLE_HS_CONN_HANDLE_NONE) {
+    uint32_t gen = linkGen;
+    if (c == BLE_HS_CONN_HANDLE_NONE || !cgmUsed) {
+      // The link is gone, or the CGM never used it: nothing to end here.
       cgmDrop = false;
-      cgmDropAt = 0;
-    } else if (!cgmUsed) {
-      // Nothing CGM has happened on this link: leave the pod's session up. The
-      // core asks again every second; this clears each request.
-      cgmDrop = false;
-      cgmDropAt = 0;
+      cgmDropTimed = false;
     } else {
-      if (!cgmDropAt) cgmDropAt = now32;
-      if (now32 - podLastTraffic >= 1500u || now32 - cgmDropAt >= 20000u) {
+      if (!cgmDropTimed) {
+        cgmDropTimed = true;
+        cgmDropAt = now32;
+      }
+      // Signed elapsed: podNotify/PodCallbacks may stamp podLastTraffic from
+      // another task after now32 was taken, which must read as "just now" (a
+      // small negative), not as a huge unsigned idle. Horizon: 2^31 ms, i.e.
+      // about 24 days of uptime per link, far beyond the 20 s deadline.
+      int32_t sincePod = (int32_t)(now32 - podLastTraffic);
+      int32_t sinceDrop = (int32_t)(now32 - cgmDropAt);
+      // The link may have been replaced while this tick was deciding (the
+      // handle could be reused): only end the same link.
+      if ((sincePod >= 1500 || sinceDrop >= 20000) && conn == c && linkGen == gen) {
         cgmDrop = false;
-        cgmDropAt = 0;
+        cgmDropTimed = false;
         logf("cgm: hanging up so the phone collects the reading");
         ble_gap_terminate(c, BLE_ERR_REM_USER_CONN_TERM);
       }
@@ -543,10 +567,16 @@ void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n) {
 }
 
 // The core calls this from inside its own mutex, possibly on the NimBLE
-// callback thread: only mark the hang-up. tick() terminates the link, and the
-// NimBLE disconnect callback then calls sensor::onDisconnect.
+// callback thread: only mark the hang-up. tick() terminates the link (if the
+// CGM ever used it), and the NimBLE disconnect callback then calls
+// sensor::onDisconnect.
 void cgmDisconnect() {
-  if (conn != BLE_HS_CONN_HANDLE_NONE) cgmDrop = true;
+  if (conn == BLE_HS_CONN_HANDLE_NONE) return;
+  // A request that arrives while none is pending starts a fresh 20 s deadline;
+  // the core asks again every second while it is pending, which must not
+  // restart it.
+  if (!cgmDrop) cgmDropTimed = false;
+  cgmDrop = true;
 }
 
 bool cgmConnected() { return conn != BLE_HS_CONN_HANDLE_NONE; }
