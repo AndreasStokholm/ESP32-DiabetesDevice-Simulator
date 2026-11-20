@@ -11,12 +11,11 @@ static const char settingsHTML[] PROGMEM = R"HTML(<!doctype html>
   :root { color-scheme: dark; --bg:#14161a; --card:#1d2026; --line:#2b2f37; --fg:#e8eaed; --mut:#9aa0aa; --accent:#4f9cf8; --ok:#43c06d; --warn:#e0a53b; --bad:#e2574c; }
   * { box-sizing:border-box; }
   body { margin:0; font:15px/1.4 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
-  header { padding:16px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:4px 20px; align-items:baseline; }
-  header h1 { font-size:18px; margin:0; }
-  header .meta { color:var(--mut); font-size:13px; }
-  .state { padding:3px 10px; border-radius:20px; font-size:13px; background:#2b2f37; }
-  .state.ok { background:rgba(67,192,109,.18); color:var(--ok); }
-  .state.warn { background:rgba(224,165,59,.18); color:var(--warn); }
+  nav { display:flex; flex-wrap:wrap; gap:2px 18px; align-items:baseline; padding:12px 16px; border-bottom:1px solid var(--line); max-width:760px; margin:0 auto; }
+  nav .brand { font-weight:600; margin-right:auto; }
+  nav a { color:var(--mut); text-decoration:none; font-size:14px; }
+  nav a:hover { color:var(--fg); }
+  nav a.active { color:var(--accent); }
   main { max-width:760px; margin:0 auto; padding:16px; display:grid; gap:14px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
   .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--mut); margin:0 0 12px; }
@@ -38,13 +37,14 @@ static const char settingsHTML[] PROGMEM = R"HTML(<!doctype html>
 </style>
 </head>
 <body>
-<header>
-  <h1>Settings</h1>
-  <span class="state" id="link" role="status">—</span>
-  <a class="meta" href="/" style="margin-left:auto;color:var(--accent)">G7 sensor panel &rarr;</a>
-  <a class="meta" href="/pod" style="color:var(--accent)">Pod panel &rarr;</a>
-  <a class="meta" href="/medtrum" style="color:var(--accent)">Medtrum patch panel &rarr;</a>
-</header>
+<nav>
+  <span class="brand">ESP-Sim</span>
+  <a href="/">Home</a>
+  <a href="/g7">G7</a>
+  <a href="/pod">Pod</a>
+  <a href="/medtrum">Medtrum</a>
+  <a class="active" href="/settings">Settings</a>
+</nav>
 <main>
   <div class="card">
     <h2>Network</h2>
@@ -96,12 +96,10 @@ static const char settingsHTML[] PROGMEM = R"HTML(<!doctype html>
   $('forget').onclick = () => call('/settings/forget');
   $('reboot').onclick = () => call('/settings/reboot');
 
-  function chip(text, cls) { const el = $('link'); el.textContent = text; el.className = 'state ' + (cls || ''); }
   async function refresh() {
     try {
       const s = await (await fetch('/settings/status')).json();
       const joined = !!(s.wifi && s.wifi.joined), ssid = (s.wifi && s.wifi.ssid) || '';
-      chip(joined ? 'joined' : 'access point', joined ? 'ok' : 'warn');
       $('joined').textContent = ssid ? (joined ? ssid : ssid + ' (not joined)') : '—';
       $('ip').textContent = s.ip || '—';
       $('boardIp').textContent = s.ip || '—';
@@ -110,7 +108,7 @@ static const char settingsHTML[] PROGMEM = R"HTML(<!doctype html>
       if (s.firmware && s.firmware.built) $('commit').title = 'built ' + s.firmware.built;
       if (!edited && ssid && document.activeElement !== $('ssid')) $('ssid').value = ssid;
     } catch (err) {
-      chip('unreachable', 'warn');
+      say('Could not reach the board.');
     }
   }
   refresh();

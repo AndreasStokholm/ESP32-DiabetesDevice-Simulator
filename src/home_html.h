@@ -43,7 +43,7 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
   <a href="/settings">Settings</a>
 </nav>
 <main>
-  <div class="banner" id="wallclock">No wall clock: no network saved, so NTP never ran.<a href="/setup">Set up Wi-Fi &rarr;</a></div>
+  <div class="banner" id="wallclock">No wall clock: NTP never ran.<a href="/setup">Set up Wi-Fi &rarr;</a></div>
   <a class="card" href="/g7">
     <div class="t">Dexcom G7<span class="go">Open &rarr;</span></div>
     <div class="s"><span class="dot" id="g7dot"></span><span id="g7line">--</span></div>
@@ -88,7 +88,7 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
       const glucose = s.latest && s.latest.glucose !== undefined ? s.latest.glucose + ' mg/dL' : '--';
       const displays = Object.keys(s.slots || {}).length;
       set('g7line', (s.name || '--') + ' · code ' + (s.code || '--') + ' · ' + glucose + ' · ' + displays + (displays === 1 ? ' display' : ' displays'));
-      dot('g7dot', s.latest ? (s.latest.state === 0 ? 'ok' : 'warn') : 'warn');
+      dot('g7dot', (s.latest && s.latest.state === 6 && s.latest.glucose !== undefined) ? 'ok' : 'warn');
     } catch (err) {
       set('g7line', '--');
       dot('g7dot', '');
@@ -126,7 +126,7 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
   async function pollWallClock() {
     try {
       const s = await get('/settings/status');
-      $('wallclock').className = (s.wifi && s.wifi.ssid) ? 'banner' : 'banner show';
+      $('wallclock').className = s.clock === 'set from NTP' ? 'banner' : 'banner show';
     } catch (err) {
       /* leave the banner alone until the board answers */
     }

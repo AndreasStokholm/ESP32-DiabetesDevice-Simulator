@@ -2,7 +2,7 @@
 // One failure-injection state per device (pod, G7, Medtrum), and the pure
 // decisions the radio asks of it. No Arduino, no NimBLE, no logging: the host
 // test in test/fail/ builds this with plain cc. src/radio.cpp applies the
-// decisions; src/main.cpp parses the request into the setters below.
+// decisions; src/main.cpp parses the request into FailRequest and fail_apply().
 //
 // One BLE link is shared by all three simulators, so a refused connection is
 // refused for the link: the server accepts it, then disconnects immediately.
@@ -14,6 +14,7 @@ extern "C" {
 #endif
 
 #define FAIL_DEVICE_COUNT 3
+#define FAIL_ABSENT (-1)
 
 typedef enum FailDevice {
   FAIL_POD = 0,
@@ -38,23 +39,18 @@ typedef struct FailState {
   int64_t quietUntilMs;    // do not advertise before this monotonic time
 } FailState;
 
-// The one entry point radio.cpp uses. Out-of-range devices are harmless: the
+// -1 means "leave it alone"; 0 clears the field. drop uses 0/1 for clear/set.
+typedef struct FailRequest {
+  int drop;
+  int refuse;
+  int quietMs;
+  int delayMs;
+  int ignore;
+} FailRequest;
+
+// The one decision radio.cpp uses. Out-of-range devices are harmless: the
 // connection and advertising decisions default to "allow", the others to 0.
 long long fail_decide(FailDevice device, FailAction action, int64_t nowMs);
-
-// The names from the brief, as thin wrappers over fail_decide.
-static inline int fail_should_accept(FailDevice d, int64_t nowMs) {
-  return (int)fail_decide(d, FAIL_ACCEPT, nowMs);
-}
-static inline unsigned fail_notify_delay_ms(FailDevice d) {
-  return (unsigned)fail_decide(d, FAIL_NOTIFY_DELAY_MS, 0);
-}
-static inline int fail_should_advertise(FailDevice d, int64_t nowMs) {
-  return (int)fail_decide(d, FAIL_ADVERTISE, nowMs);
-}
-static inline int fail_consume_message(FailDevice d) {
-  return (int)fail_decide(d, FAIL_CONSUME_MESSAGE, 0);
-}
 
 void fail_clear_all(void);
 void fail_clear(FailDevice device);
@@ -64,6 +60,11 @@ void fail_set_refuse(FailDevice device, unsigned connects);
 void fail_set_quiet_for(FailDevice device, unsigned ms, int64_t nowMs);
 void fail_set_delay(FailDevice device, unsigned ms);
 void fail_set_ignore(FailDevice device, unsigned messages);
+
+// The request-parser decision: validate every present field first, then apply
+// them all to one device. Returns NULL on success, or a static error string.
+// Out-of-range values leave the state untouched.
+const char* fail_apply(FailDevice device, const FailRequest* request, int64_t nowMs);
 
 // "pod", "g7", "medtrum" -> 0..2; anything else (including "all", which the
 // request parser expands itself) -> -1.

@@ -175,8 +175,9 @@ firmware.
 Join the AP from a phone and it gets the Wi‑Fi sheet without typing an address. A
 `DNSServer` answers every name with the board's AP address, the OS captive-portal probes
 are answered the way Apple, Android and Windows expect, and `/` redirects to `/setup`
-until the sheet has been dismissed. The sheet itself never shows the AP password: the
-reader is already on the AP.
+until the sheet has been dismissed. Once a network is saved or the sheet is dismissed, the
+same probes return their "no portal" answers so the phone stops presenting it. The sheet
+itself never shows the AP password: the reader is already on the AP.
 
 - **Join and restart** saves a 2.4 GHz network and restarts the board on it; the pages
   then stay at `http://esp-sim.local/` and the clock is set from NTP. If the network cannot
@@ -375,13 +376,13 @@ Post JSON to `/fail`:
 
 ```bash
 curl -XPOST esp-sim.local/fail -H 'Content-Type: application/json' \
-  -d '{"device":"g7","refuse":3,"quietMs":10000,"delayMs":500,"ignore":2}'
+  -d '{"device":"pod","refuse":3,"quietMs":10000,"delayMs":500,"ignore":2}'
 ```
 
 | Field | What it does | Range |
 |---|---|---|
 | `device` | Which simulator: `pod`, `g7`, `medtrum` or `all` | |
-| `drop` | Drop the next connection once (accept it, then disconnect) | `true` / `false` |
+| `drop` | Drop the next connection once for that device (accept it, then disconnect) | `true` / `false` |
 | `refuse` | Drop this many subsequent connections | 0–1000 |
 | `quietMs` | Stop advertising that device for this many milliseconds | 0–86,400,000 |
 | `delayMs` | Delay each outgoing notification | 0–60,000 |
@@ -404,9 +405,10 @@ fail all clear
 
 There is one BLE link for all three simulators, so `drop` and `refuse` apply to the next
 connection attempt whichever device asked; a refused connection is accepted and then
-disconnected immediately. `quiet` only clears that device's advertising want flag: the
-pod's and Medtrum's advertisement bytes do not change. `ignore` drops the message at the
-BLE write, for all three devices.
+disconnected immediately. `drop` is per device: `device:"all"` with `drop:true` arms one
+drop for each, so the next three connections are dropped. `quiet` only clears that
+device's advertising want flag: the pod's and Medtrum's advertisement bytes do not change.
+`ignore` drops the message at the BLE write, for all three devices.
 
 A G7 `delayMs` is recorded and returned in the state but not applied, because the G7's
 notifications are sent by its sensor task; the pod's and Medtrum's delays are applied. The
@@ -486,7 +488,8 @@ Devices we want to add:
 | `src/pod_html.h`, `src/medtrum_html.h` | Generated pod and patch panels |
 | `src/settings_html.h` | The Settings page (Network + Board) |
 | `src/setup_html.h` | The captive-portal Wi‑Fi sheet |
-| `test/medtrum/` | Host tests for the portable Medtrum patch core |
+| `src/adv_rotation.h` | The pure advertising-rotation choice, shared with `test/medtrum/test_adv.c` |
+| `test/medtrum/` | Host tests for the Medtrum patch core and the advertising rotation |
 | `test/portal/` | Host tests for the captive-portal decision |
 | `test/fail/` | Host tests for the failure-injection state |
 | `flasher/`, `tools/make_flasher.sh` | The browser flasher |

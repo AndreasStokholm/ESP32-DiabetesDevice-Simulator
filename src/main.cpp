@@ -9,11 +9,11 @@
 // insulin and every value it reports is made up. Never use it, or an app
 // paired to it, for therapy.
 //
-// Control: the USB serial console (type `help`) and the web panels, the G7's
-// at / and the pod's at /pod. With no Wi-Fi network saved, the board runs its
-// own access point (name and password are printed at boot) and answers every
-// HTTP probe as a captive portal, so a phone that joins it gets the Wi-Fi
-// sheet at /setup.
+// Control: the USB serial console (type `help`) and the web pages: the home
+// page at /, the G7's at /g7 and the pod's at /pod. With no Wi-Fi network saved,
+// the board runs its own access point (name and password are printed at boot)
+// and answers every HTTP probe as a captive portal, so a phone that joins it
+// gets the Wi-Fi sheet at /setup.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -216,6 +216,12 @@ static void sendPortalProbe() {
     case PORTAL_PROBE_APPLE_SUCCESS:
       web.send_P(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
       break;
+    case PORTAL_PROBE_ANDROID_REDIRECT:
+    case PORTAL_PROBE_WINDOWS_REDIRECT:
+    case PORTAL_PROBE_FWLINK:
+      web.sendHeader("Location", "/setup");
+      web.send(302, "text/plain", "");
+      break;
     case PORTAL_PROBE_ANDROID_204:
       web.send(204, "text/plain", "");
       break;
@@ -224,10 +230,6 @@ static void sendPortalProbe() {
       break;
     case PORTAL_PROBE_NCSI:
       web.send_P(200, "text/plain", "Microsoft NCSI");
-      break;
-    case PORTAL_PROBE_FWLINK:
-      web.sendHeader("Location", "/setup");
-      web.send(302, "text/plain", "");
       break;
     default:
       web.send(404, "text/plain", "not found\n");
@@ -281,58 +283,66 @@ static void startWeb() {
     const char* name = j["device"].as<const char*>();
     int dev = fail_device_from_name(name);
     bool all = strcmp(name, "all") == 0;
-    const char* err = nullptr;
-    if (dev < 0 && !all)
-      err = "device is pod, g7, medtrum or all";
-    else if (!j["drop"].isNull() && !j["drop"].is<bool>())
-      err = "drop is true or false";
-    else if (!j["refuse"].isNull() && (!j["refuse"].is<int>() || j["refuse"].as<int>() < 0 || j["refuse"].as<int>() > 1000))
-      err = "refuse is 0-1000 connects";
-    else if (!j["quietMs"].isNull() &&
-             (!j["quietMs"].is<int>() || j["quietMs"].as<int>() < 0 || j["quietMs"].as<int>() > 86400000))
-      err = "quietMs is 0-86400000 ms";
-    else if (!j["delayMs"].isNull() &&
-             (!j["delayMs"].is<int>() || j["delayMs"].as<int>() < 0 || j["delayMs"].as<int>() > 60000))
-      err = "delayMs is 0-60000 ms";
-    else if (!j["ignore"].isNull() && (!j["ignore"].is<int>() || j["ignore"].as<int>() < 0 || j["ignore"].as<int>() > 1000))
-      err = "ignore is 0-1000 messages";
-    if (err) {
-      web.send(400, "text/plain", err);
+    if (dev < 0 && !all) {
+      web.send(400, "text/plain", "device is pod, g7, medtrum or all");
       return;
     }
+    FailRequest r = {FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT};
+    if (!j["drop"].isNull()) {
+      if (!j["drop"].is<bool>()) {
+        web.send(400, "text/plain", "drop is true or false");
+        return;
+      }
+      r.drop = j["drop"].as<bool>() ? 1 : 0;
+    }
+    if (!j["refuse"].isNull()) {
+      if (!j["refuse"].is<int>() || j["refuse"].as<int>() < 0) {
+        web.send(400, "text/plain", "refuse is 0-1000 connects");
+        return;
+      }
+      r.refuse = j["refuse"].as<int>();
+    }
+    if (!j["quietMs"].isNull()) {
+      if (!j["quietMs"].is<int>() || j["quietMs"].as<int>() < 0) {
+        web.send(400, "text/plain", "quietMs is 0-86400000 ms");
+        return;
+      }
+      r.quietMs = j["quietMs"].as<int>();
+    }
+    if (!j["delayMs"].isNull()) {
+      if (!j["delayMs"].is<int>() || j["delayMs"].as<int>() < 0) {
+        web.send(400, "text/plain", "delayMs is 0-60000 ms");
+        return;
+      }
+      r.delayMs = j["delayMs"].as<int>();
+    }
+    if (!j["ignore"].isNull()) {
+      if (!j["ignore"].is<int>() || j["ignore"].as<int>() < 0) {
+        web.send(400, "text/plain", "ignore is 0-1000 messages");
+        return;
+      }
+      r.ignore = j["ignore"].as<int>();
+    }
     int64_t now = monoMs();
+    const char* err = nullptr;
     auto applyOne = [&](FailDevice d) {
-      if (!j["drop"].isNull()) {
-        bool on = j["drop"].as<bool>();
-        fail_set_drop(d, on ? 1 : 0);
-        logf("fail: %s %s", fail_device_name(d), on ? "drops the next connect" : "drop cleared");
-      }
-      if (!j["refuse"].isNull()) {
-        unsigned n = j["refuse"].as<unsigned>();
-        fail_set_refuse(d, n);
-        logf("fail: %s refuses %u connects", fail_device_name(d), n);
-      }
-      if (!j["quietMs"].isNull()) {
-        unsigned ms = j["quietMs"].as<unsigned>();
-        fail_set_quiet_for(d, ms, now);
-        logf("fail: %s quiet for %u ms", fail_device_name(d), ms);
-      }
-      if (!j["delayMs"].isNull()) {
-        unsigned ms = j["delayMs"].as<unsigned>();
-        fail_set_delay(d, ms);
-        logf("fail: %s delays notifications by %u ms", fail_device_name(d), ms);
-      }
-      if (!j["ignore"].isNull()) {
-        unsigned n = j["ignore"].as<unsigned>();
-        fail_set_ignore(d, n);
-        logf("fail: %s ignores %u messages", fail_device_name(d), n);
-      }
+      if (!err) err = fail_apply(d, &r, now);
     };
     if (all) {
       for (int i = 0; i < FAIL_DEVICE_COUNT; i++) applyOne((FailDevice)i);
     } else {
       applyOne((FailDevice)dev);
     }
+    if (err) {
+      web.send(400, "text/plain", err);
+      return;
+    }
+    const char* who = all ? "all" : name;
+    if (r.drop >= 0) logf("fail: %s %s", who, r.drop ? "drops the next connect" : "drop cleared");
+    if (r.refuse >= 0) logf("fail: %s refuses %d connects", who, r.refuse);
+    if (r.quietMs >= 0) logf("fail: %s quiet for %d ms", who, r.quietMs);
+    if (r.delayMs >= 0) logf("fail: %s delays notifications by %d ms", who, r.delayMs);
+    if (r.ignore >= 0) logf("fail: %s ignores %d messages", who, r.ignore);
     web.send(200, "application/json", failStateJson());
   });
   web.on("/status", HTTP_GET, sendStatus);
@@ -510,6 +520,11 @@ static void pollWifi() {
   if (!up && staFailures >= 5 && !apStarted) {
     logf("Wi-Fi: could not join the saved network: starting the access point too");
     startAP();
+  }
+  // The AP may still be up after a later drop (a sleeping hotspot), and the
+  // sheet needs its wildcard DNS again; it was stopped when the board joined.
+  if (!up && apStarted && !dnsStarted) {
+    startDns();
   }
   // Keep trying while the network is away (e.g. a phone hotspot that sleeps).
   static int64_t lastTry = monoMs();
@@ -713,54 +728,46 @@ static void command(const std::string& line) {
       Serial.println("fail: want drop, refuse, quiet, delay, ignore or clear");
       return;
     }
+    FailRequest r = {FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT};
+    int n = 0;
     if (what == "drop") {
-      auto applyOne = [&](FailDevice d) {
-        fail_set_drop(d, 1);
-        logf("fail: %s drops the next connect", fail_device_name(d));
-      };
-      if (all) for (int i = 0; i < FAIL_DEVICE_COUNT; i++) applyOne((FailDevice)i);
-      else applyOne((FailDevice)dev);
-      Serial.println(failStateJson().c_str());
-      return;
-    }
-    if (a.size() < 4) {
-      Serial.println("fail: want a number for refuse, quiet, delay or ignore");
-      return;
-    }
-    double v = atof(a[3].c_str());
-    if (!(v >= 0) || v > 86400000.0) {
-      Serial.println("fail: number is out of range");
-      return;
-    }
-    unsigned n = (unsigned)v;
-    if ((what == "refuse" || what == "ignore") && n > 1000) {
-      Serial.println("fail: refuse/ignore is 0-1000");
-      return;
-    }
-    if (what == "delay" && n > 60000) {
-      Serial.println("fail: delay is 0-60000 ms");
-      return;
-    }
-    auto applyOne = [&](FailDevice d) {
-      if (what == "refuse") {
-        fail_set_refuse(d, n);
-        logf("fail: %s refuses %u connects", fail_device_name(d), n);
-      } else if (what == "quiet") {
-        fail_set_quiet_for(d, n, monoMs());
-        logf("fail: %s quiet for %u ms", fail_device_name(d), n);
-      } else if (what == "delay") {
-        fail_set_delay(d, n);
-        logf("fail: %s delays notifications by %u ms", fail_device_name(d), n);
-      } else {
-        fail_set_ignore(d, n);
-        logf("fail: %s ignores %u messages", fail_device_name(d), n);
+      r.drop = 1;
+    } else {
+      if (a.size() < 4) {
+        Serial.println("fail: want a number for refuse, quiet, delay or ignore");
+        return;
       }
+      double v = atof(a[3].c_str());
+      if (!(v >= 0) || v > 86400000.0) {
+        Serial.println("fail: number is out of range");
+        return;
+      }
+      n = (int)v;
+      if (what == "refuse") r.refuse = n;
+      else if (what == "quiet") r.quietMs = n;
+      else if (what == "delay") r.delayMs = n;
+      else r.ignore = n;
+    }
+    int64_t now = monoMs();
+    const char* err = nullptr;
+    auto applyOne = [&](FailDevice d) {
+      if (!err) err = fail_apply(d, &r, now);
     };
     if (all) {
       for (int i = 0; i < FAIL_DEVICE_COUNT; i++) applyOne((FailDevice)i);
     } else {
       applyOne((FailDevice)dev);
     }
+    if (err) {
+      Serial.printf("fail: %s\n", err);
+      return;
+    }
+    const char* who = all ? "all" : a[1].c_str();
+    if (r.drop >= 0) logf("fail: %s drops the next connect", who);
+    else if (r.refuse >= 0) logf("fail: %s refuses %d connects", who, n);
+    else if (r.quietMs >= 0) logf("fail: %s quiet for %d ms", who, n);
+    else if (r.delayMs >= 0) logf("fail: %s delays notifications by %d ms", who, n);
+    else if (r.ignore >= 0) logf("fail: %s ignores %d messages", who, n);
     Serial.println(failStateJson().c_str());
   } else if (cmd == "pod") {
     std::string sub = a.size() >= 2 ? a[1] : "";

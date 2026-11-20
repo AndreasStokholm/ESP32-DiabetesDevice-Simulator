@@ -19,27 +19,40 @@ static void want(PortalAction expected, const char *path, const char *method,
 
 static void test_apple(void)
 {
+    /* Before dismissal the sheet opens; after it (or after a saved network)
+       the probe says "Success", which closes it. */
     want(PORTAL_PROBE_APPLE_HTML, "/hotspot-detect.html", "GET", 0, 0);
-    want(PORTAL_PROBE_APPLE_HTML, "/hotspot-detect.html", "GET", 1, 0);
     want(PORTAL_PROBE_APPLE_HTML, "/hotspot-detect.html?x=1", "GET", 0, 0);
+    want(PORTAL_PROBE_APPLE_SUCCESS, "/hotspot-detect.html", "GET", 1, 0);
+    want(PORTAL_PROBE_APPLE_SUCCESS, "/hotspot-detect.html", "GET", 0, 1);
+    want(PORTAL_PROBE_APPLE_SUCCESS, "/hotspot-detect.html", "GET", 1, 1);
+
     want(PORTAL_PROBE_APPLE_SUCCESS, "/library/test/success.html", "GET", 0, 0);
     want(PORTAL_PROBE_APPLE_SUCCESS, "/library/test/success.html?cache=1", "GET", 1, 0);
 }
 
 static void test_android(void)
 {
-    want(PORTAL_PROBE_ANDROID_204, "/generate_204", "GET", 0, 0);
-    want(PORTAL_PROBE_ANDROID_204, "/gen_204", "GET", 0, 0);
+    want(PORTAL_PROBE_ANDROID_REDIRECT, "/generate_204", "GET", 0, 0);
+    want(PORTAL_PROBE_ANDROID_REDIRECT, "/gen_204", "GET", 0, 0);
+    want(PORTAL_PROBE_ANDROID_204, "/generate_204", "GET", 1, 0);
+    want(PORTAL_PROBE_ANDROID_204, "/generate_204", "GET", 0, 1);
     want(PORTAL_PROBE_ANDROID_204, "/generate_204?ts=42", "GET", 1, 0);
 }
 
 static void test_windows(void)
 {
-    want(PORTAL_PROBE_CONNECTTEST, "/connecttest.txt", "GET", 0, 0);
-    want(PORTAL_PROBE_NCSI, "/ncsi.txt", "GET", 0, 0);
+    want(PORTAL_PROBE_WINDOWS_REDIRECT, "/connecttest.txt", "GET", 0, 0);
+    want(PORTAL_PROBE_WINDOWS_REDIRECT, "/ncsi.txt", "GET", 0, 0);
+    want(PORTAL_PROBE_CONNECTTEST, "/connecttest.txt", "GET", 1, 0);
+    want(PORTAL_PROBE_CONNECTTEST, "/connecttest.txt", "GET", 0, 1);
+    want(PORTAL_PROBE_NCSI, "/ncsi.txt", "GET", 1, 0);
+    want(PORTAL_PROBE_NCSI, "/ncsi.txt", "GET", 0, 1);
+
     want(PORTAL_PROBE_FWLINK, "/fwlink/", "GET", 0, 0);
     want(PORTAL_PROBE_FWLINK, "/fwlink/?LinkId=123456", "GET", 0, 0);
-    want(PORTAL_PROBE_FWLINK, "/fwlink/?LinkId=123456", "GET", 1, 0);
+    want(PORTAL_SERVE_APP, "/fwlink/?LinkId=123456", "GET", 1, 0);
+    want(PORTAL_SERVE_APP, "/fwlink/?LinkId=123456", "GET", 0, 1);
     /* A path that merely starts with the same letters is not the probe. */
     want(PORTAL_SERVE_APP, "/fwlinker", "GET", 0, 0);
 }
@@ -49,9 +62,8 @@ static void test_root_and_cookie(void)
     /* AP mode: the root is the sheet until dismissed. */
     want(PORTAL_REDIRECT_SETUP, "/", "GET", 0, 0);
     want(PORTAL_REDIRECT_SETUP, "/?from=qr", "GET", 0, 0);
-    want(PORTAL_REDIRECT_SETUP, "/", "HEAD", 0, 0);
 
-    /* The cookie dismisses the sheet for good. */
+    /* The cookie dismisses the sheet, even without a saved network. */
     want(PORTAL_SERVE_APP, "/", "GET", 0, 1);
 
     /* With a network the board serves the app, cookie or not. */
@@ -64,15 +76,16 @@ static void test_root_and_cookie(void)
 
 static void test_setup(void)
 {
-    /* /setup is always the sheet, in AP mode and on a joined network. */
+    /* GET /setup is always the sheet, in AP mode and on a joined network. */
     want(PORTAL_SERVE_SETUP, "/setup", "GET", 0, 0);
     want(PORTAL_SERVE_SETUP, "/setup", "GET", 0, 1);
     want(PORTAL_SERVE_SETUP, "/setup", "GET", 1, 0);
     want(PORTAL_SERVE_SETUP, "/setup?x=1", "GET", 0, 0);
 
-    /* Critically: a POST to /setup is never redirected, cookie or not. */
-    want(PORTAL_SERVE_SETUP, "/setup", "POST", 0, 0);
-    want(PORTAL_SERVE_SETUP, "/setup", "POST", 0, 1);
+    /* A POST to /setup is never redirected. The router has GET only, so this
+       is an ordinary app request (a 404), matching the helper. */
+    want(PORTAL_SERVE_APP, "/setup", "POST", 0, 0);
+    want(PORTAL_SERVE_APP, "/setup", "POST", 0, 1);
 
     /* The form's own endpoints are app routes, never the sheet or a redirect. */
     want(PORTAL_SERVE_APP, "/setup/wifi", "POST", 0, 0);
@@ -93,11 +106,12 @@ static void test_app(void)
 
 static void test_methods(void)
 {
-    /* Probes answer GET/HEAD only; other methods are ordinary requests. */
+    /* Probes answer GET only; other methods are ordinary requests. */
     want(PORTAL_SERVE_APP, "/generate_204", "POST", 0, 0);
     want(PORTAL_SERVE_APP, "/hotspot-detect.html", "POST", 0, 0);
-    want(PORTAL_PROBE_APPLE_SUCCESS, "/library/test/success.html", "head", 0, 0);
-    want(PORTAL_PROBE_ANDROID_204, "/generate_204", "get", 0, 0);
+    want(PORTAL_SERVE_APP, "/library/test/success.html", "HEAD", 0, 0);
+    want(PORTAL_PROBE_APPLE_HTML, "/hotspot-detect.html", "get", 0, 0);
+    want(PORTAL_PROBE_ANDROID_REDIRECT, "/generate_204", "get", 0, 0);
 }
 
 static void test_robustness(void)
@@ -110,8 +124,9 @@ static void test_robustness(void)
     /* Every action has a distinct, non-empty name. */
     static const PortalAction all[] = {
         PORTAL_SERVE_SETUP, PORTAL_REDIRECT_SETUP, PORTAL_PROBE_APPLE_HTML,
-        PORTAL_PROBE_APPLE_SUCCESS, PORTAL_PROBE_ANDROID_204,
-        PORTAL_PROBE_CONNECTTEST, PORTAL_PROBE_NCSI, PORTAL_PROBE_FWLINK,
+        PORTAL_PROBE_APPLE_SUCCESS, PORTAL_PROBE_ANDROID_REDIRECT,
+        PORTAL_PROBE_ANDROID_204, PORTAL_PROBE_CONNECTTEST,
+        PORTAL_PROBE_NCSI, PORTAL_PROBE_WINDOWS_REDIRECT, PORTAL_PROBE_FWLINK,
         PORTAL_SERVE_APP};
     for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
         const char *name = portalActionName(all[i]);
