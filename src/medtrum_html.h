@@ -11,6 +11,11 @@ static const char medtrumHTML[] PROGMEM = R"MEDTRUMHTML(<!doctype html>
   :root { color-scheme: dark; --bg:#14161a; --card:#1d2026; --line:#2b2f37; --fg:#e8eaed; --mut:#9aa0aa; --accent:#4f9cf8; --ok:#43c06d; --warn:#e0a53b; --bad:#e2574c; }
   * { box-sizing:border-box; }
   body { margin:0; font:15px/1.4 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  nav { display:flex; flex-wrap:wrap; gap:2px 18px; align-items:baseline; padding:12px 16px; border-bottom:1px solid var(--line); max-width:760px; margin:0 auto; }
+  nav .brand { font-weight:600; margin-right:auto; }
+  nav a { color:var(--mut); text-decoration:none; font-size:14px; }
+  nav a:hover { color:var(--fg); }
+  nav a.active { color:var(--accent); }
   header { padding:16px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:4px 20px; align-items:baseline; }
   header h1 { font-size:18px; margin:0; }
   header .meta { color:var(--mut); font-size:13px; }
@@ -43,12 +48,18 @@ static const char medtrumHTML[] PROGMEM = R"MEDTRUMHTML(<!doctype html>
 </style>
 </head>
 <body>
+<nav>
+  <span class="brand">ESP-Sim</span>
+  <a href="/">Home</a>
+  <a href="/g7">G7</a>
+  <a href="/pod">Pod</a>
+  <a class="active" href="/medtrum">Medtrum</a>
+  <a href="/settings">Settings</a>
+</nav>
 <header>
   <h1 id="title">Medtrum patch</h1>
   <span class="meta" id="base"></span>
   <span class="chip" id="link" role="status">—</span>
-  <a href="/" style="margin-left:auto">G7 sensor panel &rarr;</a>
-  <a href="/pod">Pod panel &rarr;</a>
 </header>
 <main>
   <section class="card" aria-labelledby="h-status">
@@ -130,12 +141,19 @@ static const char medtrumHTML[] PROGMEM = R"MEDTRUMHTML(<!doctype html>
     <div class="muted" style="margin-top:8px">Clears the activation and delivery: the next phone activates a fresh patch on the same base. Deactivating the patch from the app does the same.</div>
   </section>
 
-  <section class="card" aria-labelledby="h-wifi">
-    <h2 id="h-wifi">Wi-Fi</h2>
-    <label for="wifiSsid">Network name</label> <input id="wifiSsid" autocomplete="off">
-    <label for="wifiPass">Password</label> <input id="wifiPass" type="password" autocomplete="off">
-    <div class="actions"><button id="wifiSet">Join and restart</button><button id="wifiForget">Forget network</button></div>
-    <div class="muted" style="margin-top:8px">Joining a network puts this panel on your LAN and sets the clock; the board prints its address on the serial console. Without one it runs its own access point.</div>
+  <section class="card" aria-labelledby="h-fail">
+    <h2 id="h-fail">Failure injection</h2>
+    <div class="row">
+      <div><label for="failRefuse">Refuse connects</label><input type="number" id="failRefuse" min="0" max="1000" step="1" value="0"></div>
+      <div><label for="failQuiet">Go quiet (s)</label><input type="number" id="failQuiet" min="0" max="86400" step="1" value="0"></div>
+      <div><label for="failDelay">Delay each notification (ms)</label><input type="number" id="failDelay" min="0" max="60000" step="10" value="0"></div>
+    </div>
+    <div class="actions">
+      <button class="danger" id="failDrop" type="button">Drop next connect</button>
+      <button class="primary" id="failApply" type="button">Apply</button>
+      <button id="failClear" type="button">Clear</button>
+    </div>
+    <div class="muted" id="failMsg" style="margin-top:8px">One BLE link is shared by all three simulators, so drop and refuse act on the next connection whichever device asked; quiet removes only this device from advertising; delay holds each outgoing notification.</div>
   </section>
   <div class="muted" id="msg" role="status" aria-live="polite"></div>
 </main>
@@ -186,12 +204,6 @@ $('faultClear').onclick = ()=>send({command:'medtrumSetFault', state:32}, 'Fault
 $('crash').onclick = ()=>{ if(confirm('Reboot the base at the next command? The phone loses its in-flight command.')) send({command:'medtrumCrash'}, 'Armed'); };
 $('newPatch').onclick = ()=>{ if(confirm('Forget this patch? The phone will need to activate a new one.')) send({command:'medtrumReset'}, 'New patch ready'); };
 
-async function wifi(body, done){
-  try { const r = await fetch('/medtrum/wifi',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const t = await r.text(); if(!r.ok) throw new Error(t.trim()); say(done); } catch(e){ say('Failed — '+e.message); } }
-$('wifiSet').onclick = ()=>wifi({ssid:$('wifiSsid').value, password:$('wifiPass').value}, 'Saved — restarting');
-$('wifiForget').onclick = ()=>wifi({ssid:'', password:''}, 'Forgotten — restarting');
-
 function chip(el, text, cls){ el.textContent=text; el.className='chip '+(cls||''); }
 
 function show(p){
@@ -216,6 +228,24 @@ function show(p){
 
 async function refresh(){ try { show(await (await fetch('/medtrum/status')).json()); } catch(e){} }
 refresh(); setInterval(refresh, 1000);
+
+async function fail(body, done) {
+  const msg = $('failMsg');
+  msg.textContent = 'Applying…';
+  try {
+    const r = await fetch('/fail',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const t = await r.text();
+    if(!r.ok) throw new Error(t.trim());
+    msg.textContent = done;
+    setTimeout(()=>{ if(msg.textContent===done) msg.textContent=''; }, 2500);
+  } catch(e){ msg.textContent = 'Failed — '+e.message; }
+}
+$('failDrop').onclick = ()=>fail({device:'medtrum', drop:true}, 'Next connection will be dropped');
+$('failApply').onclick = ()=>fail({device:'medtrum',
+  refuse:+$('failRefuse').value,
+  quietMs:+$('failQuiet').value*1000,
+  delayMs:+$('failDelay').value}, 'Failure set');
+$('failClear').onclick = ()=>fail({device:'medtrum', drop:false, refuse:0, quietMs:0, delayMs:0, ignore:0}, 'Failures cleared');
 </script>
 </body>
 </html>

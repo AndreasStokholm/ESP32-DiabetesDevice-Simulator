@@ -7,6 +7,7 @@
 
 #include "adv_rotation.h"
 #include "dash_internal.h"
+#include "fail.h"
 #include "link.h"
 
 namespace radio {
@@ -100,6 +101,18 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       s->disconnect(desc->conn_handle);
       return;
     }
+    // A refused connect is still accepted by the BLE stack, then dropped at
+    // once. One set of decisions for the one shared link; the first device
+    // with a pending drop or refusal names it in the log.
+    int64_t acceptNow = monoMs();
+    for (int i = 0; i < FAIL_DEVICE_COUNT; i++) {
+      FailDevice d = (FailDevice)i;
+      if (!fail_decide(d, FAIL_ACCEPT, acceptNow)) {
+        logf("%s: injected failure: %s connection dropped", addr.c_str(), fail_device_name(d));
+        s->disconnect(desc->conn_handle);
+        return;
+      }
+    }
     AdvertMode m;
     {
       std::lock_guard<std::mutex> l(mu);
@@ -147,6 +160,10 @@ class CharCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
     auto l = currentLink(desc->conn_handle);
     if (!l) return;
+    if (fail_decide(FAIL_G7, FAIL_CONSUME_MESSAGE, 0)) {
+      logf("%s: injected failure: G7 message ignored", l->addr.c_str());
+      return;
+    }
     NimBLEAttValue v = ch->getValue();
     l->enqueue(c, v.data(), v.length(), false);
   }
@@ -177,6 +194,10 @@ class PodCallbacks : public NimBLECharacteristicCallbacks {
     if (desc->conn_handle != conn) return;
     NimBLEAttValue v = ch->getValue();
     if (v.length() > DASH_PKT_MAX) return;
+    if (fail_decide(FAIL_POD, FAIL_CONSUME_MESSAGE, 0)) {
+      logf("pod: injected failure: message ignored");
+      return;
+    }
     podLastTraffic = monoMs();
     podPush(cmd ? DASH_EV_CMD : DASH_EV_DATA, v.data(), v.length());
   }
@@ -190,6 +211,10 @@ class MedtrumWriteCallbacks : public NimBLECharacteristicCallbacks {
     if (desc->conn_handle != conn) return;
     NimBLEAttValue v = ch->getValue();
     if (v.length() > MEDTRUM_FRAME_MAX) return;
+    if (fail_decide(FAIL_MEDTRUM, FAIL_CONSUME_MESSAGE, 0)) {
+      logf("medtrum: injected failure: message ignored");
+      return;
+    }
     medtrumPush(MEDTRUM_EV_WRITE, v.data(), v.length());
   }
 };
@@ -342,14 +367,16 @@ void tick() {
   // Who needs to be found? The G7 on its own schedule; the pod whenever no
   // phone is connected, and until it is paired; the Medtrum patch whenever it
   // is switched on and no phone is connected. One advertising set, so when
-  // more than one wants to be found they take turns.
+  // more than one wants to be found they take turns. An injected quiet window
+  // only clears that device's want flag; its payload string is untouched.
   bool connected = conn != BLE_HS_CONN_HANDLE_NONE;
+  int64_t now = monoMs();
   adv_wants_t wants = {
-      .g7 = m != AdvertMode::Off,
-      .pod = !podData.empty() && (!connected || !paired),
-      .med = medOn && !medData.empty() && !connected,
+      .g7 = m != AdvertMode::Off && fail_decide(FAIL_G7, FAIL_ADVERTISE, now),
+      .pod = !podData.empty() && (!connected || !paired) && fail_decide(FAIL_POD, FAIL_ADVERTISE, now),
+      .med = medOn && !medData.empty() && !connected && fail_decide(FAIL_MEDTRUM, FAIL_ADVERTISE, now),
   };
-  int choice = adv_rotation_slot(&wants, monoMs());
+  int choice = adv_rotation_slot(&wants, now);
 
   static std::string current;
   bool active = ble_gap_ext_adv_active(inst);
@@ -391,6 +418,8 @@ bool podNextEvent(dash_ev_t* ev, uint32_t timeoutMs) {
 static void podNotify(uint16_t handle, const uint8_t* p, size_t n) {
   uint16_t c = conn;
   if (c == BLE_HS_CONN_HANDLE_NONE) return;
+  unsigned delay = (unsigned)fail_decide(FAIL_POD, FAIL_NOTIFY_DELAY_MS, 0);
+  if (delay) vTaskDelay(pdMS_TO_TICKS(delay));
   podLastTraffic = monoMs();
   // With a dozen fragments queued, NimBLE can run short of buffers for a
   // moment: wait for them rather than lose a fragment.
@@ -460,6 +489,8 @@ bool medtrumNextEvent(medtrum_ev_t* ev, uint32_t timeoutMs) {
 static void medtrumNotifyRaw(uint16_t handle, const uint8_t* p, size_t n) {
   uint16_t c = conn;
   if (c == BLE_HS_CONN_HANDLE_NONE) return;
+  unsigned delay = (unsigned)fail_decide(FAIL_MEDTRUM, FAIL_NOTIFY_DELAY_MS, 0);
+  if (delay) vTaskDelay(pdMS_TO_TICKS(delay));
   // With a dozen fragments queued, NimBLE can run short of buffers for a
   // moment: wait for them rather than lose a fragment.
   for (int tries = 0; tries < 100; tries++) {
