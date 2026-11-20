@@ -13,6 +13,11 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
   header { padding:16px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:4px 20px; align-items:baseline; }
   header h1 { font-size:18px; margin:0; }
   header .meta { color:var(--mut); font-size:13px; }
+  nav { display:flex; flex-wrap:wrap; gap:2px 18px; align-items:baseline; padding:12px 16px; border-bottom:1px solid var(--line); max-width:760px; margin:0 auto; }
+  nav .brand { font-weight:600; margin-right:auto; }
+  nav a { color:var(--mut); text-decoration:none; font-size:14px; }
+  nav a:hover { color:var(--fg); }
+  nav a.active { color:var(--accent); }
   main { max-width:760px; margin:0 auto; padding:16px; display:grid; gap:16px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
   .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin:0 0 12px; }
@@ -46,14 +51,20 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
 </style>
 </head>
 <body>
+<nav>
+  <span class="brand">ESP-Sim</span>
+  <a href="/">Home</a>
+  <a class="active" href="/g7">G7</a>
+  <a href="/pod">Pod</a>
+  <a href="/medtrum">Medtrum</a>
+  <a href="/settings">Settings</a>
+</nav>
 <header>
   <h1 id="name">G7 sensor</h1>
   <span class="meta" id="model"></span>
   <span class="meta" id="serial"></span>
   <span class="meta" id="code"></span>
   <span class="meta" id="age"></span>
-  <a class="meta" href="/pod" style="margin-left:auto;color:var(--accent)">Pod panel &rarr;</a>
-  <a class="meta" href="/medtrum" style="color:var(--accent)">Medtrum patch panel &rarr;</a>
 </header>
 <main>
   <div class="card">

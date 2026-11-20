@@ -1,14 +1,14 @@
 """Builds src/pod_html.h from ESP-Sim's control panel (tools/pod_panel.html,
 main/panel.html in nightscout/ESP-Sim, with a one-button pod type switch): the pod's panel is served
-under /pod here, beside the G7's at /."""
+under /pod here, beside the home page's at / and the G7's at /g7.
+The nav (Home/G7/Pod/Medtrum/Settings) is part of the panel source itself, so
+this only rewrites the API paths."""
 import os, sys
 here = os.path.dirname(os.path.abspath(__file__))
 html = open(os.path.join(here, "pod_panel.html")).read()
 reps = [
     ("fetch('/command'", "fetch('/pod/command'"),
-    ("fetch('/wifi'", "fetch('/pod/wifi'"),
     ("fetch('/status')", "fetch('/pod/status')"),
-    ("</header>", '  <a href="/" style="margin-left:auto">G7 sensor panel &rarr;</a>\n</header>'),
 ]
 for a, b in reps:
     assert html.count(a) == 1, a

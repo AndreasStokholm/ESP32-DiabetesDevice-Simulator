@@ -29,6 +29,7 @@
 #include <esp_sntp.h>
 
 #include "crypto.h"
+#include "home_html.h"
 #include "index_html.h"
 #include "medtrum_app.h"
 #include "medtrum_html.h"
@@ -222,8 +223,9 @@ static void startWeb() {
       web.send(302, "text/plain", "");
       return;
     }
-    web.send_P(200, "text/html; charset=utf-8", indexHTML);
+    web.send_P(200, "text/html; charset=utf-8", homeHTML);
   });
+  web.on("/g7", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", indexHTML); });
   web.on("/setup", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", setupHTML); });
   web.on("/setup/wifi", HTTP_POST, sendWifiSaved);
   web.on("/setup/dismiss", HTTP_POST, [] {
