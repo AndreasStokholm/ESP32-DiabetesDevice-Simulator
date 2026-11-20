@@ -34,10 +34,27 @@
 //   void cgmDisconnect();
 //       Drop the current link.
 //   void cgmAdvertise(bool on, const char* name, const uint8_t addr[6]);
-//       Start/stop the CGM's advertising payload (flags + complete local name
-//       `name`; on the board's one advertising set, rotating with the pod's
-//       and the Medtrum patch's). addr is the random static address the core
-//       persists; the radio keeps the chip's own address as it does now.
+//       Start/stop the CGM's advertising payload. A phone filters its scan on
+//       the 16-bit service UUID 0xFEBC, so the advert MUST carry it. Build it
+//       as a legacy connectable+scannable advert, exactly (all hex):
+//
+//         advertisement:  02 01 06          flags: LE general discoverable,
+//                                           BR/EDR not supported
+//                         03 03 BC FE       complete list of 16-bit UUIDs:
+//                                           0xFEBC, little-endian
+//                         LL 09 <name>      complete local name; LL =
+//                                           strlen(name) + 1
+//         scan response:  LL 09 <name>      the same name field
+//
+//       `name` is sensor::name() ("DXCM"+2 for G7, "Dexcom"+last 2 for G6),
+//       at most 15 characters, so the whole advert fits the 31-byte limit.
+//       Set `name` in both the advertisement and the scan response, as
+//       ESP-Sim's main/ble.c does. Do NOT add the old G7 advert's 0xFF
+//       manufacturer/CRC block: it is not in the reference's CGM advert and
+//       the apps do not need it. On this board's single advertising set the
+//       radio keeps the chip's own address; `addr` is only for the
+//       reference's second extended-adv instance. Keep the existing G7
+//       advertising window/interval schedule around this payload.
 //   bool cgmConnected();
 //       Whether a phone is connected (the panel shows this next to the core's
 //       own view of the link).
@@ -52,14 +69,19 @@
 //
 // The characteristics, as cgm.h numbers them: CGM_CHR_COMM = F8083533,
 // CGM_CHR_CONTROL = F8083534, CGM_CHR_AUTH = F8083535, CGM_CHR_BACKFILL =
-// F8083536 (all under service F8083532). A write is the characteristic's
-// value; a read returns the auth challenge's bytes and length. src/radio.*
-// therefore needs "cgm.h" on its include path (PlatformIO supplies it from
-// lib/cgmsim). Do NOT hold radio's mutex while calling the sensor::
-// callbacks: the core calls radio::cgmNotify/cgmDisconnect/cgmAdvertise from
-// inside the glue's mutex. In particular, radio::cgmDisconnect must terminate
-// the link asynchronously: the core calls it from inside the glue's mutex, so
-// it must not call sensor::onDisconnect before returning.
+// F8083536 (all under service F8083532). Map by UUID, NOT by casting the
+// existing src/link.h Char enum: Char has Auth=0, Control=1, Backfill=2, so a
+// cast would send auth to COMM. Store the COMM (F8083533) handle too; the
+// current chars[4] has no slot for it. A write is the characteristic's value;
+// a read returns the auth challenge's bytes and length. src/radio.* therefore
+// needs "cgm.h" on its include path (PlatformIO supplies it from lib/cgmsim).
+// Do NOT hold radio's mutex while calling the sensor:: callbacks: the core
+// calls radio::cgmNotify/cgmDisconnect/cgmAdvertise from inside the glue's
+// mutex. In particular, radio::cgmDisconnect must terminate the link
+// asynchronously: the core calls it from inside the glue's mutex, so it must
+// not call sensor::onDisconnect before returning. Likewise cgmNotify should
+// notify once (the reference's ble_cgm_send has no retry loop); a pod-style
+// 100x5ms BLE_HS_ENOMEM loop would spin while the glue mutex is held.
 
 namespace radio {
 void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n);
@@ -72,8 +94,14 @@ namespace sensor {
 
 static cgm_t c;
 static SemaphoreHandle_t mu;
+static SemaphoreHandle_t saveMu;
 static nvs_handle_t nvs;
 static bool nvsReady;
+// State changed since the task last committed it. Both are guarded by mu.
+static bool dirty;
+static uint32_t saveGen;
+// The highest generation handed to flash; guarded by saveMu.
+static uint32_t savedGen;
 
 #define LOCKED(stmt)                   \
   do {                                 \
@@ -110,7 +138,13 @@ static const cgm_io_t io = {
     .disconnect = [](void*) { radio::cgmDisconnect(); },
     .advertise = [](void*, bool on, const char* name, const uint8_t addr[6]) { radio::cgmAdvertise(on, name, addr); },
     .now = nowSeconds,
-    .save = [](void*, const cgm_state_t* st) { persist(st); },
+    .save = [](void*, const cgm_state_t*) {
+      // Called by the core under mu, possibly on the NimBLE callback thread.
+      // Only mark it: a flash commit there would stall every other core call,
+      // so sensorTask (or a panel command) does the write.
+      dirty = true;
+      saveGen++;
+    },
     .log = logLine,
 };
 
@@ -144,8 +178,28 @@ static bool loadBlob(cgm_state_t* out, int64_t* savedAt) {
   if (!nvsReady) return false;
   sensor_saved_t s;
   size_t len = sizeof s;
-  if (nvs_get_blob(nvs, "state", &s, &len) != ESP_OK || len != sizeof s) return false;
-  if (s.magic != SENSOR_STATE_MAGIC || s.version != SENSOR_STATE_VERSION) return false;
+  esp_err_t err = nvs_get_blob(nvs, "state", &s, &len);
+  if (err != ESP_OK) {
+    // First boot has no blob; that is not a rejection and needs no log.
+    if (err != ESP_ERR_NVS_NOT_FOUND) {
+      logf("sensor: could not read the saved CGM state: %s; starting fresh", esp_err_to_name(err));
+    }
+    return false;
+  }
+  if (len != sizeof s) {
+    logf("sensor: saved CGM state is %u bytes, want %u; discarded", (unsigned)len, (unsigned)sizeof s);
+    return false;
+  }
+  if (s.magic != SENSOR_STATE_MAGIC) {
+    logf("sensor: saved CGM state magic 0x%08x, want 0x%08x; discarded", (unsigned)s.magic,
+         (unsigned)SENSOR_STATE_MAGIC);
+    return false;
+  }
+  if (s.version != SENSOR_STATE_VERSION) {
+    logf("sensor: saved CGM state version %u, want %u; discarded", (unsigned)s.version,
+         (unsigned)SENSOR_STATE_VERSION);
+    return false;
+  }
   if (s.state.version != CGM_STATE_VERSION) {
     logf("sensor: saved state has core version %u, want %u; starting fresh", (unsigned)s.state.version,
          (unsigned)CGM_STATE_VERSION);
@@ -154,6 +208,27 @@ static bool loadBlob(cgm_state_t* out, int64_t* savedAt) {
   *out = s.state;
   if (savedAt) *savedAt = s.saved_at;
   return true;
+}
+
+// Hands a snapshot to flash. Called with mu NOT held (the task's deferred
+// save) or with it held (a panel command, which must persist immediately).
+// The generation check stops an older snapshot from overwriting a newer one
+// that a panel command committed while the task was on its way to flash.
+static void saveSnapshot(const cgm_state_t* st, uint32_t gen) {
+  xSemaphoreTake(saveMu, portMAX_DELAY);
+  if ((int32_t)(gen - savedGen) > 0) {
+    savedGen = gen;  // attempted: never let a stale snapshot win afterwards
+    persist(st);
+  }
+  xSemaphoreGive(saveMu);
+}
+
+// Commits now, with mu held. Only the panel's commands use this: they run on
+// the HTTP thread, where a short flash write is not holding up the radio.
+static void persistNowLocked() {
+  uint32_t gen = ++saveGen;
+  saveSnapshot(&c.st, gen);
+  dirty = false;  // this snapshot is the whole current state
 }
 
 // Writes the new blob, reads it back, and only then lets the caller remove the
@@ -306,6 +381,9 @@ static bool migratePrefs(cgm_state_t* out) {
   cgm_kind_t kind = kindOfName(name);
   char id[8];
   idOfName(name, kind, id);
+  if (kind == CGM_G6 && !id[0]) {
+    logf("sensor: old name '%s' has no valid 6-character G6 transmitter id; using a random one", name.c_str());
+  }
   int64_t now = nowSeconds(nullptr);
   cgm_state_fresh(out, kind, kind == CGM_G6 && id[0] ? id : nullptr, now);
   if (kind == CGM_G7 && id[0]) {
@@ -349,13 +427,17 @@ static void clearOldState() {
 enum class Migration { None, Mapped, Failed };
 
 static Migration migrate(cgm_state_t* out, int64_t* clockHint) {
+  // The JSON file is richer and is what this board actually kept, so it wins
+  // over the briefed prefs layout. If it exists but cannot be read, still try
+  // the prefs: a board may briefly have had both.
   if (migrateStateFile(out, clockHint)) return Migration::Mapped;
-  if (LittleFS.exists("/state.json")) {
-    // It was there, but could not be mapped; start fresh (the caller persists
-    // the fresh state, then clears the unusable file).
+  bool fileFound = LittleFS.exists("/state.json");
+  if (migratePrefs(out)) return Migration::Mapped;
+  if (fileFound) {
+    // Present but unmappable, and no prefs to fall back on: start fresh (the
+    // caller persists the fresh state, then clears the unusable file).
     return Migration::Failed;
   }
-  if (migratePrefs(out)) return Migration::Mapped;
   // A 'sensor' namespace that exists but holds none of the three keys is not
   // a sensor; treat it as absent.
   return Migration::None;
@@ -365,7 +447,22 @@ static Migration migrate(cgm_state_t* out, int64_t* clockHint) {
 
 static void sensorTask(void*) {
   for (;;) {
-    LOCKED({ cgm_tick(&c); });
+    // cgm_tick may make a reading and call io.save, and a BLE callback may
+    // have marked dirty since the last pass. Take one consistent snapshot and
+    // commit it outside mu, so a flash write never blocks a radio callback.
+    cgm_state_t snapshot;
+    uint32_t gen = 0;
+    bool flush = false;
+    LOCKED({
+      cgm_tick(&c);
+      if (dirty) {
+        snapshot = c.st;
+        gen = saveGen;
+        dirty = false;
+        flush = true;
+      }
+    });
+    if (flush) saveSnapshot(&snapshot, gen);
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
@@ -381,6 +478,9 @@ void begin() {
   nvsReady = err == ESP_OK && nvs_open("cgm", NVS_READWRITE, &nvs) == ESP_OK;
   if (!nvsReady) logf("sensor: NVS namespace 'cgm' unavailable; the CGM will not persist");
   mu = xSemaphoreCreateMutex();
+  saveMu = xSemaphoreCreateMutex();
+  dirty = false;
+  saveGen = savedGen = 0;
 
   cgm_state_t st;
   int64_t savedAt = 0;
@@ -546,16 +646,28 @@ const char* command(const std::string& json) {
     long trend = 0;
     if (!jsonNumber(body, "glucose", &v) || v < 40 || v > 400) return "glucose is 40 to 400";
     if (jsonNumber(body, "trend", &trend) && (trend < -127 || trend > 126)) return "trend is -127 to 126";
-    LOCKED({ cgm_set_glucose(&c, (uint16_t)v, (int8_t)trend); });
+    LOCKED({
+      cgm_set_glucose(&c, (uint16_t)v, (int8_t)trend);
+      persistNowLocked();  // the HTTP thread: commit now
+    });
   } else if (strcmp(cmd, "cgmSetState") == 0) {
     if (!jsonNumber(body, "state", &v) || v < 0 || v > 255) return "state is 0 to 255";
-    LOCKED({ cgm_set_state(&c, (uint8_t)v); });
+    LOCKED({
+      cgm_set_state(&c, (uint8_t)v);
+      persistNowLocked();
+    });
   } else if (strcmp(cmd, "cgmSetSignalLoss") == 0) {
     bool on;
     if (!jsonBool(body, "on", &on)) return "on is true or false";
-    LOCKED({ cgm_set_signal_loss(&c, on); });
+    LOCKED({
+      cgm_set_signal_loss(&c, on);
+      persistNowLocked();
+    });
   } else if (strcmp(cmd, "cgmSkipWarmup") == 0) {
-    LOCKED({ cgm_skip_warmup(&c); });
+    LOCKED({
+      cgm_skip_warmup(&c);
+      persistNowLocked();
+    });
   } else if (strcmp(cmd, "cgmNewSensor") == 0 || strcmp(cmd, "cgmSetKind") == 0 ||
              strcmp(cmd, "cgmSetId") == 0) {
     bool haveKind = jsonNumber(body, "kind", &v);
@@ -573,7 +685,18 @@ const char* command(const std::string& json) {
     if (strcmp(cmd, "cgmSetKind") == 0 && !haveId && k == cur) {
       // Already that kind: nothing to reset.
     } else {
-      LOCKED({ cgm_new_sensor(&c, k, haveId ? id : nullptr); });
+      bool setG7Id = haveId && k == CGM_G7;
+      LOCKED({
+        cgm_new_sensor(&c, k, haveId ? id : nullptr);
+        // cgm_state_fresh() only honours id for G6; a G7 id is randomised
+        // there. The core is verbatim, so put the caller's suffix back here.
+        if (setG7Id) {
+          memcpy(c.st.id, id, 2);
+          c.st.id[2] = 0;
+        }
+        persistNowLocked();  // the HTTP thread: commit the new identity now
+        logf("sensor: new CGM, id %.8s (%s)", c.st.id, k == CGM_G6 ? "G6" : k == CGM_G7 ? "G7" : "off");
+      });
     }
   } else if (strcmp(cmd, "cgmForget") == 0) {
     // The core has no pairing slots: it is authenticated-and-bonded for every

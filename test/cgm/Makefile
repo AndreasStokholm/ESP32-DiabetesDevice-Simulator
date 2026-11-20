@@ -11,7 +11,7 @@ POD := ../../lib/dashpod
 CGM := ../../lib/cgmsim
 
 SRCS := $(CGM)/src/cgm.c $(POD)/src/crypto.c host_io.c platform_aes.c test_cgm.c main.c
-CFLAGS ?= -O1 -g
+CFLAGS ?= -O1 -g -fsanitize=address,undefined
 WARN := -Wall -Wextra -Werror -Wno-unused-parameter
 CFLAGS += -std=c11 -D_DEFAULT_SOURCE -I$(POD)/include -I$(CGM)/include -I.
 
