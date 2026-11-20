@@ -1,40 +1,46 @@
 # ESP32 Diabetes Device Simulator
 
-One ESP32-S3 that is an **Omnipod pod simulator** (DASH or Omnipod 5), a **Dexcom G7
-sensor simulator**, and a **Medtrum patch simulator**. On a test phone, pair the G7 and
-either the pod (from Loop or Trio) or the patch (from a MedtrumKit-capable app): the app
-has a CGM and a pump, with no real hardware. A new board starts as an Omnipod 5; one
-button switches it to DASH and back. **This build simulates G7, ONE+ and Stelo; it has no
-G6 simulator.**
+One ESP32-S3 that is an **Omnipod pod simulator** (DASH or Omnipod 5), a **Dexcom G6
+transmitter / G7 sensor simulator**, and a **Medtrum patch simulator**. On a test phone, add
+the CGM in the app and also the pod (from Loop or Trio) or the patch (from a
+MedtrumKit-capable app): the app has a CGM and a pump, with no real hardware. A new board
+starts as an Omnipod 5; one button switches it to DASH and back. The CGM is a Dexcom **G7**
+sensor, or a **G6** transmitter if you give it a 6-character transmitter id on the panel.
 
 > **Test equipment only.** Not a Dexcom, Insulet or Medtrum product, and not a medical
 > device. It delivers no insulin and every value it reports is made up. Never use it, or an
 > app paired to it, for anyone's therapy.
 
-It combines two projects:
+It builds on two projects:
 
-- the pod and the Medtrum patch are [nightscout/ESP-Sim](https://github.com/nightscout/ESP-Sim)'s
-  cores: `lib/dashpod` (commit `26c5219`, plus loopkit/pod's `ignoreNextMessages` and
-  `failNextConnects` commands) and the portable `lib/medtrumpatch`, with small
-  Arduino/PlatformIO glue;
-- the G7 is [g7simESP32](https://github.com/loudestnoise/g7simESP32), a C++ port of
-  [LoopKit/g7sim](https://github.com/LoopKit/g7sim).
+- the pod, the CGM and the Medtrum patch are [nightscout/ESP-Sim](https://github.com/nightscout/ESP-Sim)'s
+  **portable C cores**, unmodified: `lib/dashpod` (commit `26c5219`, plus loopkit/pod's
+  `ignoreNextMessages` and `failNextConnects` commands), `lib/cgmsim` (the G6/G7 protocol)
+  and `lib/medtrumpatch`, each with small Arduino/PlatformIO glue;
+- the CGM is the same code ESP-Sim runs, so there is one CGM engine on the board, not a
+  port of [LoopKit/g7sim](https://github.com/LoopKit/g7sim); g7sim's ideas live on in the
+  shape of this board's console and JSON API (see
+  [Differences](#differences-from-the-originals)).
 
 ## How one board is three devices
 
 A phone can't hold several Bluetooth connections to the same radio, so the board can't be
 several separate devices to one phone. Instead it is **one Bluetooth device** that carries
-the pod's, the G7's and the Medtrum base's services. The app's pod code, its G7 code and
+the pod's, the CGM's and the Medtrum base's services. The app's pod code, its CGM code and
 its MedtrumKit code each connect to "their" device and share the single connection
 underneath.
 
-- **Advertising** takes turns between the pod's advertisement (` :: Fake POD ::`), the
-  G7's (`DXCMxx`) and the Medtrum base's (`MT` plus its serial), depending on which needs
-  to be found.
-- **Every 5 minutes** the board hangs up once, when the pod is quiet. A real G7 hangs up
-  after each reading and the app only asks for a reading after connecting, so this is what
-  makes it collect the new one. Both sides reconnect within a second; the reading can
-  arrive up to about 30 seconds late.
+- **Advertising** takes turns on one Bluetooth 5 advertising set: the pod's advertisement
+  (` :: Fake POD ::`), the CGM's (the `0xFEBC` service plus its name, `Dexcomxx` for a G6
+  or `DXCMxx` for a G7) and the Medtrum base's (`MT` plus its serial), depending on which
+  needs to be found. Each keeps its own bytes exactly; they cannot be merged into one
+  payload.
+- **The CGM advertises around each reading**, as a real sensor does: a 60-second window
+  after a reading, and only while that reading has not been collected.
+- **The board hangs up when the reading is out**, about 3 seconds after the phone has had
+  it (and never while the pod is talking, or after 20 seconds of waiting). The app's CGM
+  code only asks for a reading after connecting, so this is what makes it collect the next
+  one; both sides reconnect within a second or two.
 - **One phone at a time.**
 
 ## Flashing the firmware
@@ -59,7 +65,7 @@ flash.
 3. Choose **Install**. Tick *Erase device* for a fresh start; leave it unticked to update a
    board and keep its paired sensor and pod.
 4. When it finishes, close the installer and press **Connect to the board**. The page
-   reads the G7's name and 4-digit **pairing code**, the pod type, and the board's Wi‑Fi
+   reads the CGM's **name**, the pod type, and the board's Wi‑Fi
    name and password straight from the board. (`status` on the console shows the same.)
 5. Pair from the app (see [Pair](#pair)), and use the same page's buttons to
    [control](#control) the board.
@@ -81,7 +87,7 @@ flash.
    pio run -t upload
    ```
 
-3. Open the console to see the pairing code. Type `help` for commands; Ctrl+C quits.
+3. Open the console and type `status` to see the CGM's kind, name and id. Type `help` for commands; Ctrl+C quits.
 
    ```bash
    pio device monitor
@@ -89,9 +95,9 @@ flash.
 
 ### Updating, and starting over
 
-- **Updating** keeps everything the board has stored: the sensor, the pod, the patch,
-  their pairings and the Wi‑Fi network. Flash again from the browser with *Erase device*
-  unticked, or run `git pull` and `pio run -t upload`.
+- **Updating** keeps everything the board has stored: the CGM, the pod, the patch, the
+  pod's and patch's pairings, and the Wi‑Fi network. Flash again from the browser with
+  *Erase device* unticked, or run `git pull` and `pio run -t upload`.
 - **Starting over** wipes all of that. Tick *Erase device* in the browser, or run
   `pio run -t erase` and then `pio run -t upload`. To replace only the sensor, pod or
   patch, use `new`, `pod fresh`, or **New patch** on the Medtrum panel instead.
@@ -126,14 +132,18 @@ Write them separately. A single merged image pads the gaps between the parts, an
 padding overwrites the board's stored pod state and Wi‑Fi settings.
 
 Tested on an ESP32-S3 with 8 MB flash, with Trio on a test iPhone: a DASH pod and an
-Omnipod 5 pod each paired, primed and ran, with the G7 paired on the same connection and
-its readings collected every 5 minutes. Switching the pod type from the USB panel and
-pairing the new pod was tested both ways.
+Omnipod 5 pod each paired, primed and ran, with a G7 sensor paired on the same connection
+and its readings collected every 5 minutes. Switching the pod type from the USB panel and
+pairing the new pod was tested both ways. That test ran the g7sim-era sensor; the G6/G7
+core (and the G6 mode in particular) has not been on hardware yet.
 
 ## Pair
 
-- **G7:** add a Dexcom G7 in the app and enter the board's 4-digit pairing code. The USB
-  panel shows it, and so does `status` on the console.
+- **CGM:** add a Dexcom G7 in the app; it finds the board as `DXCMxx` (`xx` is the id the
+  panel shows), and there is **no pairing code**: the board reports itself as already
+  bonded. For a **G6**, switch the kind on the `/g7` panel, then enter the **6-character
+  transmitter id** there (`81ABC2`-style: digits and capitals, no I or O) and the same id in
+  the app; the board then advertises as `Dexcomxx` with that transmitter's id.
 - **Pod:** pair a new Omnipod 5 pod, which is what a new board starts as. For DASH, switch
   the pod type first: the **Switch to DASH** button on either panel, or `pod mode dash`.
   The button always offers the other type, and switching starts a new, unpaired pod.
@@ -148,23 +158,12 @@ Use a **test phone**, never one that runs a real sensor, pod or patch.
 
 **Over USB, with buttons (no Wi‑Fi needed).** Open **https://loudestnoi.se/esp-sim/** in
 Chrome or Edge, press **Connect to the board** and pick its port. Close other serial
-monitors first: only one program can use the port. The page shows the pairing code, the
-latest reading with its trend, the glucose pattern, the pod and the board's Wi‑Fi details,
-and has buttons for test situations:
-
-- **CGM glucose:** steady, low, urgent low, high, very high, a wave, a random walk, or any
-  value you enter. A countdown shows when the next 5-minute reading is due.
-- **Sensor state:** normal, warmup, temporary sensor issue, excess noise, expired, failed.
-- **Pod type:** one button that offers the other type, **Switch to DASH** or **Switch to
-  Omnipod 5**. Switching starts a new, unpaired pod, and warns first if the current one is
-  paired.
-- **Pod:** reservoir levels, alerts, pod age up to the 80-hour shutdown, an occlusion
-  fault, a crash before or after the next command, and ignoring the next messages.
-- **Start over:** unpair the sensor, a new sensor, a new pod of the same type.
-- **Console:** the board's live log and a box for typing any [command](#commands).
-
-The buttons send the console commands below, so a board whose firmware is older than the
-page may not know them: install again to update it.
+monitors first: only one program can use the port. The page reads the board's console and
+sends console commands, so a board whose firmware is older than the page may not know them.
+The page's own sensor buttons were written for the g7sim-era firmware: this build has no
+pairing code, and its glucose controls are the next reading plus a trend (see
+[the CGM commands](#console-commands-the-cgm)). The page's console box runs any
+[command](#commands); the board's own web panels (below) are the current UI.
 
 **Web panels (over Wi‑Fi).** With no Wi‑Fi network saved, the board runs its own access
 point, `ESP-Sim-XXXX`. Its name and password are shown by the USB panel and by `status`,
@@ -183,33 +182,39 @@ itself never shows the AP password: the reader is already on the AP.
   then stay at `http://esp-sim.local/` and the clock is set from NTP. If the network cannot
   be joined, the board comes back as its own access point and the sheet returns.
 - **Continue without joining** sets a `setup=done` cookie (path `/`, 7 days), goes to `/`,
-  and leaves the simulators running offline. Only the clock is unset, so the pod and patch
-  start from their own uptime.
+  and leaves the simulators running offline. Only the board's wall clock is unset; the CGM
+  keeps its own clock, and the pod and patch start from their own uptime.
 
 The sheet is also at `http://192.168.4.1/setup`. To put the board on your network later,
 use `/settings` or `wifi <name> <password>`.
 
-All pages share one nav: **Home, G7, Pod, Medtrum, Settings**.
+All pages share one nav: **Home, CGM (at `/g7`), Pod, Medtrum, Settings**.
 
-- `/` is the home page: one card per simulator with a live line (G7 name, code, glucose and
-  display count; pod type, pairing, reservoir, active minutes and alerts; Medtrum serial,
+- `/` is the home page: one card per simulator with a live line (CGM name, code, glucose
+  and state; pod type, pairing, reservoir, active minutes and alerts; Medtrum serial,
   model, state, reservoir and connection), plus a no-clock banner that links to `/setup`.
-- `/g7` is the G7 panel: glucose (fixed, sine, random walk), sensor errors, new sensor.
+  Its CGM card is still titled "Dexcom G7" even when the board is a G6; the panel at
+  `/g7` shows the real kind.
+- `/g7` is the CGM panel: the kind (Dexcom G6 / Dexcom G7 / off), a G6 transmitter id, the
+  next reading and its trend, a calibration, the sensor state, signal loss, skip warm-up,
+  a new sensor, and the failure-injection card.
 - `/pod` is the pod panel: reservoir, pod age, alerts, faults, crash on the next command,
   the pod type switch, new pod.
 - `/medtrum` is the patch panel: model and serial, reservoir, patch state, fault, crash,
   new patch.
 - `/settings` owns the board: joined SSID and address, clock/NTP state, join or forget the
   network, firmware, hardware, and reboot. Wi‑Fi setup left the device panels for here.
+- `/setup` is the captive-portal Wi‑Fi sheet (also at `http://192.168.4.1/setup`).
 
-The JSON APIs are the originals': g7sim's at `/status`, `/glucose`, `/forget`, `/new`, and
-loopkit/pod's under `/pod` (`/pod/status`, `/pod/command`), the patch's under `/medtrum`
+The JSON APIs are the originals': g7sim's four stay at the root (`/status`, `/glucose`,
+`/forget`, `/new`), and the CGM's own core has `/g7/status` and `/g7/command`; loopkit/pod's
+are under `/pod` (`/pod/status`, `/pod/command`), the patch's under `/medtrum`
 (`/medtrum/status`, `/medtrum/command`), plus `/settings/status`, `/settings/wifi`,
 `/settings/forget`, `/settings/reboot` and `/fail` (see
 [Failure injection](#failure-injection)). `/setup/wifi`, `/pod/wifi` and `/medtrum/wifi`
 are aliases to the same save handler.
 
-The console commands below cover the G7, the pod and the board; the Medtrum patch is
+The console commands below cover the CGM, the pod and the board; the Medtrum patch is
 controlled from its panel or `/medtrum/command`.
 
 ## Commands
@@ -243,53 +248,78 @@ pio device monitor
 Type a command and press Enter. What you type may not be shown until you press Enter.
 Press **Ctrl+C** to quit.
 
-Either way, start with `help` to list the commands, or `status` to see the pairing code.
+Either way, start with `help` to list the commands, or `status` to see the CGM's kind,
+name and id with the pod and Wi‑Fi details.
 
-### Console commands: G7 sensor
+### Console commands: the CGM
 
-The sensor's commands are [LoopKit/g7sim](https://github.com/LoopKit/g7sim)'s control
-API: the same four requests, with the same JSON fields. On the console, type the request's
-name followed by the body you would post to g7sim.
+The CGM is ESP-Sim's portable G6/G7 core. The console keeps [LoopKit/g7sim](https://github.com/LoopKit/g7sim)'s
+four requests at the root and the same JSON fields, so the old one-liners still work, but
+what they do is what the core can do: one next reading and a trend, not g7sim's waveforms.
 
 | Console | g7sim | What it does |
 |---|---|---|
-| `status` | `GET /status` | Sensor name, pairing code, latest reading, plus the pod and Wi‑Fi details |
-| `glucose {"kind":"fixed","value":65}` | `POST /glucose` | Hold glucose at one value (mg/dL) |
-| `glucose {"kind":"sine","value":120,"amplitude":50,"periodMinutes":240}` | `POST /glucose` | Swing around 120 by ±50 over 240 minutes |
-| `glucose {"kind":"walk","value":140}` | `POST /glucose` | Drift randomly toward 140 |
-| `glucose {"kind":"fixed","value":120,"algorithmState":18}` | `POST /glucose` | Report a sensor error: 18 is a temporary issue, 25 a failed sensor |
-| `forget` | `POST /forget` | Unpair every phone from the sensor. It then advertises continuously until paired again. |
-| `new {"model":"stelo","code":"1234","ageMinutes":0}` | `POST /new` | Replace the sensor with a new one. The board restarts. |
+| `status` | `GET /status` | CGM kind, name, id, the next reading, the last reading, plus the pod and Wi‑Fi details |
+| `glucose {"kind":"fixed","value":65}` | `POST /glucose` | The next reading is 65 mg/dL |
+| `glucose {"kind":"fixed","value":120,"trend":-10}` | `POST /glucose` | 120 mg/dL now, and the next readings fall (the trend is tenths of mg/dL per minute, so −10 is about −5 mg/dL every 5 minutes) |
+| `glucose {"kind":"fixed","value":120,"algorithmState":18}` | `POST /glucose` | Report a sensor error: 18 is a temporary issue, 16 a G6 session failure, 25 a failed sensor |
+| `cal 120` | (none) | A G6 calibration: the last calibration and the next reading, as a 0x34 write does |
+| `algo 18` | (shorthand) | Change only the reported state; `algo 0` lets the core derive it |
+| `kind g6` / `kind g7` / `kind off` | (none) | Become a G6 transmitter, a G7 sensor, or neither. A new kind starts a new sensor |
+| `id 81ABC2` | (none) | A G6's 6-character transmitter id (2 characters for a G7) |
+| `forget` | `POST /forget` | Drop the current link. The core keeps no pairing to forget |
+| `new {"model":"g7","ageMinutes":0}` | `POST /new` | Start a new sensor. The board restarts |
 
-As in g7sim, `glucose` replaces the whole mode: a number you leave out is 0, and leaving
-out `algorithmState` returns the sensor to normal. `new` takes `model` (`g7`, `oneplus` or
-`stelo`), `days` (10 or 15), `code` (four digits), `serial`, `ageMinutes` (0 starts in
-warmup; the default is 120), `lifetimeHours` and `warmupMinutes`; anything left out picks
-g7sim's default. `new` alone makes a sensor with a random name and code.
-
-The same requests work over Wi‑Fi exactly as g7sim documents them, for example
+The same requests work over Wi‑Fi, for example
 `curl -XPOST esp-sim.local/glucose -d '{"kind":"fixed","value":65}'`.
 
-Shorter forms for typing, which g7sim does not have:
+`glucose` keeps g7sim's body: a number you leave out is 0, and leaving out
+`algorithmState` returns the sensor to normal. g7sim's `sine` and `walk` are accepted and
+logged as not applicable: the core has no waveform, so the `value` is the next reading and
+`trend` (tenths of mg/dL per minute, applied over the five minutes to the following
+reading) is how it moves. `cal`,
+`kind` and `id` are additions for the G6; the panel's signal loss and skip warm-up are
+`/g7/command` only (below).
 
-| Shorthand | What it does |
+`new` takes g7sim's body too: `model` picks the kind (`g6` is an extension; `g7`, `oneplus`
+and `stelo` are all a G7 sensor here), `ageMinutes` starts an older sensor (0 starts in
+warm-up), and `days`, `code`, `serial`, `lifetimeHours` and `warmupMinutes` are accepted,
+logged as not applicable and not invented. The core's sessions are fixed: a G6 is a 10-day
+transmitter with a 2-hour warm-up, a G7 a 10.5-day sensor (10 days and the 12-hour grace)
+with a 27-minute warm-up. There is no pairing code to choose.
+
+The panel and `/g7/command` take the core's own commands:
+
+| `/g7/command` | What it does |
 |---|---|
-| `glucose fixed 55` | Hold glucose at one value, keeping the current algorithm state |
-| `glucose sine 120 50 90` | Mean, swing and period in minutes, keeping the algorithm state |
-| `glucose walk 120` | Random walk, keeping the algorithm state |
-| `algo 18` | Change only the algorithm state. `algo 0` returns to normal. |
-| `new code=1234 ageMinutes=0` | The fields of `new` as `key=value` |
-| `help` | List all commands |
+| `{"command":"cgmSetGlucose","glucose":120,"trend":-10}` | The next reading and its trend (tenths of mg/dL per minute) |
+| `{"command":"cgmSetState","state":18}` | Force the reported state (0 derives it from the session's age) |
+| `{"command":"cgmSetSignalLoss","on":true}` | Signal loss: stop advertising and drop the link; the readings are still made, so the app backfills them when it ends |
+| `{"command":"cgmSkipWarmup"}` | End the warm-up now, keeping the sensor and its id |
+| `{"command":"cgmSetCalibration","glucose":120}` | G6 calibration (the last calibration and the next reading) |
+| `{"command":"cgmSetKind","kind":6}` | 0 off, 6 G6, 7 G7; a new kind starts a new sensor |
+| `{"command":"cgmSetId","id":"81ABC2"}` | A G6's transmitter id (2 characters for a G7) |
+| `{"command":"cgmNewSensor","kind":7,"ageMinutes":120}` | A new sensor of that kind, that many minutes old |
+| `{"command":"cgmForget"}` | Drop the current link |
 
-Glucose changes take effect at the next 5-minute reading. After `forget` or `new`, pair
-the sensor in the app again.
+`GET /g7/status` returns the core's own state (kind, name, id, glucose, trend, state,
+`signalLoss`, the reading history's last entry, `advertising`/`connected`, plus
+`radioConnected`, `now`, `ageSeconds` and `warmupLeftSeconds`), and the panel polls it
+every 2 seconds.
 
-Not carried over from g7sim: `POST /force-quit` and the `-transport`, `-socket`,
-`-simulator`, `-relaunch`, `-suspend` and `-dylib` flags, which only apply to its iOS
+Glucose changes take effect at the next 5-minute reading. After `new`, `kind` or `id`, the
+app has to find the sensor again (a new sensor has a new id).
+
+What g7sim had and this core does not: the 4-digit pairing code and the J-PAKE handshake
+(the core auto-authenticates and reports itself bonded), per-display key slots (see
+[Differences](#differences-from-the-originals)), the ONE+/Stelo advertised names, and the
+sine/random-walk waveforms. `GET /status` keeps g7sim's field names, but `code` is empty,
+`slots` is `{}` and `glucoseMode.kind` is always `"fixed"`, because those are what the core
+has. Not carried over either: `POST /force-quit` and the `-transport`, `-socket`,
+`-simulator`, `-relaunch`, `-suspend` and `-dylib` flags, which only apply to g7sim's iOS
 Simulator transport, and `-max-connections`, since the board serves one phone at a time.
-`/status` reports times as seconds of sensor age (`ageSeconds`, `lastSeenAgoSeconds`,
-`lockedForSeconds`) where g7sim gives clock times, because the board has no clock without
-Wi‑Fi.
+`/status` reports times as seconds of sensor age (`ageSeconds`) where g7sim gives clock
+times, because the board has no clock without Wi‑Fi (the CGM keeps its own clock anyway).
 
 ### Console commands: Omnipod pod
 
@@ -329,7 +359,7 @@ the new one. The names this console used before (`pod new`, `type`, `reservoir`,
 | `wifi MyNetwork mypassword` | Join a Wi‑Fi network. The board restarts and prints its address. |
 | `wifi off` | Forget the network and go back to the board's own access point |
 | `scan` | List the Wi‑Fi networks the board can see (2.4 GHz only) |
-| `reboot` | Restart the board. Sensor, pod and pairings are kept. |
+| `reboot` | Restart the board. The CGM's, pod's and patch's state is kept. |
 
 ### On your computer: build and flash
 
@@ -338,7 +368,7 @@ Run these in a terminal, from the repo's folder. They need PlatformIO.
 | Command | What it does |
 |---|---|
 | `pio run` | Build the firmware without flashing |
-| `pio run -t upload` | Build and flash. Keeps the board's sensor, pod, pairings and Wi‑Fi. |
+| `pio run -t upload` | Build and flash. Keeps the board's CGM, pod, patch and Wi‑Fi. |
 | `pio run -t erase` | Wipe the board completely. Follow with `pio run -t upload`. |
 | `pio device monitor` | Open the board's console |
 | `pio device list` | List connected boards and their ports |
@@ -361,18 +391,28 @@ venv/bin/pip install bleak cryptography
 | Command | What it does |
 |---|---|
 | `venv/bin/python tools/podcheck.py` | Find the pod and check that it answers |
-| `G7NAME=DXCMab venv/bin/python tools/g7client.py 1234` | Pair with the G7 as a phone would. Use your board's name and code. |
+| ~~`G7NAME=DXCMab venv/bin/python tools/g7client.py 1234`~~ | **Retired**: it speaks g7sim's J-PAKE pairing, which this firmware no longer has. Use the app instead. |
 
-`g7client.py` takes the sensor's phone slot, so the app has to pair again afterwards. Both
-need the board free: one phone or computer can be connected at a time.
+`g7client.py` also took the sensor's phone slot, so the app had to pair again afterwards.
+Both need the board free: one phone or computer can be connected at a time.
 
 ## Failure injection
 
-The **Failure injection** card on `/g7`, `/pod` and `/medtrum`, and the console's `fail`
-command, put real Bluetooth failures in front of the simulators. The card has drop, refuse,
-quiet and delay; `ignore` is console/API-only. The knobs live in RAM and reset on reboot.
+The **Failure injection** card on `/g7`, `/pod` and `/medtrum`, the console's `fail`
+command and `/fail` put real Bluetooth failures in front of the simulators. All five knobs
+are enforced by the radio; the values live in RAM and reset on reboot.
 
-Post JSON to `/fail`:
+| Knob | What it does | pod | CGM (`g7`) | Medtrum |
+|---|---|---|---|---|
+| `drop` | Accept the next connection, then disconnect at once | yes | yes | yes |
+| `refuse` | Drop the next N connections | yes | yes | yes |
+| `quiet` | Leave that device out of the advertising rotation for the chosen time | yes | yes | yes |
+| `delay` | Wait before each outgoing notification from that device | yes | yes | yes |
+| `ignore` | Drop the next N messages the phone sends to that device | yes | yes | yes |
+
+The knobs reach the radio through `/fail` (also on the card on `/g7` and `/medtrum`; the
+`/pod` card has drop, refuse, quiet, delay and Clear, and `ignore` for the pod is
+console/`/fail` only). Post JSON to `/fail`:
 
 ```bash
 curl -XPOST esp-sim.local/fail -H 'Content-Type: application/json' \
@@ -381,12 +421,12 @@ curl -XPOST esp-sim.local/fail -H 'Content-Type: application/json' \
 
 | Field | What it does | Range |
 |---|---|---|
-| `device` | Which simulator: `pod`, `g7`, `medtrum` or `all` | |
+| `device` | Which simulator: `pod`, `g7` (also `cgm`), `medtrum` or `all` | |
 | `drop` | Drop the next connection once for that device (accept it, then disconnect) | `true` / `false` |
 | `refuse` | Drop this many subsequent connections | 0–1000 |
 | `quietMs` | Stop advertising that device for this many milliseconds | 0–86,400,000 |
-| `delayMs` | Delay each outgoing notification | 0–60,000 |
-| `ignore` | Drop this many messages from the phone | 0–1000 |
+| `delayMs` | Wait this long before each outgoing notification | 0–60,000 |
+| `ignore` | Drop this many messages from the phone, then resume | 0–1000 |
 
 Omitted fields are left alone; `0` or `false` clears a field. The reply is the new state for
 all three devices, e.g. `{"pod":{...},"g7":{...},"medtrum":{...}}` with `drop`, `refuse`,
@@ -410,24 +450,28 @@ drop for each, so the next three connections are dropped. `quiet` only clears th
 device's advertising want flag: the pod's and Medtrum's advertisement bytes do not change.
 `ignore` drops the message at the BLE write, for all three devices.
 
-A G7 `delayMs` is recorded and returned in the state but not applied, because the G7's
-notifications are sent by its sensor task; the pod's and Medtrum's delays are applied. The
-G7's drop, refuse, quiet and ignore knobs all work.
+The CGM's notifications are sent from a task of its own, so `delay` holds them without
+blocking the CGM core. A delayed message is sent to the link it was queued for: if the
+phone has hung up by then, it is dropped rather than delivered to the next one.
 
 ## Good to know
 
-- All three simulators keep their state in flash: a reboot is the same sensor, pod and
+- All three simulators keep their state in flash: a reboot is the same CGM, pod and
   patch, still paired.
-- Without NTP, the pod's and patch's clocks pause while the board is unplugged.
-- In the app the pod may briefly show as reconnecting once every 5 minutes. That's the
+- The CGM keeps its own clock: a reboot continues the sensor's age, and NTP is not needed
+  for it. Without NTP, the pod's and patch's clocks pause while the board is unplugged.
+- In the app the pod may briefly show as reconnecting after each CGM reading. That's the
   hang-up described above.
-- Unlike a real G7, the sensor serves a phone that has already collected the current
+- Unlike a real CGM, the board serves a phone that has already collected the current
   reading, and it does not serve a second display (a watch or a second phone).
 - The simulators don't appear in iOS Settings → Bluetooth. That's expected.
 - Not yet tested on hardware: the captive Wi-Fi sheet on iOS and Android; long runs; what
   the app does after `crashNextCommand` and `ignoreNextMessages` (the board accepts them);
   and a blank board starting as an Omnipod 5 (boards updated from an earlier build keep the
   pod they had).
+- **Not yet on hardware at all**: the G6/G7 core (`lib/cgmsim`) and the CGM's side of the
+  radio. The panel sets the next glucose, a trend and the state; every reading is made up,
+  and there is no waveform.
 - The ESP32 is 2.4 GHz only, and can't sign in to captive-portal Wi‑Fi (hotels). Use its
   own access point or a phone hotspot.
 
@@ -437,69 +481,98 @@ Devices we want to add:
 
 - [x] Omnipod DASH
 - [x] Omnipod 5
-- [x] Dexcom G7 (also ONE+ and Stelo)
+- [x] Dexcom G6 (transmitter mode: a 6-character transmitter id)
+- [x] Dexcom G7
 - [x] Medtrum
 - [ ] FreeStyle Libre 3 Plus (L3P)
 - [ ] More to come!
 
 ## Differences from the originals
 
-- **ESP-Sim** is an ESP-IDF project; here its pod core runs under Arduino/PlatformIO with
-  new board glue (`src/pod.cpp`, and the pod's side of `src/radio.cpp`) in place of its
-  `main/`. The pod's panel moved to `/pod`, and its pod type dropdown became one switch
-  button. A new board starts as an Omnipod 5, where ESP-Sim starts as a DASH. The pod core
-  gained loopkit/pod's `ignoreNextMessages` and `failNextConnects` commands. ESP-Sim's
-  host tests are not included: run them in ESP-Sim itself.
+- **ESP-Sim** is an ESP-IDF project; here its **portable cores** run under Arduino/PlatformIO
+  with new board glue in place of its `main/`: `lib/dashpod` (`src/pod.cpp`), `lib/cgmsim`
+  (`src/sensor_app.cpp`) and `lib/medtrumpatch` (`src/medtrum_app.cpp`), plus each device's
+  side of `src/radio.cpp`. The pod's panel moved to `/pod`, and its pod type dropdown became
+  one switch button. A new board starts as an Omnipod 5, where ESP-Sim starts as a DASH.
+  The pod core gained loopkit/pod's `ignoreNextMessages` and `failNextConnects` commands.
+  ESP-Sim's host tests are not copied, except the CGM's (`make -C test/cgm`, the same
+  checks ESP-Sim runs).
 - **ESP-Sim's Medtrum patch** is ported here as a third device. Its portable patch core
   (`lib/medtrumpatch`, plain C with no ESP-IDF or mbedTLS) runs under Arduino/PlatformIO
   with new board glue (`src/medtrum_app.cpp`, and the patch's side of `src/radio.cpp`).
-  The one radio now takes turns between the pod's, the G7's and the Medtrum pump base's
+  The one radio now takes turns between the pod's, the CGM's and the Medtrum pump base's
   advertisements. The patch's panel is at `/medtrum`, its host tests run with
   `make -C test/medtrum`, and its controls are the panel and `/medtrum/command` (there is
   no console command prefix for it).
-- **g7simESP32**'s radio is rewritten to share one connection with the pod and the patch,
-  and its session stays open on that connection instead of hanging up after a few idle
-  seconds. The G7 panel is at `/g7`, but `/status`, `/glucose`, `/new` and `/forget` stay
-  exactly where g7sim has them. `/glucose` now fills in omitted fields as g7sim does (0,
-  not g7simESP32's 120, 50 and 240), and the console takes g7sim's request bodies.
-- **Pages and the captive portal** are new here: `/` is a home page, `/g7` the G7 panel,
+- **The CGM is ESP-Sim's core**, not the g7sim port. `lib/cgmsim` is ESP-Sim's portable
+  G6/G7 protocol, verbatim, with `src/sensor_app.cpp` for its clock, flash and task and the
+  CGM's side of `src/radio.cpp`. The g7sim port that used to run the G7 (`src/sensor.cpp`,
+  `handler.cpp`, `crypto.cpp`, `link.h`) is still in the tree but **retired**: nothing
+  starts it. In exchange for g7sim's extras, the board gains a real **G6 transmitter mode**
+  (a 6-character id, G6 calibration, a 2-hour warm-up and a 10-day session), signal loss
+  with backfill, skip warm-up, and the full sensor-state table.
+- **g7sim's interface is kept where it can be**: the panel is at `/g7`, and `/status`,
+  `/glucose`, `/new` and `/forget` stay exactly where g7sim has them, with g7sim's field
+  names and its JSON bodies. `/g7/status` and `/g7/command` are new (the panel uses them).
+  What the core cannot do is not faked: `code` is empty, `slots` is `{}` and
+  `glucoseMode.kind` is always `"fixed"`.
+- **The honest costs of the swap**:
+  - **Multi-display key slots are gone.** The core presents itself as already
+    authenticated and bonded and keeps no per-display keys, so there is no slot table, no
+    last-seen or miss count, and `/forget` can only drop the current link. **One phone at a
+    time**; a second display (a watch, another phone) is not served.
+  - **No pairing code.** g7sim's 4-digit code and J-PAKE handshake are gone; a G7 is found
+    as `DXCMxx` and a G6 needs its transmitter id, as the real apps expect.
+  - **No sine or random-walk waveform.** The core holds **one next glucose and a trend**, so
+    `/glucose`'s `value` is the next reading and `trend` is how it moves; `sine`/`walk` and
+    their swing parameters are accepted and logged as not applied. The adapter does not
+    synthesize them.
+  - **`ONE+` and `Stelo` names are gone**: a G7 always advertises `DXCM`+id and a G6
+    `Dexcom`+the id's last two characters, as ESP-Sim's reference does.
+  - A board updated from the g7sim-era firmware migrates its saved sensor on first boot
+    (the id suffix, age, glucose and up to 3 hours of readings); the pairing code, slots,
+    calibration and waveform are dropped, each with a line on the console.
+- **Pages and the captive portal** are new here: `/` is a home page, `/g7` the CGM panel,
   `/pod` and `/medtrum` the device panels, and `/settings` the board (network, clock,
   firmware, reboot). The board's own access point answers as a captive portal and serves
   the Wi-Fi sheet at `/setup`; dismissing it sets a `setup=done` cookie. The
   failure-injection card is on the three device panels, backed by `/fail`.
-- **This variant** simulates G7, ONE+ and Stelo only: there is no G6 sensor service or G6
-  protocol in this firmware.
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `lib/dashpod/` | ESP-Sim's pod core with two commands added (GPL-3.0-or-later) |
+| `lib/cgmsim/` | ESP-Sim's portable Dexcom G6/G7 core, verbatim (GPL-3.0-or-later) |
 | `lib/medtrumpatch/` | ESP-Sim's portable Medtrum patch core (GPL-3.0-or-later) |
 | `src/pod.cpp` | The pod's clock, storage and task |
+| `src/sensor_app.cpp` | The CGM's clock, storage and task |
 | `src/medtrum_app.cpp` | The Medtrum pump base's clock, storage and task |
-| `src/radio.cpp` | One Bluetooth device for the pod, the G7 and the patch |
-| `src/sensor.cpp`, `handler.cpp`, `crypto.cpp` | The G7 (from g7simESP32) |
+| `src/radio.cpp` | One Bluetooth device for the pod, the CGM and the patch |
+| `src/sensor.cpp`, `handler.cpp`, `crypto.cpp`, `link.h` | The retired g7sim port (kept in the tree, unused) |
 | `src/main.cpp` | Boot, Wi‑Fi, captive-portal routes, web pages, failure API, console |
 | `src/portal.h`, `src/portal.cpp` | The pure captive-probe and AP-mode redirect decision |
 | `src/fail.h`, `src/fail.cpp` | The pure failure-injection state machine |
 | `src/home_html.h` | The home page with one card per simulator |
-| `src/index_html.h` | The G7 panel |
+| `src/index_html.h` | The CGM panel |
 | `src/pod_html.h`, `src/medtrum_html.h` | Generated pod and patch panels |
 | `src/settings_html.h` | The Settings page (Network + Board) |
 | `src/setup_html.h` | The captive-portal Wi‑Fi sheet |
 | `src/adv_rotation.h` | The pure advertising-rotation choice, shared with `test/medtrum/test_adv.c` |
+| `test/cgm/` | Host tests for the CGM core |
 | `test/medtrum/` | Host tests for the Medtrum patch core and the advertising rotation |
 | `test/portal/` | Host tests for the captive-portal decision |
 | `test/fail/` | Host tests for the failure-injection state |
 | `flasher/`, `tools/make_flasher.sh` | The browser flasher |
 | `tools/pod_panel.html`, `tools/gen_pod_panel.py` | The pod's web panel and its generator |
 | `tools/medtrum_panel.html`, `tools/gen_medtrum_panel.py` | The patch's web panel and its generator |
-| `tools/g7client.py`, `tools/podcheck.py` | Test clients for a Mac |
+| `tools/g7client.py`, `tools/podcheck.py` | Test clients for a Mac (`g7client.py` speaks the retired g7sim pairing and no longer works) |
 
 ## License
 
-GPL-3.0-or-later (see `LICENSE`), as ESP-Sim's pod core requires of a combined work. The G7
-files come from MIT-licensed code (LoopKit/g7sim and g7simESP32); their notice is in
-`LICENSE-g7sim-MIT`. The Medtrum patch core carries MedtrumKit's CRC-8 and Rijndael tables
-(MIT, Copyright (c) 2024 J. Bunt); that notice is in `lib/medtrumpatch/LICENSE.medtrumkit`.
+GPL-3.0-or-later (see `LICENSE`), as ESP-Sim's pod, CGM and patch cores require of a
+combined work. The retired g7sim port's files (now unused, `src/sensor.cpp`,
+`handler.cpp`, `crypto.cpp`, `link.h`) come from MIT-licensed code (LoopKit/g7sim and
+g7simESP32); their notice is in `LICENSE-g7sim-MIT`. The Medtrum patch core carries
+MedtrumKit's CRC-8 and Rijndael tables (MIT, Copyright (c) 2024 J. Bunt); that notice is in
+`lib/medtrumpatch/LICENSE.medtrumkit`.
