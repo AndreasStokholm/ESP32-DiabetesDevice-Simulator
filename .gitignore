@@ -1,3 +1,4 @@
 .pio/
 .vscode/
 flasher/dist/
+test/cgm/cgm_tests
