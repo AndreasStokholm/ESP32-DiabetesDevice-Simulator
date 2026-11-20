@@ -37,7 +37,7 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
 <nav>
   <span class="brand">ESP-Sim</span>
   <a class="active" href="/">Home</a>
-  <a href="/g7">G7</a>
+  <a href="/g7">CGM</a>
   <a href="/pod">Pod</a>
   <a href="/medtrum">Medtrum</a>
   <a href="/settings">Settings</a>
@@ -45,7 +45,7 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
 <main>
   <div class="banner" id="wallclock">No wall clock: NTP never ran.<a href="/setup">Set up Wi-Fi &rarr;</a></div>
   <a class="card" href="/g7">
-    <div class="t">Dexcom G7<span class="go">Open &rarr;</span></div>
+    <div class="t"><span id="cgmTitle">CGM</span><span class="go">Open &rarr;</span></div>
     <div class="s"><span class="dot" id="g7dot"></span><span id="g7line">--</span></div>
   </a>
   <a class="card" href="/pod">
@@ -76,6 +76,10 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
   const PATCH_FAULTS = [96,97,98,99,100,101,102,103];
   const stateName = s => PATCH_STATES[s] || ('state ' + s);
 
+  const CGM_KINDS = {0:'CGM (off)', 6:'Dexcom G6', 7:'Dexcom G7'};
+  const CGM_STATES = {1:'stopped',2:'warm-up',6:'ok',16:'session failure',18:'temporary issue',
+    24:'expired',25:'failed',26:'session ended'};
+
   async function get(url) {
     const r = await fetch(url);
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -84,11 +88,14 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
 
   async function pollG7() {
     try {
-      const s = await get('/status');
-      const glucose = s.latest && s.latest.glucose !== undefined ? s.latest.glucose + ' mg/dL' : '--';
-      const displays = Object.keys(s.slots || {}).length;
-      set('g7line', (s.name || '--') + ' · code ' + (s.code || '--') + ' · ' + glucose + ' · ' + displays + (displays === 1 ? ' display' : ' displays'));
-      dot('g7dot', (s.latest && s.latest.state === 6 && s.latest.glucose !== undefined) ? 'ok' : 'warn');
+      // The CGM's own view (/g7/status): the kind, name, reading and state. The
+      // g7sim-shaped /status has no code or display slots to show any more.
+      const s = await get('/g7/status');
+      set('cgmTitle', CGM_KINDS[s.kind] || 'CGM');
+      const glucose = s.last && s.last.glucose ? s.last.glucose + ' mg/dL' : '--';
+      const st = CGM_STATES[s.state] || ('state ' + s.state);
+      set('g7line', (s.name || '--') + ' · ' + glucose + ' · ' + st + (s.signalLoss ? ' · signal loss' : ''));
+      dot('g7dot', (s.kind && s.state === 6 && s.last && s.last.glucose) ? 'ok' : 'warn');
     } catch (err) {
       set('g7line', '--');
       dot('g7dot', '');

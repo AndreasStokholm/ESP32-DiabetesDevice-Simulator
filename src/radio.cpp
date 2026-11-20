@@ -5,6 +5,7 @@
 
 #include <mutex>
 
+#include "adv_payload.h"
 #include "adv_rotation.h"
 #include "dash_internal.h"
 #include "fail.h"
@@ -63,14 +64,23 @@ static bool cgmAdvOn = false;
 // happen here before that call returns. The link is the pod's too, so the
 // hang-up waits for a pause in the pod's traffic, with a 20 s deadline.
 static volatile bool cgmDrop = false;
-static int64_t cgmDropAt = 0;
+static volatile uint32_t cgmDropAt = 0;  // 32-bit: written by two tasks
+// The CGM was used on the current link (any of its GATT events). The core ends
+// a session after CONN_MAX; a link the CGM never touched is the pod's or the
+// patch's, and must not be torn down by that timer.
+static volatile bool cgmUsed = false;
+// A new value for every connection, so a notification queued (or delayed) for
+// the old link cannot reach a new phone that happens to reuse the handle.
+static volatile uint32_t linkGen = 0;
 
 // The CGM's notifications go through a queue and a task of their own: the core
 // calls radio::cgmNotify from inside its mutex, so the injected delay is
 // waited out here, never while the core's mutex is held. The order is kept,
-// and the link and the subscription are re-checked after the wait.
+// and the link, its generation and the subscription are re-checked after the
+// wait.
 struct CgmOut {
-  uint16_t conn;  // the link it was queued for
+  uint16_t conn;   // the link it was queued for
+  uint32_t gen;    // ...and its generation
   uint8_t chr;
   uint8_t len;
   uint8_t data[32];
@@ -87,7 +97,7 @@ static QueueHandle_t podEvents;
 static uint16_t podCmdHandle, podDataHandle, podO5DataHandle;
 static std::string podAdvData;  // guarded by mu
 static bool podIsO5 = false, podPaired = false;
-static volatile int64_t podLastTraffic = 0;
+static volatile uint32_t podLastTraffic = 0;
 
 // The Medtrum patch's side of the link.
 static QueueHandle_t medtrumEvents;
@@ -141,6 +151,17 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     }
     logf("%s connected", addr.c_str());
     conn = desc->conn_handle;
+    ++linkGen;  // anything queued for the old link is stale now
+    cgmUsed = false;
+    // The core marks its own advertising off when it sees the connection
+    // (cgm_on_connect) without calling advertise(false), so the radio's copy is
+    // cleared here to match: otherwise the rotation would keep advertising the
+    // CGM outside the core's 60-second window, and signal loss could not stop
+    // it.
+    {
+      std::lock_guard<std::mutex> l(mu);
+      cgmAdvOn = false;
+    }
     // The core does not hold the radio's mutex, and this callback holds none
     // of it either: it may send (cgmNotify) and hang up (cgmDisconnect, which
     // tick() carries out) from inside its own mutex.
@@ -154,6 +175,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     conn = BLE_HS_CONN_HANDLE_NONE;
     cgmDrop = false;
     cgmDropAt = 0;
+    cgmUsed = false;
+    // No stale CCCD: a notification that was queued for this link is dropped
+    // (the generation check), and a new phone has to subscribe afresh.
+    for (int i = 0; i < CGM_CHR_COUNT; i++) cgmSubs[i] = 0;
     std::string addr = addrString(desc->peer_ota_addr);
     logf("%s disconnected", addr.c_str());
     sensor::onDisconnect();
@@ -171,6 +196,7 @@ class CgmCallbacks : public NimBLECharacteristicCallbacks {
 
   void onWrite(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
     if (desc->conn_handle != conn) return;
+    cgmUsed = true;
     if (fail_decide(FAIL_CGM, FAIL_CONSUME_MESSAGE, 0)) {
       logf("cgm: injected failure: message ignored");
       return;
@@ -181,6 +207,7 @@ class CgmCallbacks : public NimBLECharacteristicCallbacks {
 
   void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc* desc, uint16_t subValue) override {
     if (desc && desc->conn_handle != conn) return;
+    cgmUsed = true;
     // The core answers a subscription at once (the auth status, the reading), so
     // the CCCD value is recorded first: cgmNotify sends only to a subscriber.
     cgmSubs[chr] = subValue;
@@ -189,6 +216,7 @@ class CgmCallbacks : public NimBLECharacteristicCallbacks {
 
   void onRead(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
     if (desc && desc->conn_handle != conn) return;
+    cgmUsed = true;
     uint8_t buf[64];
     size_t n = sensor::onRead(chr, buf, sizeof buf);
     if (n) ch->setValue(buf, n);
@@ -217,7 +245,7 @@ class PodCallbacks : public NimBLECharacteristicCallbacks {
       logf("pod: injected failure: message ignored");
       return;
     }
-    podLastTraffic = monoMs();
+    podLastTraffic = (uint32_t)monoMs();
     podPush(cmd ? DASH_EV_CMD : DASH_EV_DATA, v.data(), v.length());
   }
 
@@ -279,10 +307,12 @@ void begin() {
   NimBLEService* cgm = server->createService(cgmServiceUUID);
   NimBLECharacteristic* cgmChars[CGM_CHR_COUNT];
   for (int i = 0; i < CGM_CHR_COUNT; i++) {
-    // The G6's active mode reads the auth challenge from the auth
-    // characteristic, so that one is readable as well.
-    uint32_t props = (cgm_chr_t)i == CGM_CHR_AUTH ? (rw | NIMBLE_PROPERTY::READ) : rw;
-    cgmChars[i] = cgm->createCharacteristic(cgmCharUUIDs[i], props);
+    // ESP-Sim's ble.c gives COMM, AUTH and BACKFILL the READ bit (the G6's
+    // active mode reads the auth challenge; CGMBLEKit reads COMM/BACKFILL in
+    // some paths) and leaves CONTROL write/notify/indicate. The
+    // write-without-response bit is a superset the phone need not use.
+    bool readable = (cgm_chr_t)i != CGM_CHR_CONTROL;
+    cgmChars[i] = cgm->createCharacteristic(cgmCharUUIDs[i], readable ? (rw | NIMBLE_PROPERTY::READ) : rw);
     cgmChars[i]->setCallbacks(new CgmCallbacks((cgm_chr_t)i));
   }
   NimBLEService* b = server->createService(serviceBUUID);
@@ -323,8 +353,9 @@ void begin() {
 
 // A complete local name field: length, type 0x09, the name.
 static std::string named(const std::string& name) {
-  std::string p = {(char)(name.size() + 1), 0x09};
-  return p + name;
+  uint8_t b[ADV_MAX];
+  size_t n = adv_name(name.c_str(), b, sizeof b);
+  return n ? std::string((const char*)b, n) : std::string();
 }
 
 // (Re)configures the advertising set as a legacy connectable advert and starts it.
@@ -353,18 +384,21 @@ void cgmAdvertise(bool on, const char* name, const uint8_t addr[6]) {
   // and is not used here (the apps find the device by name and service).
   (void)addr;
   std::string nm = name ? name : "";
-  // Exactly the reference's CGM advertisement (ESP-Sim's main/ble.c): flags,
-  // the complete list of 16-bit service UUIDs with 0xFEBC (the service the
-  // phones filter their scan on, little-endian), then the complete local name.
-  std::string p = {0x02, 0x01, 0x06, 0x03, 0x03, (char)0xBC, (char)0xFE};
-  p += named(nm);
+  // Exactly the reference's CGM advertisement (ESP-Sim's main/ble.c), built by
+  // the pure adv_cgm() the host test pins: flags, the complete list of 16-bit
+  // service UUIDs with the 0xFEBC the phones filter their scan on
+  // (little-endian), then the complete local name.
+  uint8_t buf[ADV_MAX];
+  size_t pn = on ? adv_cgm(nm.c_str(), buf, sizeof buf) : 0;
+  if (on && !pn) logf("cgm: \"%s\" does not fit one advertisement; without one it cannot be found", nm.c_str());
+  std::string p(pn ? (const char*)buf : "", pn);
   {
     std::lock_guard<std::mutex> l(mu);
-    cgmAdvOn = on;
+    cgmAdvOn = on && pn != 0;
     cgmAdvData = p;
     cgmAdvName = nm;
   }
-  logf("cgm: %s as %s", on ? "advertising" : "not advertising", nm.empty() ? "(off)" : nm.c_str());
+  logf("cgm: %s as %s", on && pn ? "advertising" : "not advertising", nm.empty() ? "(off)" : nm.c_str());
 }
 
 void tick() {
@@ -372,16 +406,24 @@ void tick() {
   // call that asked (the core holds its mutex there, and the NimBLE disconnect
   // callback calls back into the core). The one link is the pod's as well, so
   // the CGM's hang-up waits for the pod's traffic to pause first, as it always
-  // did, and gives up waiting after 20 s.
+  // did, and gives up waiting after 20 s. A link the CGM never touched is not
+  // the CGM's to end: the core's 30 s session cap must not tear down a pod or
+  // patch session (P1: the cap is the core's, but the link is shared).
   int64_t now = monoMs();
+  uint32_t now32 = (uint32_t)now;  // the cross-task deadlines are 32-bit
   if (cgmDrop) {
     uint16_t c = conn;
     if (c == BLE_HS_CONN_HANDLE_NONE) {
       cgmDrop = false;
       cgmDropAt = 0;
+    } else if (!cgmUsed) {
+      // Nothing CGM has happened on this link: leave the pod's session up. The
+      // core asks again every second; this clears each request.
+      cgmDrop = false;
+      cgmDropAt = 0;
     } else {
-      if (!cgmDropAt) cgmDropAt = now;
-      if (now - podLastTraffic >= 1500 || now - cgmDropAt >= 20 * 1000) {
+      if (!cgmDropAt) cgmDropAt = now32;
+      if (now32 - podLastTraffic >= 1500u || now32 - cgmDropAt >= 20000u) {
         cgmDrop = false;
         cgmDropAt = 0;
         logf("cgm: hanging up so the phone collects the reading");
@@ -462,7 +504,9 @@ static void cgmSendTask(void*) {
     unsigned delay = (unsigned)fail_decide(FAIL_CGM, FAIL_NOTIFY_DELAY_MS, 0);
     if (delay) vTaskDelay(pdMS_TO_TICKS(delay));
     uint16_t c = conn;
-    if (c == BLE_HS_CONN_HANDLE_NONE || c != m.conn) continue;  // the phone left while we waited
+    // The phone may have left, or a new one taken the same handle, while we
+    // waited: a queued message belongs to the link it was queued for.
+    if (c == BLE_HS_CONN_HANDLE_NONE || c != m.conn || linkGen != m.gen) continue;
     uint16_t sub = cgmSubs[m.chr];
     if (!sub) {
       logf("cgm: %s -> %s dropped: not subscribed", cgmCharNames[m.chr], hexstr(m.data, m.len).c_str());
@@ -491,6 +535,7 @@ void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n) {
   }
   CgmOut m = {};
   m.conn = conn;
+  m.gen = linkGen;
   m.chr = (uint8_t)chr;
   m.len = (uint8_t)n;
   if (n) memcpy(m.data, p, n);
@@ -519,9 +564,13 @@ bool podNextEvent(dash_ev_t* ev, uint32_t timeoutMs) {
 static void podNotify(uint16_t handle, const uint8_t* p, size_t n) {
   uint16_t c = conn;
   if (c == BLE_HS_CONN_HANDLE_NONE) return;
+  uint32_t gen = linkGen;
   unsigned delay = (unsigned)fail_decide(FAIL_POD, FAIL_NOTIFY_DELAY_MS, 0);
   if (delay) vTaskDelay(pdMS_TO_TICKS(delay));
-  podLastTraffic = monoMs();
+  // The link may have gone (or been replaced) while we waited: do not send
+  // the old device's message to a new phone that reused the handle.
+  if (conn != c || linkGen != gen) return;
+  podLastTraffic = (uint32_t)monoMs();
   // With a dozen fragments queued, NimBLE can run short of buffers for a
   // moment: wait for them rather than lose a fragment.
   for (int tries = 0; tries < 100; tries++) {
@@ -550,22 +599,21 @@ void podDisconnect() {
 
 void podAdvertise(const dash_adv_t* adv) {
   bool o5 = adv->pod_type == DASH_POD_O5;
-  std::string p = {0x02, 0x01, 0x06};
+  // The pod's bytes are the reference's; the pure builders in adv_payload.h
+  // assemble them and the host test pins them.
+  uint8_t buf[ADV_MAX];
+  size_t n = 0;
   if (o5) {
     // One 128-bit UUID with the paired controller's id in it.
     uint8_t le[16];
     dash_o5_advertised_uuid(adv->pdm_id, le);
-    p += {0x11, 0x07};
-    p.append((const char*)le, 16);
+    n = adv_pod_o5(le, buf, sizeof buf);
   } else {
     uint16_t svc[9];
     dash_advertised_services(adv->id, adv->fault, adv->alerts, svc);
-    p += {0x13, 0x03};
-    for (uint16_t u : svc) {
-      p += (char)(u & 0xff);
-      p += (char)(u >> 8);
-    }
+    n = adv_pod(svc, buf, sizeof buf);
   }
+  std::string p((const char*)buf, n);
   bool paired = o5 ? adv->pdm_id != nullptr : adv->id != nullptr;
   {
     std::lock_guard<std::mutex> l(mu);
@@ -590,8 +638,11 @@ bool medtrumNextEvent(medtrum_ev_t* ev, uint32_t timeoutMs) {
 static void medtrumNotifyRaw(uint16_t handle, const uint8_t* p, size_t n) {
   uint16_t c = conn;
   if (c == BLE_HS_CONN_HANDLE_NONE) return;
+  uint32_t gen = linkGen;
   unsigned delay = (unsigned)fail_decide(FAIL_MEDTRUM, FAIL_NOTIFY_DELAY_MS, 0);
   if (delay) vTaskDelay(pdMS_TO_TICKS(delay));
+  // The link may have gone (or been replaced) while we waited.
+  if (conn != c || linkGen != gen) return;
   // With a dozen fragments queued, NimBLE can run short of buffers for a
   // moment: wait for them rather than lose a fragment.
   for (int tries = 0; tries < 100; tries++) {
@@ -626,9 +677,10 @@ void medtrumAdvertise(bool on, const uint8_t sn[4]) {
   uint8_t snv[4] = {0, 0, 0, 0};
   if (sn) memcpy(snv, sn, 4);
   // Flags, the name "MT", and the manufacturer data the app reads the base
-  // serial, device type and version from.
-  std::string p = {0x02, 0x01, 0x06, 0x03, 0x09, 'M', 'T'};
-  p += {0x09, (char)0xFF, 0x00, 0x00, (char)snv[0], (char)snv[1], (char)snv[2], (char)snv[3], 0x01, 0x01};
+  // serial, device type and version from; the pure builder the host test pins.
+  uint8_t buf[ADV_MAX];
+  size_t n = adv_medtrum(snv, buf, sizeof buf);
+  std::string p((const char*)buf, n);
   {
     std::lock_guard<std::mutex> l(mu);
     medtrumAdvOn = on;

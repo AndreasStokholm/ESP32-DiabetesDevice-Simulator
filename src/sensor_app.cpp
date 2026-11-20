@@ -157,21 +157,25 @@ static bool loadBlob(cgm_state_t* out, int64_t* savedAt) {
 // save) or with it held (a panel command, which must persist immediately).
 // The generation check stops an older snapshot from overwriting a newer one
 // that a panel command committed while the task was on its way to flash.
-static void saveSnapshot(const cgm_state_t* st, uint32_t gen) {
+// Returns whether this snapshot reached flash.
+static bool saveSnapshot(const cgm_state_t* st, uint32_t gen) {
   xSemaphoreTake(saveMu, portMAX_DELAY);
+  bool ok = true;
   if ((int32_t)(gen - savedGen) > 0) {
     savedGen = gen;  // attempted: never let a stale snapshot win afterwards
-    persist(st);
+    ok = persist(st);
   }
   xSemaphoreGive(saveMu);
+  return ok;
 }
 
 // Commits now, with mu held. Only the panel's commands use this: they run on
-// the HTTP thread, where a short flash write is not holding up the radio.
+// the HTTP thread, where a short flash write is not holding up the radio. A
+// failed write leaves dirty set, so the task retries it with a fresh snapshot
+// and a new generation.
 static void persistNowLocked() {
   uint32_t gen = ++saveGen;
-  saveSnapshot(&c.st, gen);
-  dirty = false;  // this snapshot is the whole current state
+  if (saveSnapshot(&c.st, gen)) dirty = false;  // this snapshot is the whole current state
 }
 
 // Writes the new blob, reads it back, and only then lets the caller remove the
@@ -268,6 +272,18 @@ static bool migrateStateFile(cgm_state_t* out, int64_t* clockHint) {
   }
   if (d["calibration"].is<JsonObject>()) {
     logf("sensor: the old G7 calibration is not in the CGM core; it is dropped");
+  }
+  // The old pairing code and the per-display keys have no home in the core:
+  // say so, rather than dropping them silently.
+  std::string oldCode = d["code"] | "";
+  if (!oldCode.empty()) {
+    logf("sensor: the old pairing code %s is not part of the CGM core (it auto-authenticates); not carried over",
+         oldCode.c_str());
+  }
+  JsonObject oldSlots = d["slots"].as<JsonObject>();
+  if (!oldSlots.isNull() && oldSlots.size() > 0) {
+    logf("sensor: the old %u display slots are not in the CGM core (it bonds every phone); not carried over",
+         (unsigned)oldSlots.size());
   }
 
   JsonArray arr = d["readings"].as<JsonArray>();
@@ -393,6 +409,9 @@ static void sensorTask(void*) {
     // cgm_tick may make a reading and call io.save, and a BLE callback may
     // have marked dirty since the last pass. Take one consistent snapshot and
     // commit it outside mu, so a flash write never blocks a radio callback.
+    // Each attempt takes a new generation: a failed write leaves dirty set and
+    // the next pass retries with a newer snapshot (which will not be skipped by
+    // the generation check).
     cgm_state_t snapshot;
     uint32_t gen = 0;
     bool flush = false;
@@ -400,12 +419,15 @@ static void sensorTask(void*) {
       cgm_tick(&c);
       if (dirty) {
         snapshot = c.st;
-        gen = saveGen;
-        dirty = false;
+        gen = ++saveGen;
         flush = true;
       }
     });
-    if (flush) saveSnapshot(&snapshot, gen);
+    if (flush && saveSnapshot(&snapshot, gen)) {
+      LOCKED({
+        if (saveGen == gen) dirty = false;  // nothing newer arrived meanwhile
+      });
+    }
     vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }

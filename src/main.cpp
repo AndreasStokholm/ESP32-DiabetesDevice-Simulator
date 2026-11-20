@@ -125,9 +125,12 @@ static void buildStatus(JsonDocument& d) {
     JsonObject o = d["latest"].to<JsonObject>();
     o["index"] = (int)(last["seq"] | 0) - 1;
     o["time"] = (uint32_t)((last["t"] | 0LL) - activated);
-    if ((last["glucose"] | 0) > 0) o["glucose"] = last["glucose"];
+    if ((last["glucose"] | 0) > 0) {
+      o["glucose"] = last["glucose"];
+      // As g7sim: a reading only carries a trend when it has a glucose value.
+      o["trend"] = (core["trend"] | 0) / 10.0;  // tenths of mg/dL per minute
+    }
     o["state"] = last["state"] | 0;
-    o["trend"] = (core["trend"] | 0) / 10.0;  // tenths of mg/dL per minute, as g7sim's
   }
   JsonObject c = d["cgm"].to<JsonObject>();  // additive: the core's own fields
   c["kind"] = kind;

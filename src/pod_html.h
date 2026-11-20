@@ -154,13 +154,14 @@ static const char podHTML[] PROGMEM = R"PODHTML(<!doctype html>
       <div><label for="failRefuse">Refuse connects</label><input type="number" id="failRefuse" min="0" max="1000" step="1" value="0"></div>
       <div><label for="failQuiet">Go quiet (s)</label><input type="number" id="failQuiet" min="0" max="86400" step="1" value="0"></div>
       <div><label for="failDelay">Delay each notification (ms)</label><input type="number" id="failDelay" min="0" max="60000" step="10" value="0"></div>
+      <div><label for="failIgnore">Ignore N messages</label><input type="number" id="failIgnore" min="0" max="1000" step="1" value="0"></div>
     </div>
     <div class="actions">
       <button class="danger" id="failDrop" type="button">Drop next connect</button>
       <button class="primary" id="failApply" type="button">Apply</button>
       <button id="failClear" type="button">Clear</button>
     </div>
-    <div class="muted" id="failMsg" style="margin-top:8px">One BLE link is shared by all three simulators, so drop and refuse act on the next connection whichever device asked; quiet removes only this device from advertising; delay holds each outgoing notification.</div>
+    <div class="muted" id="failMsg" style="margin-top:8px">One BLE link is shared by all three simulators, so drop and refuse act on the next connection whichever device asked; quiet removes only this device from advertising; delay holds each outgoing notification; ignore drops that many messages from the phone, then resumes.</div>
   </section>
 
   <section class="card" aria-labelledby="h-comms">
@@ -394,7 +395,8 @@ $('failDrop').onclick = ()=>fail({device:'pod', drop:true}, 'Next connection wil
 $('failApply').onclick = ()=>fail({device:'pod',
   refuse:+$('failRefuse').value,
   quietMs:+$('failQuiet').value*1000,
-  delayMs:+$('failDelay').value}, 'Failure set');
+  delayMs:+$('failDelay').value,
+  ignore:+$('failIgnore').value}, 'Failure set');
 $('failClear').onclick = ()=>fail({device:'pod', drop:false, refuse:0, quietMs:0, delayMs:0, ignore:0}, 'Failures cleared');
 </script>
 </body>

@@ -190,11 +190,10 @@ use `/settings` or `wifi <name> <password>`.
 
 All pages share one nav: **Home, CGM (at `/g7`), Pod, Medtrum, Settings**.
 
-- `/` is the home page: one card per simulator with a live line (CGM name, code, glucose
-  and state; pod type, pairing, reservoir, active minutes and alerts; Medtrum serial,
-  model, state, reservoir and connection), plus a no-clock banner that links to `/setup`.
-  Its CGM card is still titled "Dexcom G7" even when the board is a G6; the panel at
-  `/g7` shows the real kind.
+- `/` is the home page: one card per simulator with a live line (the CGM's kind, name,
+  glucose and state from `/g7/status`; pod type, pairing, reservoir, active minutes and
+  alerts; Medtrum serial, model, state, reservoir and connection), plus a no-clock banner
+  that links to `/setup`.
 - `/g7` is the CGM panel: the kind (Dexcom G6 / Dexcom G7 / off), a G6 transmitter id, the
   next reading and its trend, a calibration, the sensor state, signal loss, skip warm-up,
   a new sensor, and the failure-injection card.
@@ -315,7 +314,9 @@ What g7sim had and this core does not: the 4-digit pairing code and the J-PAKE h
 [Differences](#differences-from-the-originals)), the ONE+/Stelo advertised names, and the
 sine/random-walk waveforms. `GET /status` keeps g7sim's field names, but `code` is empty,
 `slots` is `{}` and `glucoseMode.kind` is always `"fixed"`, because those are what the core
-has. Not carried over either: `POST /force-quit` and the `-transport`, `-socket`,
+has; g7sim's `window`, `activation` and `lockedForSeconds` are not reported either (the
+core has no per-reading window view, no wall-clock activation and no rejection lockout).
+Not carried over either: `POST /force-quit` and the `-transport`, `-socket`,
 `-simulator`, `-relaunch`, `-suspend` and `-dylib` flags, which only apply to g7sim's iOS
 Simulator transport, and `-max-connections`, since the board serves one phone at a time.
 `/status` reports times as seconds of sensor age (`ageSeconds`) where g7sim gives clock
@@ -396,6 +397,23 @@ venv/bin/pip install bleak cryptography
 `g7client.py` also took the sensor's phone slot, so the app had to pair again afterwards.
 Both need the board free: one phone or computer can be connected at a time.
 
+## Tests
+
+The host suites need only `cc` and `make` (no PlatformIO, no board):
+
+| Command | What it covers |
+|---|---|
+| `make -C test/cgm` | The CGM core, with ESP-Sim's own checks (the sources are byte-identical) |
+| `make -C test/medtrum` | The patch core, the 3-way advertising rotation and the bytes of all three advertisements |
+| `make -C test/fail` | The failure-injection decisions (drop, refuse, quiet, delay, ignore) for each device |
+| `make -C test/portal` | The captive-portal probe and redirect decision |
+
+The items that need a board: the NimBLE wiring (`src/radio.cpp`), the CGM's NVS
+blob and its g7sim-state migration (`src/sensor_app.cpp`), and the panels. They
+depend on the Arduino platform (NimBLE, Preferences/NVS, LittleFS, ArduinoJson),
+so they are exercised on a board; a host test for them would first need the
+platform split behind a fake-able interface.
+
 ## Failure injection
 
 The **Failure injection** card on `/g7`, `/pod` and `/medtrum`, the console's `fail`
@@ -410,9 +428,8 @@ are enforced by the radio; the values live in RAM and reset on reboot.
 | `delay` | Wait before each outgoing notification from that device | yes | yes | yes |
 | `ignore` | Drop the next N messages the phone sends to that device | yes | yes | yes |
 
-The knobs reach the radio through `/fail` (also on the card on `/g7` and `/medtrum`; the
-`/pod` card has drop, refuse, quiet, delay and Clear, and `ignore` for the pod is
-console/`/fail` only). Post JSON to `/fail`:
+The knobs reach the radio through `/fail`, and the three device cards all have them: drop,
+refuse, quiet, delay, ignore, Apply and Clear. Post JSON to `/fail`:
 
 ```bash
 curl -XPOST esp-sim.local/fail -H 'Content-Type: application/json' \
@@ -532,6 +549,10 @@ Devices we want to add:
   - A board updated from the g7sim-era firmware migrates its saved sensor on first boot
     (the id suffix, age, glucose and up to 3 hours of readings); the pairing code, slots,
     calibration and waveform are dropped, each with a line on the console.
+- **The retired g7sim port** (`src/sensor.cpp`, `handler.cpp`, `crypto.cpp` and their
+  headers) is kept in the tree for reference but left out of the build by
+  `platformio.ini`'s `build_src_filter`, so it costs no flash and cannot be compiled back
+  in by accident.
 - **Pages and the captive portal** are new here: `/` is a home page, `/g7` the CGM panel,
   `/pod` and `/medtrum` the device panels, and `/settings` the board (network, clock,
   firmware, reboot). The board's own access point answers as a captive portal and serves
@@ -549,7 +570,7 @@ Devices we want to add:
 | `src/sensor_app.cpp` | The CGM's clock, storage and task |
 | `src/medtrum_app.cpp` | The Medtrum pump base's clock, storage and task |
 | `src/radio.cpp` | One Bluetooth device for the pod, the CGM and the patch |
-| `src/sensor.cpp`, `handler.cpp`, `crypto.cpp`, `link.h` | The retired g7sim port (kept in the tree, unused) |
+| `src/sensor.cpp`, `handler.cpp`, `crypto.cpp`, `link.h` | The retired g7sim port (kept for reference, left out of the build) |
 | `src/main.cpp` | Boot, Wi‑Fi, captive-portal routes, web pages, failure API, console |
 | `src/portal.h`, `src/portal.cpp` | The pure captive-probe and AP-mode redirect decision |
 | `src/fail.h`, `src/fail.cpp` | The pure failure-injection state machine |
@@ -559,6 +580,7 @@ Devices we want to add:
 | `src/settings_html.h` | The Settings page (Network + Board) |
 | `src/setup_html.h` | The captive-portal Wi‑Fi sheet |
 | `src/adv_rotation.h` | The pure advertising-rotation choice, shared with `test/medtrum/test_adv.c` |
+| `src/adv_payload.h` | The pure builders for the three advertising payloads and the name field, pinned by the same test |
 | `test/cgm/` | Host tests for the CGM core |
 | `test/medtrum/` | Host tests for the Medtrum patch core and the advertising rotation |
 | `test/portal/` | Host tests for the captive-portal decision |
