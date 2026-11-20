@@ -253,6 +253,7 @@ static void sendSettingsStatus() {
   d["clock"] = wallMs() ? "set from NTP" : "not set (NTP never ran)";
   d["firmware"]["commit"] = ESP_SIM_COMMIT;
   d["firmware"]["built"] = __DATE__ " " __TIME__;
+  d["pump"] = radio::pump() == radio::PUMP_POD ? "pod" : radio::pump() == radio::PUMP_MEDTRUM ? "medtrum" : "both";
   sendJson(200, d);
 }
 
@@ -322,6 +323,31 @@ static void startWeb() {
   web.on("/settings/reboot", HTTP_POST, [] {
     web.send(200, "text/plain", "rebooting\n");
     restartAt = monoMs() + 1000;
+  });
+  // Which pump simulator advertises. A phone runs one pump app, and a Medtrum app
+  // keys a discovered device by address, so it never surfaces while the pod keeps
+  // rewriting the same advertisement with another name.
+  web.on("/settings/pump", HTTP_POST, [] {
+    JsonDocument j;
+    if (deserializeJson(j, web.arg("plain")) || !j["pump"].is<const char*>()) {
+      web.send(400, "text/plain", "want {\"pump\":\"both|pod|medtrum\"}\n");
+      return;
+    }
+    const char* v = j["pump"].as<const char*>();
+    int p = strcmp(v, "pod") == 0 ? radio::PUMP_POD : strcmp(v, "medtrum") == 0 ? radio::PUMP_MEDTRUM : strcmp(v, "both") == 0 ? radio::PUMP_BOTH : -1;
+    if (p < 0) {
+      web.send(400, "text/plain", "pump is both, pod or medtrum\n");
+      return;
+    }
+    radio::setPump(p);
+    Preferences pr;
+    pr.begin("board", false);
+    pr.putString("pump", v);
+    pr.end();
+    logf("pump simulators: %s", v);
+    web.send(200, "text/plain", p == radio::PUMP_BOTH ? "both pumps take turns\n"
+                                                      : p == radio::PUMP_POD ? "only the pod advertises\n"
+                                                                             : "only the Medtrum base advertises\n");
   });
   web.on("/fail", HTTP_POST, [] {
     JsonDocument j;
@@ -957,6 +983,16 @@ void setup() {
   startWifi();
   startWeb();
   radio::begin();
+  {
+    Preferences pr;
+    pr.begin("board", true);
+    String p = pr.isKey("pump") ? pr.getString("pump") : "";
+    pr.end();
+    if (p == "pod") radio::setPump(radio::PUMP_POD);
+    else if (p == "medtrum") radio::setPump(radio::PUMP_MEDTRUM);
+    else radio::setPump(radio::PUMP_BOTH);
+    logf("pump simulators: %s", p.isEmpty() ? "both take turns" : p.c_str());
+  }
   sensor::start();
   pod::start();
   medtrum::start();

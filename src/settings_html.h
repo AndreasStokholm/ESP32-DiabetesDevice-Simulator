@@ -62,6 +62,16 @@ static const char settingsHTML[] PROGMEM = R"HTML(<!doctype html>
     <div class="muted">Without a saved network the board runs its own access point and shows the Wi-Fi sheet first, as a captive-portal page you can dismiss.</div>
   </div>
   <div class="card">
+    <h2>Simulated pumps</h2>
+    <div class="kv"><span>Now</span><span id="pumpNow">—</span></div>
+    <div class="actions">
+      <button type="button" id="pumpBoth">Both, taking turns</button>
+      <button type="button" id="pumpPod">Pod only</button>
+      <button type="button" id="pumpMed">Medtrum only</button>
+    </div>
+    <div class="muted" id="pumpNote">A phone runs one pump app. With both selected the pod's and the Medtrum base's advertisements share the one set, so a Medtrum app that keys a discovered device by address may never list the base — choose Medtrum only for that test, and the base advertises continuously.</div>
+  </div>
+  <div class="card">
     <h2>Board</h2>
     <div class="kv"><span>Firmware</span><span><code id="commit">—</code></span></div>
     <div class="kv"><span>Hardware</span><span>ESP32-S3 &middot; 8 MB</span></div>
@@ -95,6 +105,9 @@ static const char settingsHTML[] PROGMEM = R"HTML(<!doctype html>
   };
   $('forget').onclick = () => call('/settings/forget');
   $('reboot').onclick = () => call('/settings/reboot');
+  $('pumpBoth').onclick = () => call('/settings/pump', { pump:'both' }).then(refresh);
+  $('pumpPod').onclick = () => call('/settings/pump', { pump:'pod' }).then(refresh);
+  $('pumpMed').onclick = () => call('/settings/pump', { pump:'medtrum' }).then(refresh);
 
   async function refresh() {
     try {
@@ -107,6 +120,7 @@ static const char settingsHTML[] PROGMEM = R"HTML(<!doctype html>
       $('commit').textContent = s.firmware ? s.firmware.commit : '—';
       if (s.firmware && s.firmware.built) $('commit').title = 'built ' + s.firmware.built;
       if (!edited && ssid && document.activeElement !== $('ssid')) $('ssid').value = ssid;
+      $('pumpNow').textContent = s.pump === 'pod' ? 'pod only' : s.pump === 'medtrum' ? 'Medtrum only' : 'both, taking turns';
     } catch (err) {
       say('Could not reach the board.');
     }

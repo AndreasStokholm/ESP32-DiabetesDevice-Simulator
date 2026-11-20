@@ -110,6 +110,11 @@ static uint16_t medtrumReadHandle, medtrumWriteHandle;
 static volatile bool medtrumStatusNotify = false;
 static std::string medtrumAdvData;  // guarded by mu
 static bool medtrumAdvOn = false;
+// Which pump simulator is allowed to advertise (see radio.h), and a flag that
+// forces the next tick to restart the set even if its payload is unchanged --
+// switching the selection must show up immediately, not on the next rotation.
+static int pumpSel = PUMP_BOTH;
+static bool advForce = false;
 
 static std::string addrString(const ble_addr_t& a) {
   char b[18];
@@ -472,12 +477,29 @@ void tick() {
   // more than one wants to be found they take turns. An injected quiet window
   // only clears that device's want flag; its payload string is untouched.
   bool connected = conn != BLE_HS_CONN_HANDLE_NONE;
+  // The pump simulators are mutually exclusive when asked to be: a phone runs an
+  // Omnipod app or a Medtrum app, not both, and a scanner that keys a device by
+  // address never sees the second name while the first keeps rewriting it.
+  bool podWant = !podData.empty() && (!connected || !paired);
+  bool medWant = medOn && !medData.empty() && !connected;
+  int sel = pump();
+  if (sel == PUMP_POD) medWant = false;
+  if (sel == PUMP_MEDTRUM) podWant = false;
   adv_wants_t wants = {
       .g7 = adv_cgm_wants((int)sensor::kind(), cgmOn && !connected) && fail_decide(FAIL_CGM, FAIL_ADVERTISE, now),
-      .pod = !podData.empty() && (!connected || !paired) && fail_decide(FAIL_POD, FAIL_ADVERTISE, now),
-      .med = medOn && !medData.empty() && !connected && fail_decide(FAIL_MEDTRUM, FAIL_ADVERTISE, now),
+      .pod = podWant && fail_decide(FAIL_POD, FAIL_ADVERTISE, now),
+      .med = medWant && fail_decide(FAIL_MEDTRUM, FAIL_ADVERTISE, now),
   };
   int choice = adv_rotation_slot(&wants, now);
+  // Log the WANT set, not the slot: the slot changes every 1.5 s, the wants change
+  // only when a device appears or stops. Answers "did Medtrum ever want the set?"
+  // in one line, without spamming the console.
+  static int lastWants = -1;
+  int w = (wants.g7 ? 1 : 0) | (wants.pod ? 2 : 0) | (wants.med ? 4 : 0);
+  if (w != lastWants) {
+    lastWants = w;
+    logf("advertising wants: cgm=%d pod=%d medtrum=%d", wants.g7, wants.pod, wants.med);
+  }
 
   static std::string current;
   bool active = ble_gap_ext_adv_active(inst);
@@ -701,6 +723,18 @@ void medtrumNotifyStatus(const uint8_t* p, size_t n) {
 void medtrumDisconnect() {
   uint16_t c = conn;
   if (c != BLE_HS_CONN_HANDLE_NONE) ble_gap_terminate(c, BLE_ERR_REM_USER_CONN_TERM);
+}
+
+void setPump(int p) {
+  if (p != PUMP_POD && p != PUMP_MEDTRUM && p != PUMP_BOTH) return;
+  std::lock_guard<std::mutex> l(mu);
+  pumpSel = p;
+  advForce = true;
+}
+
+int pump() {
+  std::lock_guard<std::mutex> l(mu);
+  return pumpSel;
 }
 
 void medtrumAdvertise(bool on, const uint8_t sn[4]) {
