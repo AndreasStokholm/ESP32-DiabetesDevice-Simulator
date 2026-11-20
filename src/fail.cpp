@@ -134,6 +134,9 @@ const char* fail_apply(FailDevice device, const FailRequest* request, int64_t no
 
 int fail_device_from_name(const char* name) {
   if (!name) return -1;
+  // The CGM's slot is "g7" in the /fail API and on the panels; "cgm" is the
+  // same slot, named for what it now carries (a G6 transmitter or a G7).
+  if (strcmp(name, "cgm") == 0) return FAIL_CGM;
   for (int i = 0; i < FAIL_DEVICE_COUNT; i++)
     if (strcmp(name, names[i]) == 0) return i;
   return -1;

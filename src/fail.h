@@ -1,8 +1,18 @@
 #pragma once
-// One failure-injection state per device (pod, G7, Medtrum), and the pure
+// One failure-injection state per device (pod, CGM, Medtrum), and the pure
 // decisions the radio asks of it. No Arduino, no NimBLE, no logging: the host
 // test in test/fail/ builds this with plain cc. src/radio.cpp applies the
 // decisions; src/main.cpp parses the request into FailRequest and fail_apply().
+//
+// The five knobs are all enforced in src/radio.cpp, for all three devices:
+//
+//   drop     one connection is accepted, then dropped at once
+//   refuse   the next N connections are accepted, then dropped
+//   quiet    the device is left out of the advertising rotation for that time
+//   delay    every outgoing notification waits that long (the CGM's too: its
+//            notifications have a task of their own, so the wait never holds
+//            the CGM core's mutex)
+//   ignore   the next N messages from the phone are dropped, then it resumes
 //
 // One BLE link is shared by all three simulators, so a refused connection is
 // refused for the link: the server accepts it, then disconnects immediately.
@@ -18,8 +28,9 @@ extern "C" {
 
 typedef enum FailDevice {
   FAIL_POD = 0,
-  FAIL_G7 = 1,
+  FAIL_G7 = 1,        // kept for the panels' and the /fail API's "g7"
   FAIL_MEDTRUM = 2,
+  FAIL_CGM = FAIL_G7, // the same slot: a G6 transmitter or a G7 sensor
 } FailDevice;
 
 // The questions radio.cpp asks. ACCEPT and CONSUME_MESSAGE consume one pending
@@ -66,8 +77,8 @@ void fail_set_ignore(FailDevice device, unsigned messages);
 // Out-of-range values leave the state untouched.
 const char* fail_apply(FailDevice device, const FailRequest* request, int64_t nowMs);
 
-// "pod", "g7", "medtrum" -> 0..2; anything else (including "all", which the
-// request parser expands itself) -> -1.
+// "pod", "g7" (or "cgm") and "medtrum" -> 0..2; anything else (including
+// "all", which the request parser expands itself) -> -1.
 int fail_device_from_name(const char* name);
 const char* fail_device_name(FailDevice device);
 

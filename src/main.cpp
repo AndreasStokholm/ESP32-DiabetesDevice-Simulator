@@ -330,7 +330,7 @@ static void startWeb() {
     int dev = fail_device_from_name(name);
     bool all = strcmp(name, "all") == 0;
     if (dev < 0 && !all) {
-      web.send(400, "text/plain", "device is pod, g7, medtrum or all");
+      web.send(400, "text/plain", "device is pod, g7 (cgm), medtrum or all");
       return;
     }
     FailRequest r = {FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT, FAIL_ABSENT};
@@ -663,11 +663,11 @@ static void help() {
       "  pod failNextConnects <count> [sec]  loopkit/pod's command; needs its ImpossiBLE transport\n"
       "  pod selftest                        check the pod's crypto on this board\n"
       "Failure injection (one radio, one decision set per device):\n"
-      "  fail <pod|g7|medtrum|all> drop     drop the next connection once\n"
+      "  fail <pod|g7 (cgm)|medtrum|all> drop  drop the next connection once\n"
       "  fail <device> refuse <n>           drop the next n connections\n"
       "  fail <device> quiet <ms>           stop advertising that device for ms\n"
       "  fail <device> delay <ms>           delay each notification from that device\n"
-      "  fail <device> ignore <n>           drop the next n messages to that device\n"
+      "  fail <device> ignore <n>           drop the next n messages from the phone\n"
       "  fail <device> clear                clear every knob for that device\n"
       "Board:\n"
       "  wifi <ssid> [password] | wifi off   join Wi-Fi for the web panels + NTP (restarts)\n"
@@ -808,7 +808,7 @@ static void command(const std::string& line) {
     bool all = a[1] == "all";
     int dev = fail_device_from_name(a[1].c_str());
     if (dev < 0 && !all) {
-      Serial.println("fail: device is pod, g7, medtrum or all");
+      Serial.println("fail: device is pod, g7 (cgm), medtrum or all");
       return;
     }
     const std::string& what = a[2];

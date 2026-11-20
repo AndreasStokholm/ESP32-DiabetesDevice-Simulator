@@ -148,18 +148,35 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
   </div>
 
   <div class="card">
+    <h2>Signal loss and warm-up</h2>
+    <div class="row">
+      <div>
+        <label for="signalLoss">Signal loss</label>
+        <div style="display:flex; align-items:center; gap:8px">
+          <input type="checkbox" id="signalLoss" style="width:auto">
+          <span class="muted">stop advertising; the phone misses the readings</span>
+        </div>
+      </div>
+      <div style="flex:0 0 auto; display:flex; align-items:flex-end"><button id="skipWarmup">Skip warm-up</button></div>
+    </div>
+    <div class="muted" id="faultMsg" style="margin-top:8px"></div>
+    <div class="muted" style="margin-top:6px">Signal loss stops the advertising, so the phone misses the readings; the core still makes them, and the app is sent the missed ones (backfill) when the loss ends. Skipping the warm-up keeps the sensor and its pairing: it moves the start back so the warm-up is over now.</div>
+  </div>
+
+  <div class="card">
     <h2>Failure injection</h2>
     <div class="row">
       <div><label for="failRefuse">Refuse connects</label><input type="number" id="failRefuse" min="0" max="1000" step="1" value="0"></div>
       <div><label for="failQuiet">Go quiet (s)</label><input type="number" id="failQuiet" min="0" max="86400" step="1" value="0"></div>
       <div><label for="failDelay">Delay each notification (ms)</label><input type="number" id="failDelay" min="0" max="60000" step="10" value="0"></div>
+      <div><label for="failIgnore">Ignore N messages</label><input type="number" id="failIgnore" min="0" max="1000" step="1" value="0"></div>
     </div>
     <div style="margin-top:14px; display:flex; flex-wrap:wrap; gap:8px 12px">
       <button class="danger" id="failDrop" type="button">Drop next connect</button>
       <button class="primary" id="failApply" type="button">Apply</button>
       <button id="failClear" type="button">Clear</button>
     </div>
-    <div class="muted" id="failMsg" style="margin-top:8px">One BLE link is shared by all three simulators, so drop and refuse act on the next connection whichever device asked; quiet removes only this device from advertising for the chosen time. The CGM's notifications are sent from the core's own task under its lock, so a delay is recorded but not applied to them.</div>
+    <div class="muted" id="failMsg" style="margin-top:8px">One BLE link is shared by all three simulators, so drop and refuse act on the next connection whichever device asked; quiet removes only this device from advertising for the chosen time; delay holds each of this device's notifications; ignore drops that many messages from the phone, then resumes.</div>
   </div>
 </main>
 <footer>For development use only — not a Dexcom product. This sensor emits simulated, made-up data; never use it for therapy.</footer>
@@ -199,6 +216,9 @@ document.getElementById('calApply').onclick = ()=>cmd({command:'cgmSetCalibratio
   glucose:+document.getElementById('calIn').value}, 'glucoseMsg', 'Calibrated ✓');
 document.getElementById('algostate').onchange = ()=>cmd({command:'cgmSetState',
   state:+document.getElementById('algostate').value}, 'stateMsg', 'State set');
+document.getElementById('signalLoss').onchange = e=>cmd({command:'cgmSetSignalLoss',
+  on:e.target.checked}, 'faultMsg', e.target.checked ? 'Signal loss on' : 'Signal loss off');
+document.getElementById('skipWarmup').onclick = ()=>cmd({command:'cgmSkipWarmup'}, 'faultMsg', 'Warm-up skipped');
 document.getElementById('glucoseIn').oninput = e=>{ document.getElementById('glucoseRange').value = e.target.value; };
 document.getElementById('glucoseRange').oninput = e=>{ document.getElementById('glucoseIn').value = e.target.value; };
 
@@ -231,6 +251,9 @@ async function refresh(){
   document.getElementById('g6id').disabled = st.kind!==6;
   document.getElementById('applyId').disabled = st.kind!==6;
   document.getElementById('newSensor').disabled = !st.kind;
+  document.getElementById('signalLoss').checked = !!st.signalLoss;
+  document.getElementById('signalLoss').disabled = !st.kind;
+  document.getElementById('skipWarmup').disabled = !st.kind || (st.warmupLeftSeconds||0) <= 0;
   sync('glucoseIn', st.glucose||120);
   sync('glucoseRange', st.glucose||120);
   sync('trendIn', ((st.trend||0)/10).toFixed(1));
@@ -252,7 +275,8 @@ document.getElementById('failDrop').onclick = ()=>fail({device:'g7', drop:true},
 document.getElementById('failApply').onclick = ()=>fail({device:'g7',
   refuse:+document.getElementById('failRefuse').value,
   quietMs:+document.getElementById('failQuiet').value*1000,
-  delayMs:+document.getElementById('failDelay').value}, 'Failure set');
+  delayMs:+document.getElementById('failDelay').value,
+  ignore:+document.getElementById('failIgnore').value}, 'Failure set');
 document.getElementById('failClear').onclick = ()=>fail({device:'g7', drop:false, refuse:0, quietMs:0, delayMs:0, ignore:0}, 'Failures cleared');
 refresh(); setInterval(refresh, 2000);
 </script>

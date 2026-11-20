@@ -100,19 +100,54 @@ static void test_delay(void)
 static void test_ignore(void)
 {
     reset();
-    fail_set_ignore(FAIL_POD, 2);
-    CHECK(consume(FAIL_POD) == 1);
-    CHECK(consume(FAIL_POD) == 1);
-    CHECK(fail_get(FAIL_POD).ignoreMessages == 0);
-    CHECK(consume(FAIL_POD) == 0);
-    CHECK(consume(FAIL_POD) == 0);
+    /* Each device counts its own messages: three dropped, then it resumes, and
+     * the other two are not touched by it. */
+    for (int i = 0; i < FAIL_DEVICE_COUNT; i++) {
+        FailDevice d = (FailDevice)i;
+        FailDevice other = (FailDevice)((i + 1) % FAIL_DEVICE_COUNT);
+        fail_clear_all();
+        fail_set_ignore(d, 3);
+        for (int k = 0; k < 3; k++) {
+            CHECK(consume(d) == 1);
+            CHECK(consume(other) == 0);
+        }
+        CHECK(fail_get(d).ignoreMessages == 0);
+        CHECK(consume(d) == 0);
+        CHECK(consume(d) == 0);
+    }
 
-    fail_set_ignore(FAIL_G7, 1);
-    fail_set_ignore(FAIL_MEDTRUM, 1);
-    CHECK(consume(FAIL_G7) == 1);
-    CHECK(consume(FAIL_G7) == 0);
+    /* The count is messages, not connections: asking for a connection or an
+     * advertising decision leaves it alone. */
+    reset();
+    fail_set_ignore(FAIL_MEDTRUM, 2);
+    CHECK(accept(FAIL_MEDTRUM, 0) == 1);
+    CHECK(advertise(FAIL_MEDTRUM, 0) == 1);
+    CHECK(delay_ms(FAIL_MEDTRUM) == 0);
+    CHECK(fail_get(FAIL_MEDTRUM).ignoreMessages == 2);
+    CHECK(consume(FAIL_MEDTRUM) == 1);
     CHECK(consume(FAIL_MEDTRUM) == 1);
     CHECK(consume(FAIL_MEDTRUM) == 0);
+
+    /* A request arms each device, and each drops exactly its own count. */
+    reset();
+    for (int i = 0; i < FAIL_DEVICE_COUNT; i++) {
+        FailRequest r = absent();
+        r.ignore = 1;
+        CHECK(fail_apply((FailDevice)i, &r, 0) == 0);
+        CHECK(fail_get((FailDevice)i).ignoreMessages == 1);
+        CHECK(consume((FailDevice)i) == 1);
+        CHECK(consume((FailDevice)i) == 0);
+    }
+
+    /* Clearing one device leaves the others' counts in place. */
+    reset();
+    fail_set_ignore(FAIL_POD, 1);
+    fail_set_ignore(FAIL_G7, 1);
+    fail_set_ignore(FAIL_MEDTRUM, 1);
+    fail_clear(FAIL_G7);
+    CHECK(consume(FAIL_POD) == 1);
+    CHECK(consume(FAIL_G7) == 0);
+    CHECK(consume(FAIL_MEDTRUM) == 1);
 }
 
 static void test_apply(void)
@@ -210,11 +245,12 @@ static void test_clear(void)
     for (int i = 0; i < FAIL_DEVICE_COUNT; i++) {
         fail_set_drop((FailDevice)i, 1);
         fail_set_delay((FailDevice)i, 10);
+        fail_set_ignore((FailDevice)i, 5);
     }
     fail_clear_all();
     for (int i = 0; i < FAIL_DEVICE_COUNT; i++) {
         FailState c = fail_get((FailDevice)i);
-        CHECK(c.dropPending == 0 && c.delayMs == 0);
+        CHECK(c.dropPending == 0 && c.delayMs == 0 && c.ignoreMessages == 0);
     }
 }
 
@@ -222,6 +258,10 @@ static void test_names(void)
 {
     CHECK(fail_device_from_name("pod") == FAIL_POD);
     CHECK(fail_device_from_name("g7") == FAIL_G7);
+    /* The CGM slot carries a G6 transmitter or a G7 sensor; "cgm" is the
+     * same device under the name it now deserves. */
+    CHECK(FAIL_CGM == FAIL_G7);
+    CHECK(fail_device_from_name("cgm") == FAIL_CGM);
     CHECK(fail_device_from_name("medtrum") == FAIL_MEDTRUM);
     CHECK(fail_device_from_name("all") == -1);
     CHECK(fail_device_from_name("POD") == -1);

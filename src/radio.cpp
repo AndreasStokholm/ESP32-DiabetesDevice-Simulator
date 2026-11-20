@@ -65,6 +65,19 @@ static bool cgmAdvOn = false;
 static volatile bool cgmDrop = false;
 static int64_t cgmDropAt = 0;
 
+// The CGM's notifications go through a queue and a task of their own: the core
+// calls radio::cgmNotify from inside its mutex, so the injected delay is
+// waited out here, never while the core's mutex is held. The order is kept,
+// and the link and the subscription are re-checked after the wait.
+struct CgmOut {
+  uint16_t conn;  // the link it was queued for
+  uint8_t chr;
+  uint8_t len;
+  uint8_t data[32];
+};
+static QueueHandle_t cgmOut;
+static void cgmSendTask(void*);
+
 // The G7's advertising interval, 160 ms in the extended advertiser's 0.625 ms
 // units (the old sensor glue's timing.advertisingInterval).
 static const uint32_t cgmAdvInterval = 160 * 1000 / 625;
@@ -158,7 +171,7 @@ class CgmCallbacks : public NimBLECharacteristicCallbacks {
 
   void onWrite(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
     if (desc->conn_handle != conn) return;
-    if (fail_decide(FAIL_G7, FAIL_CONSUME_MESSAGE, 0)) {
+    if (fail_decide(FAIL_CGM, FAIL_CONSUME_MESSAGE, 0)) {
       logf("cgm: injected failure: message ignored");
       return;
     }
@@ -238,6 +251,13 @@ static const uint32_t podRw = NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
 void begin() {
   podEvents = xQueueCreate(64, sizeof(dash_ev_t));
   medtrumEvents = xQueueCreate(16, sizeof(medtrum_ev_t));
+  // Deep enough for a backfill burst (a dozen frames plus the records).
+  cgmOut = xQueueCreate(64, sizeof(CgmOut));
+  if (!cgmOut) {
+    logf("cgm: notification queue unavailable; notifications will be dropped");
+  } else if (xTaskCreate(cgmSendTask, "cgmsend", 6144, nullptr, 5, nullptr) != pdPASS) {
+    logf("cannot start the CGM notification task");
+  }
 
   // The GAP device name is the CGM's: the app's CGM code knows its device by
   // name (Dexcom+id for a G6, DXCM+id for a G7). The pod's code only looks for
@@ -387,7 +407,7 @@ void tick() {
   // only clears that device's want flag; its payload string is untouched.
   bool connected = conn != BLE_HS_CONN_HANDLE_NONE;
   adv_wants_t wants = {
-      .g7 = adv_cgm_wants((int)sensor::kind(), cgmOn && !connected) && fail_decide(FAIL_G7, FAIL_ADVERTISE, now),
+      .g7 = adv_cgm_wants((int)sensor::kind(), cgmOn && !connected) && fail_decide(FAIL_CGM, FAIL_ADVERTISE, now),
       .pod = !podData.empty() && (!connected || !paired) && fail_decide(FAIL_POD, FAIL_ADVERTISE, now),
       .med = medOn && !medData.empty() && !connected && fail_decide(FAIL_MEDTRUM, FAIL_ADVERTISE, now),
   };
@@ -434,28 +454,47 @@ int openLinks() { return conn != BLE_HS_CONN_HANDLE_NONE ? 1 : 0; }
 
 // MARK: - The CGM's radio
 
-// Called by the core from inside its own mutex. One attempt, as the reference's
-// ble_cgm_send: an ENOMEM retry loop here would spin while the core's mutex is
-// held and stall every other CGM event.
+// Sends the queued notifications, one at a time, after the injected delay.
+static void cgmSendTask(void*) {
+  CgmOut m = {};
+  for (;;) {
+    if (xQueueReceive(cgmOut, &m, portMAX_DELAY) != pdTRUE) continue;
+    unsigned delay = (unsigned)fail_decide(FAIL_CGM, FAIL_NOTIFY_DELAY_MS, 0);
+    if (delay) vTaskDelay(pdMS_TO_TICKS(delay));
+    uint16_t c = conn;
+    if (c == BLE_HS_CONN_HANDLE_NONE || c != m.conn) continue;  // the phone left while we waited
+    uint16_t sub = cgmSubs[m.chr];
+    if (!sub) {
+      logf("cgm: %s -> %s dropped: not subscribed", cgmCharNames[m.chr], hexstr(m.data, m.len).c_str());
+      continue;
+    }
+    os_mbuf* om = ble_hs_mbuf_from_flat(m.data, m.len);
+    if (!om) {
+      logf("cgm: notification dropped: no buffers");
+      continue;
+    }
+    // A phone subscribes to notify, or (the auth characteristic) to indicate.
+    int rc = (sub & 1) ? ble_gattc_notify_custom(c, cgmHandles[m.chr], om)
+                       : ble_gattc_indicate_custom(c, cgmHandles[m.chr], om);
+    if (rc != 0) logf("cgm: notification failed: %d", rc);
+  }
+}
+
+// Called by the core from inside its own mutex: queue the message and return.
+// The task above sends it once, as the reference's ble_cgm_send does (no
+// ENOMEM retry loop), and applies that device's injected delay.
 void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n) {
-  uint16_t c = conn;
-  if (c == BLE_HS_CONN_HANDLE_NONE) return;
-  uint16_t sub = cgmSubs[chr];
-  if (!sub) {
-    logf("cgm: %s -> %s dropped: not subscribed", cgmCharNames[chr], hexstr(p, n).c_str());
+  if (conn == BLE_HS_CONN_HANDLE_NONE || !cgmOut) return;
+  if (n > sizeof(CgmOut::data)) {
+    logf("cgm: a %u-byte notification does not fit the queue; dropped", (unsigned)n);
     return;
   }
-  unsigned delay = (unsigned)fail_decide(FAIL_G7, FAIL_NOTIFY_DELAY_MS, 0);
-  if (delay) logf("cgm: a %ums notification delay is not applied (sent under the core's lock)", delay);
-  os_mbuf* om = ble_hs_mbuf_from_flat(p, (uint16_t)n);
-  if (!om) {
-    logf("cgm: notification dropped: no buffers");
-    return;
-  }
-  // A phone subscribes to notify, or (the auth characteristic) to indicate.
-  int rc = (sub & 1) ? ble_gattc_notify_custom(c, cgmHandles[chr], om)
-                     : ble_gattc_indicate_custom(c, cgmHandles[chr], om);
-  if (rc != 0) logf("cgm: notification failed: %d", rc);
+  CgmOut m = {};
+  m.conn = conn;
+  m.chr = (uint8_t)chr;
+  m.len = (uint8_t)n;
+  if (n) memcpy(m.data, p, n);
+  if (xQueueSend(cgmOut, &m, 0) != pdTRUE) logf("cgm: notification queue full: a message was dropped");
 }
 
 // The core calls this from inside its own mutex, possibly on the NimBLE
