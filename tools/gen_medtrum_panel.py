@@ -1,15 +1,14 @@
 """Builds src/medtrum_html.h from tools/medtrum_panel.html (the Medtrum
 patch's control panel, in the pod panel's style): the patch's panel is served
-under /medtrum here, beside the pod's at /pod and the G7's at /."""
+under /medtrum here, beside the home page's at /, the pod's at /pod and the
+G7's at /g7. The nav is part of the panel source itself, so this only rewrites
+the API paths."""
 import os, sys
 here = os.path.dirname(os.path.abspath(__file__))
 html = open(os.path.join(here, "medtrum_panel.html")).read()
 reps = [
     ("fetch('/command'", "fetch('/medtrum/command'"),
-    ("fetch('/wifi'", "fetch('/medtrum/wifi'"),
     ("fetch('/status')", "fetch('/medtrum/status')"),
-    ("</header>", '  <a href="/" style="margin-left:auto">G7 sensor panel &rarr;</a>\n'
-                  '  <a href="/pod">Pod panel &rarr;</a>\n</header>'),
 ]
 for a, b in reps:
     assert html.count(a) == 1, a

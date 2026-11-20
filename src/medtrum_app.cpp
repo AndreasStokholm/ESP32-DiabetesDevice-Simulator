@@ -131,31 +131,24 @@ static void assignPatchId() {
 
 // MARK: - Requests
 
-static void notifyStatus() {
-  uint8_t payload[MEDTRUM_STATUS_MAX];
-  size_t n = medtrum_patch_notification(&patch, payload, sizeof payload);
-  if (n > 0) radio::medtrumNotifyStatus(payload, n);
-}
-
-static void onWrite(const uint8_t* data, size_t n) {
-  if (!medtrum_request_feed(&req, data, n)) return;
+static bool onWrite(const uint8_t* data, size_t n, medtrum_frag_t* frags, int* count) {
+  if (!medtrum_request_feed(&req, data, n)) return false;
   // Only a command that changed the model needs a flash commit; a GET_TIME
   // poll, a sync or a subscribe must not wear NVS.
   medtrum_status_t wasStatus = patch.status;
   medtrum_delivery_t wasDelivery = patch.delivery;
-  medtrum_frag_t frags[MEDTRUM_FRAGS_MAX];
-  int count = medtrum_patch_handle(&patch, req.command, req.sequence, req.content, req.content_len, frags,
-                                   MEDTRUM_FRAGS_MAX);
-  if (count < 0) {
+  int got = medtrum_patch_handle(&patch, req.command, req.sequence, req.content, req.content_len, frags,
+                                 MEDTRUM_FRAGS_MAX);
+  if (got < 0) {
     logf("medtrum: unhandled command %u", req.command);
-    return;
+    return false;
   }
-  for (int i = 0; i < count; i++) io.notify(io.ctx, frags[i].data, frags[i].len);
+  *count = got;
   if (memcmp(&wasStatus, &patch.status, sizeof wasStatus) != 0 ||
       memcmp(&wasDelivery, &patch.delivery, sizeof wasDelivery) != 0) {
     saveState();
   }
-  notifyStatus();
+  return true;
 }
 
 // MARK: - The run loop
@@ -167,10 +160,18 @@ static void medtrumTask(void*) {
   while (!stop) {
     medtrum_ev_t ev;
     bool got = io.next_event(io.ctx, &ev, 1000);
+    // Collect replies and the status payload under the lock, then send them
+    // after it has been released: an injected notification delay must not
+    // stall the web server, which takes the same lock.
+    medtrum_frag_t frags[MEDTRUM_FRAGS_MAX];
+    int count = 0;
+    bool sendStatus = false;
+    uint8_t statusPayload[MEDTRUM_STATUS_MAX];
+    size_t statusLen = 0;
     LOCKED({
       medtrum_patch_tick(&patch, nowMs(nullptr));
       if (!got) {
-        notifyStatus();
+        sendStatus = true;
       } else {
         switch (ev.type) {
           case MEDTRUM_EV_CONNECTED:
@@ -182,7 +183,7 @@ static void medtrumTask(void*) {
             saveState();
             break;
           case MEDTRUM_EV_WRITE:
-            onWrite(ev.data, ev.len);
+            sendStatus = onWrite(ev.data, ev.len, frags, &count);
             break;
           case MEDTRUM_EV_STOP:
             stop = true;
@@ -191,7 +192,10 @@ static void medtrumTask(void*) {
             break;
         }
       }
+      if (sendStatus) statusLen = medtrum_patch_notification(&patch, statusPayload, sizeof statusPayload);
     });
+    for (int i = 0; i < count; i++) io.notify(io.ctx, frags[i].data, frags[i].len);
+    if (statusLen > 0) radio::medtrumNotifyStatus(statusPayload, statusLen);
   }
 }
 
