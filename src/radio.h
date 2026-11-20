@@ -16,7 +16,12 @@
 //   the link by itself (cgmDisconnect, done from tick()), and both sides
 //   reconnect at once.
 
+// cgm.h is the verbatim portable core and has no extern "C" guard (upstream
+// includes it from C only); this header is included from C++, so the guard goes
+// here and not in the ported file.
+extern "C" {
 #include "cgm.h"
+}
 #include "dash.h"
 #include "medtrum.h"
 

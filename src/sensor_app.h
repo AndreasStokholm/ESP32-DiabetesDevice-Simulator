@@ -9,7 +9,13 @@
 
 #include <string>
 
+// cgm.h is the verbatim portable core and carries no extern "C" guard -- upstream
+// it is only ever included from C. This translation unit is C++, so without the
+// guard every cgm_* reference is mangled and the link fails with undefined
+// references. Wrap it here rather than editing the ported header.
+extern "C" {
 #include "cgm.h"
+}
 
 // NOTE(assembly): C++ cannot have both this namespace and a global variable
 // named `sensor` in one translation unit, so src/main.cpp has no global of
