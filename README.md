@@ -1,31 +1,36 @@
 # ESP32 Diabetes Device Simulator
 
-One ESP32-S3 that is both an **Omnipod pod simulator** (DASH or Omnipod 5) and a
-**Dexcom G7 sensor simulator**. Pair both from Loop or Trio on a test phone and the app has
-a pump and a CGM, with no real pod or sensor. A new board starts as an Omnipod 5; one
-button switches it to DASH and back.
+One ESP32-S3 that is an **Omnipod pod simulator** (DASH or Omnipod 5), a **Dexcom G7
+sensor simulator**, and a **Medtrum patch simulator**. On a test phone, pair the G7 and
+either the pod (from Loop or Trio) or the patch (from a MedtrumKit-capable app): the app
+has a CGM and a pump, with no real hardware. A new board starts as an Omnipod 5; one
+button switches it to DASH and back. **This build simulates G7, ONE+ and Stelo; it has no
+G6 simulator.**
 
-> **Test equipment only.** Not a Dexcom or Insulet product, and not a medical device. It
-> delivers no insulin and every value it reports is made up. Never use it, or an app
-> paired to it, for anyone's therapy.
+> **Test equipment only.** Not a Dexcom, Insulet or Medtrum product, and not a medical
+> device. It delivers no insulin and every value it reports is made up. Never use it, or an
+> app paired to it, for anyone's therapy.
 
 It combines two projects:
 
-- the pod is [nightscout/ESP-Sim](https://github.com/nightscout/ESP-Sim)'s pod core,
-  in `lib/dashpod` (commit `26c5219`, plus loopkit/pod's `ignoreNextMessages` and
-  `failNextConnects` commands);
+- the pod and the Medtrum patch are [nightscout/ESP-Sim](https://github.com/nightscout/ESP-Sim)'s
+  cores: `lib/dashpod` (commit `26c5219`, plus loopkit/pod's `ignoreNextMessages` and
+  `failNextConnects` commands) and the portable `lib/medtrumpatch`, with small
+  Arduino/PlatformIO glue;
 - the G7 is [g7simESP32](https://github.com/loudestnoise/g7simESP32), a C++ port of
   [LoopKit/g7sim](https://github.com/LoopKit/g7sim).
 
-## How one board is two devices
+## How one board is three devices
 
-A phone can't hold two Bluetooth connections to the same radio, so the board can't be two
-separate devices to one phone. Instead it is **one Bluetooth device** that carries both the
-pod's service and the G7's. The app's pod code and its G7 code each connect to "their"
-device and share the single connection underneath.
+A phone can't hold several Bluetooth connections to the same radio, so the board can't be
+several separate devices to one phone. Instead it is **one Bluetooth device** that carries
+the pod's, the G7's and the Medtrum base's services. The app's pod code, its G7 code and
+its MedtrumKit code each connect to "their" device and share the single connection
+underneath.
 
-- **Advertising** takes turns between the pod's advertisement (` :: Fake POD ::`) and the
-  G7's (`DXCMxx`), depending on which needs to be found.
+- **Advertising** takes turns between the pod's advertisement (` :: Fake POD ::`), the
+  G7's (`DXCMxx`) and the Medtrum base's (`MT` plus its serial), depending on which needs
+  to be found.
 - **Every 5 minutes** the board hangs up once, when the pod is quiet. A real G7 hangs up
   after each reading and the app only asks for a reading after connecting, so this is what
   makes it collect the new one. Both sides reconnect within a second; the reading can
@@ -84,12 +89,12 @@ flash.
 
 ### Updating, and starting over
 
-- **Updating** keeps everything the board has stored: the sensor, the pod, their
-  pairings and the Wi‑Fi network. Flash again from the browser with *Erase device*
+- **Updating** keeps everything the board has stored: the sensor, the pod, the patch,
+  their pairings and the Wi‑Fi network. Flash again from the browser with *Erase device*
   unticked, or run `git pull` and `pio run -t upload`.
 - **Starting over** wipes all of that. Tick *Erase device* in the browser, or run
-  `pio run -t erase` and then `pio run -t upload`. To replace only the sensor or only the
-  pod, use the `new` and `pod fresh` console commands instead.
+  `pio run -t erase` and then `pio run -t upload`. To replace only the sensor, pod or
+  patch, use `new`, `pod fresh`, or **New patch** on the Medtrum panel instead.
 
 ### If flashing fails
 
@@ -132,8 +137,12 @@ pairing the new pod was tested both ways.
 - **Pod:** pair a new Omnipod 5 pod, which is what a new board starts as. For DASH, switch
   the pod type first: the **Switch to DASH** button on either panel, or `pod mode dash`.
   The button always offers the other type, and switching starts a new, unpaired pod.
+- **Medtrum patch:** activate a patch in an app with MedtrumKit support. The base serial
+  is `4A12D828` for a 200 U base (MD0201) and `52DF1614` for a 300 U base (MD8301). The
+  patch panel's **Set model** swaps the serial and model together; switching either ends
+  the current activation, so the app activates a fresh patch.
 
-Use a **test phone**, never one that runs a real sensor or pod.
+Use a **test phone**, never one that runs a real sensor, pod or patch.
 
 ## Control
 
@@ -159,18 +168,48 @@ page may not know them: install again to update it.
 
 **Web panels (over Wi‑Fi).** With no Wi‑Fi network saved, the board runs its own access
 point, `ESP-Sim-XXXX`. Its name and password are shown by the USB panel and by `status`,
-and printed on the console at boot. Join it and open `http://192.168.4.1/`. To put the
-board on your network instead, use the pod panel's Wi‑Fi card or `wifi <name> <password>`;
-it then prints its address (also `http://esp-sim.local/`) and takes the time from NTP.
+and printed on the console at boot. The password is derived from the chip's MAC (four MAC
+bytes mixed with constants and prefixed `pod-`), so no credential is built into the
+firmware.
 
-- `/` is the G7 panel: glucose (fixed, sine, random walk), sensor errors, new sensor.
+Join the AP from a phone and it gets the Wi‑Fi sheet without typing an address. A
+`DNSServer` answers every name with the board's AP address, the OS captive-portal probes
+are answered the way Apple, Android and Windows expect, and `/` redirects to `/setup`
+until the sheet has been dismissed. The sheet itself never shows the AP password: the
+reader is already on the AP.
+
+- **Join and restart** saves a 2.4 GHz network and restarts the board on it; the pages
+  then stay at `http://esp-sim.local/` and the clock is set from NTP. If the network cannot
+  be joined, the board comes back as its own access point and the sheet returns.
+- **Continue without joining** sets a `setup=done` cookie (path `/`, 7 days), goes to `/`,
+  and leaves the simulators running offline. Only the clock is unset, so the pod and patch
+  start from their own uptime.
+
+The sheet is also at `http://192.168.4.1/setup`. To put the board on your network later,
+use `/settings` or `wifi <name> <password>`.
+
+All pages share one nav: **Home, G7, Pod, Medtrum, Settings**.
+
+- `/` is the home page: one card per simulator with a live line (G7 name, code, glucose and
+  display count; pod type, pairing, reservoir, active minutes and alerts; Medtrum serial,
+  model, state, reservoir and connection), plus a no-clock banner that links to `/setup`.
+- `/g7` is the G7 panel: glucose (fixed, sine, random walk), sensor errors, new sensor.
 - `/pod` is the pod panel: reservoir, pod age, alerts, faults, crash on the next command,
-  the same pod type switch button, new pod, Wi‑Fi.
+  the pod type switch, new pod.
+- `/medtrum` is the patch panel: model and serial, reservoir, patch state, fault, crash,
+  new patch.
+- `/settings` owns the board: joined SSID and address, clock/NTP state, join or forget the
+  network, firmware, hardware, and reboot. Wi‑Fi setup left the device panels for here.
 
 The JSON APIs are the originals': g7sim's at `/status`, `/glucose`, `/forget`, `/new`, and
-loopkit/pod's under `/pod` (`/pod/status`, `/pod/command`), plus `/pod/wifi`.
+loopkit/pod's under `/pod` (`/pod/status`, `/pod/command`), the patch's under `/medtrum`
+(`/medtrum/status`, `/medtrum/command`), plus `/settings/status`, `/settings/wifi`,
+`/settings/forget`, `/settings/reboot` and `/fail` (see
+[Failure injection](#failure-injection)). `/setup/wifi`, `/pod/wifi` and `/medtrum/wifi`
+are aliases to the same save handler.
 
-The console commands below do everything the panels do, and more.
+The console commands below cover the G7, the pod and the board; the Medtrum patch is
+controlled from its panel or `/medtrum/command`.
 
 ## Commands
 
@@ -326,19 +365,66 @@ venv/bin/pip install bleak cryptography
 `g7client.py` takes the sensor's phone slot, so the app has to pair again afterwards. Both
 need the board free: one phone or computer can be connected at a time.
 
+## Failure injection
+
+The **Failure injection** card on `/g7`, `/pod` and `/medtrum`, and the console's `fail`
+command, put real Bluetooth failures in front of the simulators. The card has drop, refuse,
+quiet and delay; `ignore` is console/API-only. The knobs live in RAM and reset on reboot.
+
+Post JSON to `/fail`:
+
+```bash
+curl -XPOST esp-sim.local/fail -H 'Content-Type: application/json' \
+  -d '{"device":"g7","refuse":3,"quietMs":10000,"delayMs":500,"ignore":2}'
+```
+
+| Field | What it does | Range |
+|---|---|---|
+| `device` | Which simulator: `pod`, `g7`, `medtrum` or `all` | |
+| `drop` | Drop the next connection once (accept it, then disconnect) | `true` / `false` |
+| `refuse` | Drop this many subsequent connections | 0–1000 |
+| `quietMs` | Stop advertising that device for this many milliseconds | 0–86,400,000 |
+| `delayMs` | Delay each outgoing notification | 0–60,000 |
+| `ignore` | Drop this many messages from the phone | 0–1000 |
+
+Omitted fields are left alone; `0` or `false` clears a field. The reply is the new state for
+all three devices, e.g. `{"pod":{...},"g7":{...},"medtrum":{...}}` with `drop`, `refuse`,
+`quietMs`, `delayMs` and `ignore` for each.
+
+On the console:
+
+```
+fail g7 drop
+fail pod refuse 3
+fail medtrum quiet 10000
+fail g7 delay 500
+fail pod ignore 2
+fail all clear
+```
+
+There is one BLE link for all three simulators, so `drop` and `refuse` apply to the next
+connection attempt whichever device asked; a refused connection is accepted and then
+disconnected immediately. `quiet` only clears that device's advertising want flag: the
+pod's and Medtrum's advertisement bytes do not change. `ignore` drops the message at the
+BLE write, for all three devices.
+
+A G7 `delayMs` is recorded and returned in the state but not applied, because the G7's
+notifications are sent by its sensor task; the pod's and Medtrum's delays are applied. The
+G7's drop, refuse, quiet and ignore knobs all work.
+
 ## Good to know
 
-- Both devices keep their state in flash: a reboot is the same sensor and the same pod,
-  still paired.
-- Without NTP, both clocks pause while the board is unplugged.
+- All three simulators keep their state in flash: a reboot is the same sensor, pod and
+  patch, still paired.
+- Without NTP, the pod's and patch's clocks pause while the board is unplugged.
 - In the app the pod may briefly show as reconnecting once every 5 minutes. That's the
   hang-up described above.
 - Unlike a real G7, the sensor serves a phone that has already collected the current
   reading, and it does not serve a second display (a watch or a second phone).
-- Neither device appears in iOS Settings → Bluetooth. That's expected.
-- Not yet tested: the web panels over the board's own access point; long runs; what the
-  app does after `crashNextCommand` and `ignoreNextMessages` (the board accepts them); and
-  a blank board starting as an Omnipod 5 (boards updated from an earlier build keep the
+- The simulators don't appear in iOS Settings → Bluetooth. That's expected.
+- Not yet tested on hardware: the captive Wi-Fi sheet on iOS and Android; long runs; what
+  the app does after `crashNextCommand` and `ignoreNextMessages` (the board accepts them);
+  and a blank board starting as an Omnipod 5 (boards updated from an earlier build keep the
   pod they had).
 - The ESP32 is 2.4 GHz only, and can't sign in to captive-portal Wi‑Fi (hotels). Use its
   own access point or a phone hotspot.
@@ -366,12 +452,21 @@ Devices we want to add:
   (`lib/medtrumpatch`, plain C with no ESP-IDF or mbedTLS) runs under Arduino/PlatformIO
   with new board glue (`src/medtrum_app.cpp`, and the patch's side of `src/radio.cpp`).
   The one radio now takes turns between the pod's, the G7's and the Medtrum pump base's
-  advertisements. The patch's panel is at `/medtrum`, and its host tests run with
-  `make -C test/medtrum`.
-- **g7simESP32**'s radio is rewritten to share one connection with the pod, and its
-  session stays open on that connection instead of hanging up after a few idle seconds.
-  `/glucose` now fills in omitted fields as g7sim does (0, not g7simESP32's 120, 50 and
-  240), and the console takes g7sim's request bodies.
+  advertisements. The patch's panel is at `/medtrum`, its host tests run with
+  `make -C test/medtrum`, and its controls are the panel and `/medtrum/command` (there is
+  no console command prefix for it).
+- **g7simESP32**'s radio is rewritten to share one connection with the pod and the patch,
+  and its session stays open on that connection instead of hanging up after a few idle
+  seconds. The G7 panel is at `/g7`, but `/status`, `/glucose`, `/new` and `/forget` stay
+  exactly where g7sim has them. `/glucose` now fills in omitted fields as g7sim does (0,
+  not g7simESP32's 120, 50 and 240), and the console takes g7sim's request bodies.
+- **Pages and the captive portal** are new here: `/` is a home page, `/g7` the G7 panel,
+  `/pod` and `/medtrum` the device panels, and `/settings` the board (network, clock,
+  firmware, reboot). The board's own access point answers as a captive portal and serves
+  the Wi-Fi sheet at `/setup`; dismissing it sets a `setup=done` cookie. The
+  failure-injection card is on the three device panels, backed by `/fail`.
+- **This variant** simulates G7, ONE+ and Stelo only: there is no G6 sensor service or G6
+  protocol in this firmware.
 
 ## Layout
 
@@ -383,9 +478,19 @@ Devices we want to add:
 | `src/medtrum_app.cpp` | The Medtrum pump base's clock, storage and task |
 | `src/radio.cpp` | One Bluetooth device for the pod, the G7 and the patch |
 | `src/sensor.cpp`, `handler.cpp`, `crypto.cpp` | The G7 (from g7simESP32) |
-| `src/main.cpp` | Boot, Wi‑Fi, web panels, console |
+| `src/main.cpp` | Boot, Wi‑Fi, captive-portal routes, web pages, failure API, console |
+| `src/portal.h`, `src/portal.cpp` | The pure captive-probe and AP-mode redirect decision |
+| `src/fail.h`, `src/fail.cpp` | The pure failure-injection state machine |
+| `src/home_html.h` | The home page with one card per simulator |
+| `src/index_html.h` | The G7 panel |
+| `src/pod_html.h`, `src/medtrum_html.h` | Generated pod and patch panels |
+| `src/settings_html.h` | The Settings page (Network + Board) |
+| `src/setup_html.h` | The captive-portal Wi‑Fi sheet |
 | `test/medtrum/` | Host tests for the portable Medtrum patch core |
+| `test/portal/` | Host tests for the captive-portal decision |
+| `test/fail/` | Host tests for the failure-injection state |
 | `flasher/`, `tools/make_flasher.sh` | The browser flasher |
+| `tools/pod_panel.html`, `tools/gen_pod_panel.py` | The pod's web panel and its generator |
 | `tools/medtrum_panel.html`, `tools/gen_medtrum_panel.py` | The patch's web panel and its generator |
 | `tools/g7client.py`, `tools/podcheck.py` | Test clients for a Mac |
 
