@@ -94,10 +94,10 @@ static const char medtrumHTML[] PROGMEM = R"MEDTRUMHTML(<!doctype html>
   <section class="card" aria-labelledby="h-serial">
     <h2 id="h-serial">Base serial</h2>
     <div class="row">
-      <div><label for="snIn">Base serial (8 hex digits)</label><input id="snIn" maxlength="8" autocomplete="off" placeholder="4A12D828"></div>
+      <div><label for="snIn">Base serial (enter this in the app)</label><input id="snIn" maxlength="8" autocomplete="off" placeholder="4A12D828"></div>
       <div style="flex:0"><button class="primary" id="snSet">Set serial</button></div>
     </div>
-    <div class="muted" style="margin-top:8px">4A12D828 is a 200U base (MD0201); 52DF1614 is a 300U base (MD8301).</div>
+    <div class="muted" style="margin-top:8px">Type this exact string in the app when it asks for the base serial: 4A12D828 is a 200U base (MD0201), 52DF1614 a 300U base (MD8301). A serial the app cannot derive a model from is refused here.</div>
   </section>
 
   <section class="card" aria-labelledby="h-res">

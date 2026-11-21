@@ -11,9 +11,10 @@ CFLAGS ?= -O1 -g
 WARN := -Wall -Wextra -Werror
 CFLAGS += -std=c11 -D_DEFAULT_SOURCE -I$(MED)/include -I.
 
-all: medtrum_tests adv_payload_tests
+all: medtrum_tests adv_payload_tests serial_tests
 	./medtrum_tests
 	./adv_payload_tests
+	./serial_tests
 
 medtrum_tests: $(SRCS) $(wildcard $(MED)/include/*.h) test.h
 	$(CC) $(CFLAGS) $(WARN) -o $@ $(SRCS)
@@ -23,7 +24,12 @@ medtrum_tests: $(SRCS) $(wildcard $(MED)/include/*.h) test.h
 adv_payload_tests: test_adv_payload.c ../../src/adv_payload.h
 	$(CC) $(CFLAGS) $(WARN) -I../../src -o $@ test_adv_payload.c
 
+# src/medtrum_serial.h is the panel's serial parsing and the app's validation,
+# both pure; it calls the core's decrypt, so this links the core too.
+serial_tests: test_serial.c ../../src/medtrum_serial.h $(wildcard $(MED)/src/*.c)
+	$(CC) $(CFLAGS) $(WARN) -I../../src -o $@ test_serial.c $(wildcard $(MED)/src/*.c)
+
 clean:
-	rm -f medtrum_tests adv_payload_tests
+	rm -f medtrum_tests adv_payload_tests serial_tests
 
 .PHONY: all clean

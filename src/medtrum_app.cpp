@@ -21,6 +21,7 @@
 #include <string.h>
 #include <sys/time.h>
 
+#include "medtrum_serial.h"
 #include "radio.h"
 #include "util.h"
 
@@ -82,17 +83,6 @@ static const char* modelName(const uint8_t sn[4]) {
   return "INVALID";
 }
 
-static bool serialHex(const char* s, uint8_t sn[4]) {
-  if (strlen(s) != 8) return false;
-  for (int i = 0; i < 4; i++) {
-    char b[3] = {s[i * 2], s[i * 2 + 1], 0};
-    char* end;
-    long v = strtol(b, &end, 16);
-    if (*end != 0) return false;
-    sn[i] = (uint8_t)v;
-  }
-  return true;
-}
 
 // MARK: - Persistence (NVS "medtrum"/"state", distinct from the pod's)
 
@@ -323,8 +313,14 @@ const char* command(const std::string& json) {
   if (!jsonStr(body, "command", cmd, sizeof cmd)) return "want {\"command\": ...}";
   if (strcmp(cmd, "medtrumSetSerial") == 0) {
     uint8_t sn[4];
-    if (!jsonStr(body, "sn", hex, sizeof hex) || !serialHex(hex, sn)) {
+    if (!jsonStr(body, "sn", hex, sizeof hex) || !medtrum_serial_parse(hex, sn)) {
       return "sn is 8 hex digits, e.g. \"4A12D828\"";
+    }
+    // The app derives the model from this serial and refuses a base it cannot
+    // read one from, so refuse it here rather than let Trio say "Incorrect
+    // serial number received" after a scan.
+    if (!medtrum_serial_valid(sn)) {
+      return "that serial does not validate in the app: 4A12D828 (200U) or 52DF1614 (300U)";
     }
     LOCKED({
       memcpy(patch.sn, sn, 4);
