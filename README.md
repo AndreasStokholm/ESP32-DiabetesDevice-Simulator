@@ -533,7 +533,12 @@ Devices we want to add:
   with new board glue (`src/medtrum_app.cpp`, and the patch's side of `src/radio.cpp`).
   The radio advertises on two sets at once: the CGM's advertisement and the selected pump's
   (the pod's, or the Medtrum base's). The pod and the Medtrum base are mutually exclusive,
-  so at most one of them is ever in the pump set.
+  so at most one of them is ever in the pump set. One field is deliberately NOT ESP-Sim's:
+  the base's manufacturer **company id is 0x4781 (18305)**, where ESP-Sim sends `0x0000`. A
+  real base sends Medtrum's own id, an app that gates on it (Rockit) rejects a placeholder,
+  and the point of the thing is to be the real device. Trio matches on the name `MT` alone.
+  For the same reason the base's serial is advertised **reversed** relative to the string the
+  panel shows: that is the form both apps compare against.
   The patch's panel is the pump page at `/pump` (the Medtrum patch choice), its host tests
   run with `make -C test/medtrum`, and its controls are the panel and `/medtrum/command`
   (there is no console command prefix for it).

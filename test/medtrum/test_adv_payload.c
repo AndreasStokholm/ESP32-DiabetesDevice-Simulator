@@ -84,13 +84,15 @@ static void test_pod_o5_payload(void) {
     CHECK(adv_pod_o5(uuid, b, sizeof want - 1) == 0);
 }
 
-/* The Medtrum base's: flags, the name "MT", the manufacturer data with the
- * serial (little-endian order as the app reads it), type and version. */
+/* The Medtrum base's: flags, the name "MT", and manufacturer data formed of
+ * company 0x4781 (18305), the serial, type and version. The company id is the
+ * real one: an app that gates on it (Rockit) has to see a base it would accept.
+ * ESP-Sim sends 0x0000 here and is the one deviation from its bytes. */
 static void test_medtrum_payload(void) {
     uint8_t sn[4] = {0x12, 0x34, 0x56, 0x78};
     uint8_t b[ADV_MAX];
     static const uint8_t want[] = {0x02, 0x01, 0x06, 0x03, 0x09, 'M', 'T',
-                                   0x09, 0xFF, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78, 0x01, 0x01};
+                                   0x09, 0xFF, 0x81, 0x47, 0x12, 0x34, 0x56, 0x78, 0x01, 0x01};
     CHECK(adv_medtrum(sn, b, sizeof b) == sizeof want);
     CHECK(memcmp(b, want, sizeof want) == 0);
     CHECK(adv_medtrum(sn, b, sizeof want - 1) == 0);

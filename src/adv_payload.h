@@ -1,8 +1,11 @@
 /* The three devices' advertising payloads, assembled byte by byte.
  *
- * Pure C (no Arduino, no NimBLE): each device's bytes are exactly ESP-Sim's,
- * so they can be read and diffed without a radio. src/radio.cpp only hands the
- * result to the advertiser.
+ * Pure C (no Arduino, no NimBLE), so the bytes can be read and diffed without a
+ * radio. src/radio.cpp only hands the result to the advertiser.
+ *
+ * The pod's, the CGM's and this file's field order are ESP-Sim's, byte for byte.
+ * One field is deliberately not: the Medtrum base's manufacturer company id, which
+ * ESP-Sim sends as 0x0000 and a real base sends as 0x4781 (see adv_medtrum).
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
@@ -97,9 +100,17 @@ static inline size_t adv_pod_o5(const uint8_t uuid[16], uint8_t *out, size_t cap
 
 /* The Medtrum base's: flags, the name "MT", and the manufacturer data the app
  * reads the base serial, device type and version from. */
+/* The Medtrum base: flags, the name "MT", then manufacturer data -- company id
+ * 0x4781 (18305, Medtrum's Bluetooth SIG id, little-endian on the wire), the
+ * serial, device type and version. ESP-Sim wrote company 0x0000 here, which a
+ * real base never sends and which apps that gate on the company id (Rockit)
+ * correctly reject; the point of this project is to BE the real device, so this
+ * is the one payload that deviates from ESP-Sim's bytes.
+ *
+ * Trio/MedtrumKit matches on the name alone and does not care about this field. */
 static inline size_t adv_medtrum(const uint8_t sn[4], uint8_t *out, size_t cap)
 {
-    if (3 + 5 + 11 > cap) {
+    if (3 + 4 + 10 > cap) {
         return 0;
     }
     size_t n = 0;
@@ -112,8 +123,8 @@ static inline size_t adv_medtrum(const uint8_t sn[4], uint8_t *out, size_t cap)
     out[n++] = 'T';
     out[n++] = 0x09;
     out[n++] = 0xFF;
-    out[n++] = 0x00;
-    out[n++] = 0x00;
+    out[n++] = 0x81; /* company 0x4781 = 18305, little-endian */
+    out[n++] = 0x47;
     out[n++] = sn[0];
     out[n++] = sn[1];
     out[n++] = sn[2];
