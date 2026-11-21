@@ -147,6 +147,16 @@ void start() {
       "pod", 12288, nullptr, 5, nullptr, tskNO_AFFINITY);
 }
 
+void setType(dash_pod_type_t type) { dash_pod_set_type(&thePod, type); }
+
+dash_pod_type_t type() {
+  dash_pod_type_t t = DASH_POD_DASH;
+  xSemaphoreTake(mu, portMAX_DELAY);
+  t = (dash_pod_type_t)thePod.st.pod_type;
+  xSemaphoreGive(mu);
+  return t;
+}
+
 std::string statusJson() {
   char json[1024];
   int n = dash_pod_status_json(&thePod, json, sizeof json);
