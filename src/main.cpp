@@ -34,10 +34,9 @@
 #include "home_html.h"
 #include "index_html.h"
 #include "medtrum_app.h"
-#include "medtrum_html.h"
 #include "pod.h"
-#include "pod_html.h"
 #include "portal.h"
+#include "pump_html.h"
 #include "radio.h"
 #include "sensor_app.h"
 #include "settings_html.h"
@@ -545,8 +544,11 @@ static void startWeb() {
     restartAt = monoMs() + 1000;
   });
 
-  // The pod's panel and API (ESP-Sim's, under /pod).
-  web.on("/pod", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", podHTML); });
+  // The one pump page (the Simulate box picks Off/DASH/Omnipod 5/Medtrum);
+  // /pod and /medtrum are aliases so a bookmarked URL does not 404. Their API
+  // stays under /pod and /medtrum.
+  web.on("/pump", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", pumpHTML); });
+  web.on("/pod", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", pumpHTML); });
   web.on("/pod/status", HTTP_GET, [] {
     web.sendHeader("Cache-Control", "no-store");
     web.send(200, "application/json", pod::statusJson().c_str());
@@ -559,8 +561,8 @@ static void startWeb() {
     web.send(200, "application/json", pod::statusJson().c_str());
   });
   web.on("/pod/wifi", HTTP_POST, sendWifiSaved);
-  // The Medtrum patch's panel and API (under /medtrum).
-  web.on("/medtrum", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", medtrumHTML); });
+  // The Medtrum patch's API (under /medtrum; its page is the pump page above).
+  web.on("/medtrum", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", pumpHTML); });
   web.on("/medtrum/status", HTTP_GET, [] {
     web.sendHeader("Cache-Control", "no-store");
     web.send(200, "application/json", medtrum::statusJson().c_str());

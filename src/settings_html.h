@@ -40,9 +40,8 @@ static const char settingsHTML[] PROGMEM = R"HTML(<!doctype html>
 <nav>
   <span class="brand">ESP-Sim</span>
   <a href="/">Home</a>
-  <a href="/g7">G7</a>
-  <a href="/pod">Pod</a>
-  <a href="/medtrum">Medtrum</a>
+  <a href="/g7">CGM</a>
+  <a href="/pump">Pump</a>
   <a class="active" href="/settings">Settings</a>
 </nav>
 <main>
@@ -62,14 +61,10 @@ static const char settingsHTML[] PROGMEM = R"HTML(<!doctype html>
     <div class="muted">Without a saved network the board runs its own access point and shows the Wi-Fi sheet first, as a captive-portal page you can dismiss.</div>
   </div>
   <div class="card">
-    <h2>Simulated pumps</h2>
+    <h2>Simulated pump</h2>
     <div class="kv"><span>Now</span><span id="pumpNow">—</span></div>
-    <div class="actions">
-      <button type="button" id="pumpBoth">Both, taking turns</button>
-      <button type="button" id="pumpPod">Pod only</button>
-      <button type="button" id="pumpMed">Medtrum only</button>
-    </div>
-    <div class="muted" id="pumpNote">A phone runs one pump app. With both selected the pod's and the Medtrum base's advertisements share the one set, so a Medtrum app that keys a discovered device by address may never list the base — choose Medtrum only for that test, and the base advertises continuously.</div>
+    <div class="actions"><button type="button" id="openPump">Open the pump page</button></div>
+    <div class="muted">One pump at a time, chosen on the pump page: Off, Omnipod DASH, Omnipod 5 or the Medtrum patch. The pod and the Medtrum base are mutually exclusive, so the one not selected stops advertising and releases the one BLE link.</div>
   </div>
   <div class="card">
     <h2>Board</h2>
@@ -105,9 +100,8 @@ static const char settingsHTML[] PROGMEM = R"HTML(<!doctype html>
   };
   $('forget').onclick = () => call('/settings/forget');
   $('reboot').onclick = () => call('/settings/reboot');
-  $('pumpBoth').onclick = () => call('/settings/pump', { pump:'both' }).then(refresh);
-  $('pumpPod').onclick = () => call('/settings/pump', { pump:'pod' }).then(refresh);
-  $('pumpMed').onclick = () => call('/settings/pump', { pump:'medtrum' }).then(refresh);
+  $('openPump').onclick = () => { location.href = '/pump'; };
+  const PUMP_NAMES = { off:'Off', 'pod-dash':'Omnipod DASH', 'pod-o5':'Omnipod 5', medtrum:'Medtrum patch' };
 
   async function refresh() {
     try {
@@ -120,7 +114,7 @@ static const char settingsHTML[] PROGMEM = R"HTML(<!doctype html>
       $('commit').textContent = s.firmware ? s.firmware.commit : '—';
       if (s.firmware && s.firmware.built) $('commit').title = 'built ' + s.firmware.built;
       if (!edited && ssid && document.activeElement !== $('ssid')) $('ssid').value = ssid;
-      $('pumpNow').textContent = s.pump === 'pod' ? 'pod only' : s.pump === 'medtrum' ? 'Medtrum only' : 'both, taking turns';
+      $('pumpNow').textContent = PUMP_NAMES[s.pump] || '—';
     } catch (err) {
       say('Could not reach the board.');
     }

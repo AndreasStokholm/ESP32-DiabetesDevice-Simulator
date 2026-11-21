@@ -56,9 +56,8 @@ static const char podHTML[] PROGMEM = R"PODHTML(<!doctype html>
 <nav>
   <span class="brand">ESP-Sim</span>
   <a href="/">Home</a>
-  <a href="/g7">G7</a>
-  <a class="active" href="/pod">Pod</a>
-  <a href="/medtrum">Medtrum</a>
+  <a href="/g7">CGM</a>
+  <a class="active" href="/pump">Pump</a>
   <a href="/settings">Settings</a>
 </nav>
 <header>

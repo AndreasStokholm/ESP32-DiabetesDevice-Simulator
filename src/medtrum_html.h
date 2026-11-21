@@ -51,9 +51,8 @@ static const char medtrumHTML[] PROGMEM = R"MEDTRUMHTML(<!doctype html>
 <nav>
   <span class="brand">ESP-Sim</span>
   <a href="/">Home</a>
-  <a href="/g7">G7</a>
-  <a href="/pod">Pod</a>
-  <a class="active" href="/medtrum">Medtrum</a>
+  <a href="/g7">CGM</a>
+  <a class="active" href="/pump">Pump</a>
   <a href="/settings">Settings</a>
 </nav>
 <header>
