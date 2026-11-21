@@ -14,6 +14,10 @@
 
 namespace radio {
 
+// adv_wants() takes the pump selection as an int; the values must be radio.h's.
+static_assert(PUMP_OFF == ADV_PUMP_OFF && PUMP_POD == ADV_PUMP_POD && PUMP_MEDTRUM == ADV_PUMP_MEDTRUM,
+              "the pump selection and the advertising-rotation want flags must agree");
+
 static const uint8_t inst = 0;  // the one advertising set
 
 // MARK: - The CGM's GATT layout (the core's characteristics, lib/cgmsim)
@@ -117,9 +121,10 @@ static bool medtrumAdvOn = false;
 // selector existed.
 static int pumpSel = PUMP_POD;
 static bool advForce = false;
-// Whether the current link was used by a pump (its GATT service was written or
-// subscribed). A link the CGM alone touched is not a pump's, so switching the
-// pump selection must not drop it; the flags are cleared on every disconnect.
+// Whether the current link is a pump's: its GATT service was written or
+// subscribed, or (with the CGM off) it connected while that pump was selected.
+// A link the CGM alone touched is not a pump's, so switching the pump selection
+// must not drop it; the flags are cleared on every disconnect.
 static volatile bool podUsed = false;
 static volatile bool medtrumUsed = false;
 
@@ -199,6 +204,16 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // cgmLinkUp()): a link it never touches is the pod's or the patch's, and
     // the core's CONN_MAX timer must not end it.
     cgmUsed = false;
+    // With the CGM off the link can only be a pump's, so mark the selected one
+    // now: a pump phone that connects but has not yet subscribed or written must
+    // still release the one link when the selection changes (see setPump). With
+    // the CGM on the link could be the CGM's, so the pump's first GATT event
+    // marks it instead.
+    if (sensor::kind() == CGM_OFF) {
+      int sel = pump();
+      if (sel == PUMP_POD) podUsed = true;
+      else if (sel == PUMP_MEDTRUM) medtrumUsed = true;
+    }
     podPush(DASH_EV_CONNECTED, nullptr, 0);
     medtrumPush(MEDTRUM_EV_CONNECTED, nullptr, 0);
   }
@@ -310,6 +325,18 @@ class PodCallbacks : public NimBLECharacteristicCallbacks {
     podUsed = true;
     podLastTraffic = (uint32_t)monoMs();
     podPush(cmd ? DASH_EV_CMD : DASH_EV_DATA, v.data(), v.length());
+  }
+
+  // A pod phone subscribes to the data characteristic as it connects, before
+  // its first write; mark the link as the pod's then too (as the Medtrum read
+  // callback does), so a switch releases it even before any write.
+  void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc* desc, uint16_t) override {
+    if (desc && desc->conn_handle != conn) return;
+    if (!pumpSelected(true)) {
+      if (desc) pumpRefuse(desc->conn_handle, "pod");
+      return;
+    }
+    podUsed = true;
   }
 
  private:
@@ -532,14 +559,14 @@ void tick() {
   // The pod and the Medtrum base are mutually exclusive: exactly one of the two
   // may advertise, and PUMP_OFF lets neither. A scanner that keys a device by
   // address never sees the second name, because the second is never in the set.
+  // adv_wants() is the pure choice (test/medtrum/test_adv.c pins it).
   int sel = pump();
-  bool podWant = sel == PUMP_POD && !podData.empty() && (!connected || !paired);
-  bool medWant = sel == PUMP_MEDTRUM && medOn && !medData.empty() && !connected;
-  adv_wants_t wants = {
-      .g7 = adv_cgm_wants((int)sensor::kind(), cgmOn && !connected) && fail_decide(FAIL_CGM, FAIL_ADVERTISE, now),
-      .pod = podWant && fail_decide(FAIL_POD, FAIL_ADVERTISE, now),
-      .med = medWant && fail_decide(FAIL_MEDTRUM, FAIL_ADVERTISE, now),
-  };
+  adv_wants_t wants = adv_wants((int)sensor::kind(), cgmOn && !connected, sel,
+                                !podData.empty() && (!connected || !paired),
+                                medOn && !medData.empty() && !connected);
+  wants.g7 = wants.g7 && fail_decide(FAIL_CGM, FAIL_ADVERTISE, now);
+  wants.pod = wants.pod && fail_decide(FAIL_POD, FAIL_ADVERTISE, now);
+  wants.med = wants.med && fail_decide(FAIL_MEDTRUM, FAIL_ADVERTISE, now);
   int choice = adv_rotation_slot(&wants, now);
   // Log the WANT set, not the slot: the slot changes every 1.5 s, the wants change
   // only when a device appears or stops. Answers "did Medtrum ever want the set?"

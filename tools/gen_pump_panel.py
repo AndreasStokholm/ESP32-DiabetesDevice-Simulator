@@ -5,10 +5,12 @@ The pump page is one page: a "Simulate" box at the top, and below it only the
 panel for the selected pump. The two panels are reused verbatim -- their header,
 their main sections and their script -- rather than rewritten. Because both
 panels share element ids (resIn, faultIn, failMsg, ...), each panel's ids are
-prefixed (p/m) in both its markup and its script, and each script is wrapped in
-an IIFE so its top-level names ($, show, refresh, ...) cannot collide. The pod
-script's API paths are pointed at /pod and the Medtrum script's at /medtrum;
-/fail is shared and left alone.
+prefixed (p/m) in its markup, its script's `$` lookup is scoped to those
+prefixed ids, and each script is wrapped in an IIFE so its top-level names ($,
+show, refresh, ...) cannot collide. Scoping `$` (rather than rewriting every
+call) is what makes ids passed indirectly -- `['resIn','ageIn'].forEach(id =>
+$(id) ...)` -- resolve too. The pod script's API paths are pointed at /pod and
+the Medtrum script's at /medtrum; /fail is shared and left alone.
 
     python3 tools/gen_pump_panel.py
 """
@@ -32,6 +34,16 @@ def ids(html):
     return sorted(set(re.findall(r'id="([^"]+)"', html)))
 
 
+def id_refs(js):
+    """Every id the script looks up: the literal $('x') calls, the id strings in
+    a `[...].forEach(id => $(id) ...)` list, and the '#x' of a querySelector."""
+    refs = set(re.findall(r"\$\('([^']+)'\)", js))
+    for arr in re.findall(r"\[([^\]]*)\]\.forEach\(id\s*=>\s*\$\(id\)", js):
+        refs |= set(re.findall(r"'([^']+)'", arr))
+    refs |= set(re.findall(r"querySelector(?:All)?\('#([^' .]+)", js))
+    return refs
+
+
 def prefix_html(html, names, pfx):
     for i in names:
         html = html.replace('id="%s"' % i, 'id="%s%s"' % (pfx, i))
@@ -40,23 +52,27 @@ def prefix_html(html, names, pfx):
     return html
 
 
-def prefix_js(js, names, pfx):
-    for i in names:
-        js = js.replace("$('%s')" % i, "$('%s%s')" % (pfx, i))
-        js = js.replace("querySelectorAll('#%s" % i, "querySelectorAll('#%s%s" % (pfx, i))
-        js = js.replace("querySelector('#%s" % i, "querySelector('#%s%s" % (pfx, i))
-    return js
-
-
 def panel(src_name, pfx, api):
     """The reused panel: its header + main, ids prefixed, and its script."""
     src = read(src_name)
     head_src = re.search(r"<header>.*?</header>", src, re.S).group(0)
     body_src = extract(src, "main")
     names = ids(head_src + body_src)
+    script = extract(src, "script")
+    # Every id the script looks up must be an id this panel emits, or the
+    # generated page would throw on the first lookup.
+    missing = id_refs(script) - set(names)
+    assert not missing, (src_name, "script looks up ids the panel does not emit", sorted(missing))
     head = prefix_html(head_src, names, pfx)
     body = prefix_html(body_src, names, pfx)
-    script = prefix_js(extract(src, "script"), names, pfx)
+    # Scope the panel's own $ to its prefixed ids, so a literal and an id from
+    # the forEach lists both resolve.
+    m = re.search(r"const \$ = id\s*=>\s*document\.getElementById\(id\);", script)
+    assert m, (src_name, "no $ definition")
+    script = script[:m.start()] + ("const $ = id=>document.getElementById('%s'+id);" % pfx) + script[m.end():]
+    for i in names:
+        script = script.replace("querySelectorAll('#%s" % i, "querySelectorAll('#%s%s" % (pfx, i))
+        script = script.replace("querySelector('#%s" % i, "querySelector('#%s%s" % (pfx, i))
     for a, b in [("fetch('/command'", "fetch('%s/command'" % api),
                   ("fetch('/status')", "fetch('%s/status')" % api)]:
         assert script.count(a) == 1, (src_name, a)

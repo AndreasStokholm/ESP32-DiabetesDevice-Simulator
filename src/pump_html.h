@@ -447,7 +447,7 @@ const FAULTS = [
   [150,"Bolus termination with incorrect values"],
   [151,"Bad open transitions pod progress or count"]
 ];
-const $ = id=>document.getElementById(id);
+const $ = id=>document.getElementById('p'+id);
 const hex = n=>'0x'+n.toString(16).toUpperCase().padStart(2,'0');
 const units = u=>(Math.round(u*100)/100)+' U';
 const time = iso=>new Date(iso).toLocaleTimeString([], {timeStyle:'short'});
@@ -455,13 +455,13 @@ const faultName = c=>{ const f=FAULTS.find(f=>f[0]===c); return f ? f[1] : 'unkn
 let last = {}, edited = {};
 
 ALERTS.forEach((n,i)=>{ const l=document.createElement('label');
-  l.innerHTML='<input type="checkbox" data-slot="'+i+'"> '+n+' ('+i+')'; $('palertChecks').appendChild(l); });
-$('pfaultIn').innerHTML = FAULTS.map(f=>'<option value="'+f[0]+'">'+hex(f[0])+' — '+f[1].replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</option>').join('');
-$('pfaultIn').value = 28;
+  l.innerHTML='<input type="checkbox" data-slot="'+i+'"> '+n+' ('+i+')'; $('alertChecks').appendChild(l); });
+$('faultIn').innerHTML = FAULTS.map(f=>'<option value="'+f[0]+'">'+hex(f[0])+' — '+f[1].replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</option>').join('');
+$('faultIn').value = 28;
 ['resIn','ageIn'].forEach(id=>$(id).oninput=()=>edited[id]=true);
-$('palertChecks').onchange = ()=>edited.alerts=true;
+$('alertChecks').onchange = ()=>edited.alerts=true;
 
-function say(t){ $('pmsg').textContent=t; if(t) setTimeout(()=>{ if($('pmsg').textContent===t) $('pmsg').textContent=''; }, 4000); }
+function say(t){ $('msg').textContent=t; if(t) setTimeout(()=>{ if($('msg').textContent===t) $('msg').textContent=''; }, 4000); }
 
 async function send(body, done){
   try {
@@ -472,62 +472,62 @@ async function send(body, done){
   } catch(e){ say('Failed — '+e.message); }
 }
 
-$('presSet').onclick = ()=>{ edited.resIn=false; send({command:'changeReservoir', value:+$('presIn').value}, 'Reservoir set'); };
-$('pageSet').onclick = ()=>{ edited.ageIn=false; send({command:'setActiveTime', value:Math.round(+$('pageIn').value*60)}, 'Pod age set'); };
+$('resSet').onclick = ()=>{ edited.resIn=false; send({command:'changeReservoir', value:+$('resIn').value}, 'Reservoir set'); };
+$('ageSet').onclick = ()=>{ edited.ageIn=false; send({command:'setActiveTime', value:Math.round(+$('ageIn').value*60)}, 'Pod age set'); };
 document.querySelectorAll('[data-hours]').forEach(b=>b.onclick=()=>{ edited.ageIn=false;
   send({command:'setActiveTime', value:Math.round(+b.dataset.hours*60)}, 'Pod age set to '+b.dataset.hours+' h'); });
-$('palertsSet').onclick = ()=>{ let m=0; document.querySelectorAll('#palertChecks input').forEach(c=>{ if(c.checked) m|=1<<+c.dataset.slot; });
+$('alertsSet').onclick = ()=>{ let m=0; document.querySelectorAll('#palertChecks input').forEach(c=>{ if(c.checked) m|=1<<+c.dataset.slot; });
   edited.alerts=false; send({command:'setAlerts', value:m}, 'Alerts set'); };
-$('pfaultSet').onclick = ()=>{ const c=+$('pfaultIn').value;
+$('faultSet').onclick = ()=>{ const c=+$('faultIn').value;
   if(confirm('Fault the pod with '+hex(c)+' — '+faultName(c)+'? A faulted pod stops delivery and must be replaced.'))
     send({command:'setFault', value:c}, 'Fault triggered'); };
-$('pfaultClear').onclick = ()=>send({command:'setFault', value:0}, 'Fault cleared');
-$('pcrashBefore').onclick = ()=>send({command:'crashNextCommand', beforeProcessing:true}, 'Armed');
-$('pcrashAfter').onclick = ()=>send({command:'crashNextCommand', beforeProcessing:false}, 'Armed');
+$('faultClear').onclick = ()=>send({command:'setFault', value:0}, 'Fault cleared');
+$('crashBefore').onclick = ()=>send({command:'crashNextCommand', beforeProcessing:true}, 'Armed');
+$('crashAfter').onclick = ()=>send({command:'crashNextCommand', beforeProcessing:false}, 'Armed');
 
-$('ptypeSet').onclick = ()=>{ const o5 = last.podType === 'Omnipod 5', name = o5 ? 'DASH' : 'Omnipod 5';
+$('typeSet').onclick = ()=>{ const o5 = last.podType === 'Omnipod 5', name = o5 ? 'DASH' : 'Omnipod 5';
   if(confirm((last.paired ? 'This '+last.podType+' pod is paired with a phone, and switching ends it. Discard it in the app first.\n\n' : '')
       +'Forget this pod and become a new, unpaired '+name+' pod?'))
     send({command:'setPodType', value:o5 ? 0 : 1}, 'Now a new '+name+' pod'); };
-$('pnewPod').onclick = ()=>{ if(confirm('Forget this pod? The phone will need to pair a new one.')) send({command:'resetPod'}, 'New pod ready'); };
+$('newPod').onclick = ()=>{ if(confirm('Forget this pod? The phone will need to pair a new one.')) send({command:'resetPod'}, 'New pod ready'); };
 
 function chip(el, text, cls){ el.textContent=text; el.className='chip '+(cls||''); }
 
 function show(s){
   last = s;
-  $('ptitle').textContent = (s.podType || 'DASH') + ' pod';
-  $('ptypeNow').textContent = 'This is an '+(s.podType === 'Omnipod 5' ? 'Omnipod 5' : 'Omnipod DASH')+' pod, '+(s.paired ? 'paired with a phone.' : 'not paired yet.');
-  $('ptypeSet').textContent = 'Switch to '+(s.podType === 'Omnipod 5' ? 'DASH' : 'Omnipod 5');
-  $('ptypeSet').disabled = false;
-  $('ppodid').textContent = s.id ? 'id '+s.id : (s.paired ? '' : 'not paired');
-  chip($('plink'), s.connected ? 'connected' : 'not connected', s.connected ? 'ok' : '');
-  $('preservoir').textContent = Math.round(s.reservoir*100)/100;
+  $('title').textContent = (s.podType || 'DASH') + ' pod';
+  $('typeNow').textContent = 'This is an '+(s.podType === 'Omnipod 5' ? 'Omnipod 5' : 'Omnipod DASH')+' pod, '+(s.paired ? 'paired with a phone.' : 'not paired yet.');
+  $('typeSet').textContent = 'Switch to '+(s.podType === 'Omnipod 5' ? 'DASH' : 'Omnipod 5');
+  $('typeSet').disabled = false;
+  $('podid').textContent = s.id ? 'id '+s.id : (s.paired ? '' : 'not paired');
+  chip($('link'), s.connected ? 'connected' : 'not connected', s.connected ? 'ok' : '');
+  $('reservoir').textContent = Math.round(s.reservoir*100)/100;
   const p = s.fault ? ['bad'] : s.progress>=8 && s.progress<=9 ? ['ok'] : ['warn'];
-  chip($('pprogress'), s.progressName, p[0]);
-  $('pdelivered').textContent = units(s.delivered);
+  chip($('progress'), s.progressName, p[0]);
+  $('delivered').textContent = units(s.delivered);
   const h = Math.floor(s.minutesActive/60), m = s.minutesActive%60;
-  $('page').textContent = s.paired ? h+' h '+m+' min of 80 h' : '—';
-  $('pbasal').textContent = s.basalActive ? 'running' : 'not running';
-  $('ptemp').textContent = s.tempBasalActive ? 'until '+time(s.tempBasalEnd) : 'none';
-  $('pbolus').textContent = s.bolusActive ? units(s.bolusRemaining)+' left' : 'none';
+  $('age').textContent = s.paired ? h+' h '+m+' min of 80 h' : '—';
+  $('basal').textContent = s.basalActive ? 'running' : 'not running';
+  $('temp').textContent = s.tempBasalActive ? 'until '+time(s.tempBasalEnd) : 'none';
+  $('bolus').textContent = s.bolusActive ? units(s.bolusRemaining)+' left' : 'none';
   const active = ALERTS.filter((n,i)=>s.alerts & (1<<i));
-  $('palertsNow').textContent = active.length ? active.join(', ') : 'none';
-  $('pfaultNow').textContent = s.fault ? hex(s.fault)+' — '+faultName(s.fault)+' (at '+s.faultMinutes+' min)' : 'none';
-  if(!edited.resIn && document.activeElement!==$('presIn')) $('presIn').value = Math.round(s.reservoir*100)/100;
-  if(!edited.ageIn && document.activeElement!==$('pageIn')) $('pageIn').value = Math.round(s.minutesActive/15)/4;
+  $('alertsNow').textContent = active.length ? active.join(', ') : 'none';
+  $('faultNow').textContent = s.fault ? hex(s.fault)+' — '+faultName(s.fault)+' (at '+s.faultMinutes+' min)' : 'none';
+  if(!edited.resIn && document.activeElement!==$('resIn')) $('resIn').value = Math.round(s.reservoir*100)/100;
+  if(!edited.ageIn && document.activeElement!==$('ageIn')) $('ageIn').value = Math.round(s.minutesActive/15)/4;
   if(!edited.alerts) document.querySelectorAll('#palertChecks input').forEach(c=>c.checked = !!(s.alerts & (1<<+c.dataset.slot)));
-  $('pcrashNote').firstChild.textContent = s.crashNext
+  $('crashNote').firstChild.textContent = s.crashNext
     ? 'Armed: the ESP32 reboots '+s.crashNext+' processing the next command that changes delivery. '
     : 'The ESP32 reboots at the next command that changes delivery, leaving the phone without a response, then comes back as the same pod. Watch how the app recovers.';
-  $('pmsgSeq').textContent = s.msgSeq; $('pcmdSeq').textContent = s.cmdSeq; $('pnonceSeq').textContent = s.nonceSeq;
-  $('peapSeq').textContent = s.eapAkaSeq; $('pprogSeq').textContent = s.lastProgSeqNum;
+  $('msgSeq').textContent = s.msgSeq; $('cmdSeq').textContent = s.cmdSeq; $('nonceSeq').textContent = s.nonceSeq;
+  $('eapSeq').textContent = s.eapAkaSeq; $('progSeq').textContent = s.lastProgSeqNum;
 }
 
 async function refresh(){ try { show(await (await fetch('/pod/status')).json()); } catch(e){} }
 refresh(); setInterval(refresh, 1000);
 
 async function fail(body, done) {
-  const msg = $('pfailMsg');
+  const msg = $('failMsg');
   msg.textContent = 'Applying…';
   try {
     const r = await fetch('/fail',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -537,13 +537,13 @@ async function fail(body, done) {
     setTimeout(()=>{ if(msg.textContent===done) msg.textContent=''; }, 2500);
   } catch(e){ msg.textContent = 'Failed — '+e.message; }
 }
-$('pfailDrop').onclick = ()=>fail({device:'pod', drop:true}, 'Next connection will be dropped');
-$('pfailApply').onclick = ()=>fail({device:'pod',
-  refuse:+$('pfailRefuse').value,
-  quietMs:+$('pfailQuiet').value*1000,
-  delayMs:+$('pfailDelay').value,
-  ignore:+$('pfailIgnore').value}, 'Failure set');
-$('pfailClear').onclick = ()=>fail({device:'pod', drop:false, refuse:0, quietMs:0, delayMs:0, ignore:0}, 'Failures cleared');
+$('failDrop').onclick = ()=>fail({device:'pod', drop:true}, 'Next connection will be dropped');
+$('failApply').onclick = ()=>fail({device:'pod',
+  refuse:+$('failRefuse').value,
+  quietMs:+$('failQuiet').value*1000,
+  delayMs:+$('failDelay').value,
+  ignore:+$('failIgnore').value}, 'Failure set');
+$('failClear').onclick = ()=>fail({device:'pod', drop:false, refuse:0, quietMs:0, delayMs:0, ignore:0}, 'Failures cleared');
 
 })();
 </script>
@@ -561,19 +561,19 @@ const PATCH_STATES = {
 const PATCH_FAULTS = [[96,'Occlusion'],[97,'Expired'],[98,'Reservoir empty'],[99,'Patch fault'],
   [100,'Patch fault 2'],[101,'Base fault'],[102,'Battery empty'],[103,'No calibration']];
 const PATCH_PRIME = {2:'ready to prime',3:'priming',4:'primed',32:'primed, active',33:'primed, active'};
-const $ = id=>document.getElementById(id);
+const $ = id=>document.getElementById('m'+id);
 const hex = n=>'0x'+n.toString(16).toUpperCase().padStart(2,'0');
 const stateName = s=>PATCH_STATES[s] || ('state '+s);
 const faultName = c=>{ const f=PATCH_FAULTS.find(f=>f[0]===c); return f ? f[1] : 'unknown'; };
 const isFault = s=>PATCH_FAULTS.some(f=>f[0]===s);
 let last = {}, edited = {};
 
-$('mstateIn').innerHTML = Object.keys(PATCH_STATES).map(v=>'<option value="'+v+'">'+stateName(+v)+' ('+v+')</option>').join('');
-$('mfaultIn').innerHTML = PATCH_FAULTS.map(f=>'<option value="'+f[0]+'">'+hex(f[0])+' — '+f[1]+'</option>').join('');
-$('mfaultIn').value = 96;
+$('stateIn').innerHTML = Object.keys(PATCH_STATES).map(v=>'<option value="'+v+'">'+stateName(+v)+' ('+v+')</option>').join('');
+$('faultIn').innerHTML = PATCH_FAULTS.map(f=>'<option value="'+f[0]+'">'+hex(f[0])+' — '+f[1]+'</option>').join('');
+$('faultIn').value = 96;
 ['modelIn','snIn','resIn','stateIn','faultIn'].forEach(id=>$(id).oninput=()=>edited[id]=true);
 
-function say(t){ $('mmsg').textContent=t; if(t) setTimeout(()=>{ if($('mmsg').textContent===t) $('mmsg').textContent=''; }, 4000); }
+function say(t){ $('msg').textContent=t; if(t) setTimeout(()=>{ if($('msg').textContent===t) $('msg').textContent=''; }, 4000); }
 
 async function send(body, done){
   try {
@@ -584,44 +584,44 @@ async function send(body, done){
   } catch(e){ say('Failed — '+e.message); }
 }
 
-$('mmodelSet').onclick = ()=>{ edited.modelIn=false; send({command:'medtrumSetModel', units:+$('mmodelIn').value}, 'Model set'); };
-$('msnSet').onclick = ()=>{ edited.snIn=false; send({command:'medtrumSetSerial', sn:$('msnIn').value.trim().toUpperCase()}, 'Serial set'); };
-$('mresSet').onclick = ()=>{ edited.resIn=false; send({command:'medtrumSetReservoir', units:+$('mresIn').value}, 'Reservoir set'); };
-$('mstateSet').onclick = ()=>{ edited.stateIn=false; send({command:'medtrumSetState', state:+$('mstateIn').value}, 'State set'); };
-$('mfaultSet').onclick = ()=>{ const c=+$('mfaultIn').value;
+$('modelSet').onclick = ()=>{ edited.modelIn=false; send({command:'medtrumSetModel', units:+$('modelIn').value}, 'Model set'); };
+$('snSet').onclick = ()=>{ edited.snIn=false; send({command:'medtrumSetSerial', sn:$('snIn').value.trim().toUpperCase()}, 'Serial set'); };
+$('resSet').onclick = ()=>{ edited.resIn=false; send({command:'medtrumSetReservoir', units:+$('resIn').value}, 'Reservoir set'); };
+$('stateSet').onclick = ()=>{ edited.stateIn=false; send({command:'medtrumSetState', state:+$('stateIn').value}, 'State set'); };
+$('faultSet').onclick = ()=>{ const c=+$('faultIn').value;
   if(confirm('Fault the patch with '+hex(c)+' — '+faultName(c)+'? A faulted patch stops delivery and must be replaced.'))
     send({command:'medtrumSetFault', state:c}, 'Fault triggered'); };
-$('mfaultClear').onclick = ()=>send({command:'medtrumSetFault', state:32}, 'Fault cleared');
-$('mcrash').onclick = ()=>{ if(confirm('Reboot the base at the next command? The phone loses its in-flight command.')) send({command:'medtrumCrash'}, 'Armed'); };
-$('mnewPatch').onclick = ()=>{ if(confirm('Forget this patch? The phone will need to activate a new one.')) send({command:'medtrumReset'}, 'New patch ready'); };
+$('faultClear').onclick = ()=>send({command:'medtrumSetFault', state:32}, 'Fault cleared');
+$('crash').onclick = ()=>{ if(confirm('Reboot the base at the next command? The phone loses its in-flight command.')) send({command:'medtrumCrash'}, 'Armed'); };
+$('newPatch').onclick = ()=>{ if(confirm('Forget this patch? The phone will need to activate a new one.')) send({command:'medtrumReset'}, 'New patch ready'); };
 
 function chip(el, text, cls){ el.textContent=text; el.className='chip '+(cls||''); }
 
 function show(p){
   last = p;
-  $('mtitle').textContent = 'Medtrum patch';
-  $('mbase').textContent = p.serial;
-  $('mserial').textContent = p.serial;
-  $('mmodel').textContent = p.model + (p.model === 'MD8301' ? ' (300U)' : ' (200U)');
-  if(!edited.modelIn) $('mmodelIn').value = p.model === 'MD8301' ? '300' : '200';
-  $('mreservoir').textContent = Math.round(p.reservoir*100)/100;
-  chip($('mstate'), stateName(p.state), isFault(p.state) ? 'bad' : p.state===32 ? 'ok' : 'warn');
-  $('mstateName').textContent = stateName(p.state) + ' (' + p.state + ')';
-  $('mprime').textContent = PATCH_PRIME[p.state] || '—';
-  $('mclock').textContent = new Date((p.patchTime + 1388534400) * 1000).toISOString().replace('T',' ').slice(0,19) + ' UTC';
-  $('mbattery').textContent = p.battery.toFixed(2) + ' V';
-  $('mfault').textContent = isFault(p.state) ? hex(p.state)+' — '+faultName(p.state) : 'none';
-  if(!edited.resIn && document.activeElement!==$('mresIn')) $('mresIn').value = Math.round(p.reservoir*100)/100;
-  if(!edited.snIn && document.activeElement!==$('msnIn')) $('msnIn').value = p.serial;
-  if(!edited.stateIn) $('mstateIn').value = String(p.state);
-  chip($('mlink'), p.connected ? 'connected' : 'not connected', p.connected ? 'ok' : '');
+  $('title').textContent = 'Medtrum patch';
+  $('base').textContent = p.serial;
+  $('serial').textContent = p.serial;
+  $('model').textContent = p.model + (p.model === 'MD8301' ? ' (300U)' : ' (200U)');
+  if(!edited.modelIn) $('modelIn').value = p.model === 'MD8301' ? '300' : '200';
+  $('reservoir').textContent = Math.round(p.reservoir*100)/100;
+  chip($('state'), stateName(p.state), isFault(p.state) ? 'bad' : p.state===32 ? 'ok' : 'warn');
+  $('stateName').textContent = stateName(p.state) + ' (' + p.state + ')';
+  $('prime').textContent = PATCH_PRIME[p.state] || '—';
+  $('clock').textContent = new Date((p.patchTime + 1388534400) * 1000).toISOString().replace('T',' ').slice(0,19) + ' UTC';
+  $('battery').textContent = p.battery.toFixed(2) + ' V';
+  $('fault').textContent = isFault(p.state) ? hex(p.state)+' — '+faultName(p.state) : 'none';
+  if(!edited.resIn && document.activeElement!==$('resIn')) $('resIn').value = Math.round(p.reservoir*100)/100;
+  if(!edited.snIn && document.activeElement!==$('snIn')) $('snIn').value = p.serial;
+  if(!edited.stateIn) $('stateIn').value = String(p.state);
+  chip($('link'), p.connected ? 'connected' : 'not connected', p.connected ? 'ok' : '');
 }
 
 async function refresh(){ try { show(await (await fetch('/medtrum/status')).json()); } catch(e){} }
 refresh(); setInterval(refresh, 1000);
 
 async function fail(body, done) {
-  const msg = $('mfailMsg');
+  const msg = $('failMsg');
   msg.textContent = 'Applying…';
   try {
     const r = await fetch('/fail',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -631,13 +631,13 @@ async function fail(body, done) {
     setTimeout(()=>{ if(msg.textContent===done) msg.textContent=''; }, 2500);
   } catch(e){ msg.textContent = 'Failed — '+e.message; }
 }
-$('mfailDrop').onclick = ()=>fail({device:'medtrum', drop:true}, 'Next connection will be dropped');
-$('mfailApply').onclick = ()=>fail({device:'medtrum',
-  refuse:+$('mfailRefuse').value,
-  quietMs:+$('mfailQuiet').value*1000,
-  delayMs:+$('mfailDelay').value,
-  ignore:+$('mfailIgnore').value}, 'Failure set');
-$('mfailClear').onclick = ()=>fail({device:'medtrum', drop:false, refuse:0, quietMs:0, delayMs:0, ignore:0}, 'Failures cleared');
+$('failDrop').onclick = ()=>fail({device:'medtrum', drop:true}, 'Next connection will be dropped');
+$('failApply').onclick = ()=>fail({device:'medtrum',
+  refuse:+$('failRefuse').value,
+  quietMs:+$('failQuiet').value*1000,
+  delayMs:+$('failDelay').value,
+  ignore:+$('failIgnore').value}, 'Failure set');
+$('failClear').onclick = ()=>fail({device:'medtrum', drop:false, refuse:0, quietMs:0, delayMs:0, ignore:0}, 'Failures cleared');
 
 })();
 </script>
