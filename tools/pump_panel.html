@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP-Sim pump</title>
+<style>
+  :root { color-scheme: dark; --bg:#14161a; --card:#1d2026; --line:#2b2f37; --fg:#e8eaed; --mut:#9aa0aa; --accent:#4f9cf8; --ok:#43c06d; --warn:#e0a53b; --bad:#e2574c; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.4 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  nav { display:flex; flex-wrap:wrap; gap:2px 18px; align-items:baseline; padding:12px 16px; border-bottom:1px solid var(--line); max-width:760px; margin:0 auto; }
+  nav .brand { font-weight:600; margin-right:auto; }
+  nav a { color:var(--mut); text-decoration:none; font-size:14px; }
+  nav a:hover { color:var(--fg); }
+  nav a.active { color:var(--accent); }
+  header { padding:16px; border-bottom:1px solid var(--line); display:flex; flex-wrap:wrap; gap:4px 20px; align-items:baseline; }
+  header h1 { font-size:18px; margin:0; }
+  header .meta { color:var(--mut); font-size:13px; }
+  main { max-width:760px; margin:0 auto; padding:16px; display:grid; gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--mut); margin:0 0 12px; }
+  .big { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  .big .val { font-size:44px; font-weight:600; }
+  .big .unit { color:var(--mut); }
+  .chip { padding:3px 10px; border-radius:20px; font-size:13px; background:#2b2f37; }
+  .big .chip { margin-left:auto; }
+  .chip.ok { background:rgba(67,192,109,.18); color:var(--ok); }
+  .chip.warn { background:rgba(224,165,59,.18); color:var(--warn); }
+  .chip.bad { background:rgba(226,87,76,.18); color:var(--bad); }
+  dl { display:grid; grid-template-columns:max-content 1fr; gap:6px 16px; margin:14px 0 0; }
+  dt { color:var(--mut); }
+  dd { margin:0; }
+  label { display:block; font-size:13px; color:var(--mut); margin:10px 0 4px; }
+  input[type=number], input:not([type]), input[type=password], select { width:100%; padding:8px; background:#14161a; border:1px solid var(--line); border-radius:7px; color:var(--fg); font-size:15px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; }
+  .row > div { flex:1; min-width:140px; }
+  .checks { display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:6px 16px; }
+  .checks label { display:flex; gap:8px; align-items:center; margin:0; font-size:14px; color:var(--fg); }
+  .actions { margin-top:14px; display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; }
+  button { padding:9px 14px; background:#2b2f37; color:var(--fg); border:1px solid var(--line); border-radius:7px; font-size:14px; cursor:pointer; }
+  button:hover { border-color:var(--accent); }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline:2px solid var(--accent); outline-offset:1px; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#0b0d10; font-weight:600; }
+  button.danger:hover { border-color:var(--bad); }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--mut); font-weight:500; }
+  .muted { color:var(--mut); font-size:13px; }
+  .seg { display:flex; gap:8px; flex-wrap:wrap; }
+  .seg button { flex:1; min-width:120px; }
+  .seg button.active { background:var(--accent); border-color:var(--accent); color:#0b0d10; font-weight:600; }
+  [hidden] { display:none !important; }
+  #podPanel, #medtrumPanel { display:grid; gap:16px; }
+  footer { max-width:760px; margin:0 auto; padding:4px 16px 24px; color:var(--mut); font-size:12px; }
+</style>
+</head>
+<body>
+<nav>
+  <span class="brand">ESP-Sim</span>
+  <a href="/">Home</a>
+  <a href="/g7">CGM</a>
+  <a class="active" href="/pump">Pump</a>
+  <a href="/settings">Settings</a>
+</nav>
+<main>
+  <div class="card">
+    <h2>Simulate</h2>
+    <div class="seg" id="pumpSel">
+      <button type="button" data-pump="off">Off</button>
+      <button type="button" data-pump="pod-dash">Omnipod DASH</button>
+      <button type="button" data-pump="pod-o5">Omnipod 5</button>
+      <button type="button" data-pump="medtrum">Medtrum patch</button>
+    </div>
+    <div class="muted" style="margin-top:10px">One pump at a time. The pod and the Medtrum base are mutually exclusive: the one not selected stops advertising and releases the one BLE link.</div>
+  </div>
+  <div id="pumpOff" hidden><div class="card"><h2>Pump</h2><div class="muted">No pump is simulated. The CGM keeps working; a pump phone cannot connect.</div></div></div>
+  <div id="podPanel" hidden>
+<!--POD_PANEL-->
+  </div>
+  <div id="medtrumPanel" hidden>
+<!--MEDTRUM_PANEL-->
+  </div>
+</main>
+<footer>For development use only — test equipment. Simulated pumps deliver nothing; never use them for therapy.</footer>
+<script>
+  (function(){
+    const $ = id => document.getElementById(id);
+    const LABEL = {off:'Off','pod-dash':'Omnipod DASH','pod-o5':'Omnipod 5',medtrum:'Medtrum patch'};
+    document.querySelectorAll('#pumpSel button').forEach(b => b.onclick = async () => {
+      try {
+        await fetch('/settings/pump', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({pump: b.dataset.pump})});
+      } finally { location.reload(); }
+    });
+    async function select(){
+      let s; try { s = await (await fetch('/settings/status')).json(); } catch(e){ return; }
+      const p = LABEL[s.pump] ? s.pump : 'pod-o5';
+      document.querySelectorAll('#pumpSel button').forEach(b => b.classList.toggle('active', b.dataset.pump === p));
+      $('pumpOff').hidden = p !== 'off';
+      $('podPanel').hidden = !(p === 'pod-dash' || p === 'pod-o5');
+      $('medtrumPanel').hidden = p !== 'medtrum';
+    }
+    select();
+  })();
+</script>
+<!--POD_SCRIPT-->
+<!--MEDTRUM_SCRIPT-->
+</body>
+</html>

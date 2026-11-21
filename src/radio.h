@@ -58,12 +58,12 @@ void medtrumDisconnect();
 void medtrumAdvertise(bool on, const uint8_t sn[4]);
 bool medtrumConnected();
 
-// Which pump simulator may advertise: PUMP_BOTH (the default, pod and Medtrum
-// take turns), PUMP_POD or PUMP_MEDTRUM (only that one). Upstream ESP-Sim treats
-// the two as mutually exclusive -- a phone runs one pump app -- and a Medtrum app
-// that keys a discovered device by address cannot surface while the pod keeps
-// rewriting the same advertisement with another name.
-enum { PUMP_POD = 0, PUMP_MEDTRUM = 1, PUMP_BOTH = 2 };
+// Which pump simulator is selected: PUMP_OFF (neither advertises, and a pump
+// phone cannot hold the link), PUMP_POD or PUMP_MEDTRUM (only that one). A phone
+// runs one pump app, so the pod and the Medtrum base are mutually exclusive:
+// there is no configuration in which both advertise. The CGM is a separate
+// pane and shares the one link.
+enum { PUMP_OFF = 0, PUMP_POD = 1, PUMP_MEDTRUM = 2 };
 void setPump(int pump);
 int pump();
 }  // namespace radio

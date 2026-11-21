@@ -40,6 +40,27 @@ static inline int adv_cgm_wants(int kind, int advertising) {
     return kind != 0 && advertising;
 }
 
+/* Which pump the selector chose. The values match radio.h's PUMP_OFF /
+ * PUMP_POD / PUMP_MEDTRUM, so radio.cpp passes its selection straight in. */
+enum {
+    ADV_PUMP_OFF = 0,
+    ADV_PUMP_POD = 1,
+    ADV_PUMP_MEDTRUM = 2,
+};
+
+/* The one set's want flags, from the CGM's kind and window, the selected pump
+ * and whether the pod / Medtrum base has something to advertise. The pod and
+ * the Medtrum base are mutually exclusive: at most one of the two is set, and
+ * PUMP_OFF sets neither, whatever either one has to say. */
+static inline adv_wants_t adv_wants(int cgm_kind, int cgm_advertising, int pump,
+                                    int pod_available, int med_available) {
+    adv_wants_t w;
+    w.g7 = adv_cgm_wants(cgm_kind, cgm_advertising);
+    w.pod = pump == ADV_PUMP_POD && pod_available;
+    w.med = pump == ADV_PUMP_MEDTRUM && med_available;
+    return w;
+}
+
 /* The device that gets the set this tick: the wanted ones in order (CGM, pod,
  * Medtrum), indexed by (now_ms / 1500) % n. ADV_NONE when nobody wants it. */
 static inline int adv_rotation_slot(const adv_wants_t *w, long long now_ms) {

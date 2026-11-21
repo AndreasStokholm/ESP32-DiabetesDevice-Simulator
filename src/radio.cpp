@@ -14,6 +14,10 @@
 
 namespace radio {
 
+// adv_wants() takes the pump selection as an int; the values must be radio.h's.
+static_assert(PUMP_OFF == ADV_PUMP_OFF && PUMP_POD == ADV_PUMP_POD && PUMP_MEDTRUM == ADV_PUMP_MEDTRUM,
+              "the pump selection and the advertising-rotation want flags must agree");
+
 static const uint8_t inst = 0;  // the one advertising set
 
 // MARK: - The CGM's GATT layout (the core's characteristics, lib/cgmsim)
@@ -110,11 +114,19 @@ static uint16_t medtrumReadHandle, medtrumWriteHandle;
 static volatile bool medtrumStatusNotify = false;
 static std::string medtrumAdvData;  // guarded by mu
 static bool medtrumAdvOn = false;
-// Which pump simulator is allowed to advertise (see radio.h), and a flag that
-// forces the next tick to restart the set even if its payload is unchanged --
-// switching the selection must show up immediately, not on the next rotation.
-static int pumpSel = PUMP_BOTH;
+// Which pump simulator is selected (see radio.h), and a flag that forces the
+// next tick to restart the set even if its payload is unchanged -- switching
+// the selection must show up immediately, not on the next rotation. The default
+// is PUMP_POD, so a board with no saved choice behaves as it did before the
+// selector existed.
+static int pumpSel = PUMP_POD;
 static bool advForce = false;
+// Whether the current link is a pump's: its GATT service was written or
+// subscribed, or (with the CGM off) it connected while that pump was selected.
+// A link the CGM alone touched is not a pump's, so switching the pump selection
+// must not drop it; the flags are cleared on every disconnect.
+static volatile bool podUsed = false;
+static volatile bool medtrumUsed = false;
 
 static std::string addrString(const ble_addr_t& a) {
   char b[18];
@@ -139,11 +151,37 @@ static void medtrumPush(uint8_t type, const uint8_t* data, size_t n) {
     logf("medtrum: event queue full: a packet from the phone was dropped");
 }
 
+// The pump the selector chose. The unselected pump's service stays in the GATT
+// table (nothing invites a phone to it: its advertisement is not in the set),
+// but a phone with a cached address can still reach it. Such an access must not
+// be served, and the link must not stay held, so it is dropped.
+static bool pumpSelected(bool podSide) {
+  int sel = pump();
+  return podSide ? sel == PUMP_POD : sel == PUMP_MEDTRUM;
+}
+
+static void pumpRefuse(uint16_t c, const char* who) {
+  logf("%s: not selected; closing the link", who);
+  // This runs inside a NimBLE GATT callback, so use the server's own
+  // disconnect (the same call onConnect uses) rather than the host's GAP API.
+  if (server) server->disconnect(c);
+}
+
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
     std::string addr = addrString(desc->peer_ota_addr);
     if (conn != BLE_HS_CONN_HANDLE_NONE) {
       logf("%s: a second phone; one at a time, closing it", addr.c_str());
+      s->disconnect(desc->conn_handle);
+      return;
+    }
+    // With no pump selected and the CGM off, nothing on the board invites a
+    // phone: accept the connection (the BLE stack already has) and drop it at
+    // once, so no phone can sit on the one link. With the CGM on the link is
+    // the CGM's to use; a pump that reaches for its service anyway is dropped
+    // by the pump callbacks below.
+    if (pump() == PUMP_OFF && sensor::kind() == CGM_OFF) {
+      logf("%s: no simulator is selected; closing it", addr.c_str());
       s->disconnect(desc->conn_handle);
       return;
     }
@@ -166,6 +204,16 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     // cgmLinkUp()): a link it never touches is the pod's or the patch's, and
     // the core's CONN_MAX timer must not end it.
     cgmUsed = false;
+    // With the CGM off the link can only be a pump's, so mark the selected one
+    // now: a pump phone that connects but has not yet subscribed or written must
+    // still release the one link when the selection changes (see setPump). With
+    // the CGM on the link could be the CGM's, so the pump's first GATT event
+    // marks it instead.
+    if (sensor::kind() == CGM_OFF) {
+      int sel = pump();
+      if (sel == PUMP_POD) podUsed = true;
+      else if (sel == PUMP_MEDTRUM) medtrumUsed = true;
+    }
     podPush(DASH_EV_CONNECTED, nullptr, 0);
     medtrumPush(MEDTRUM_EV_CONNECTED, nullptr, 0);
   }
@@ -177,6 +225,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     cgmDropTimed = false;
     bool hadCgm = cgmUsed;
     cgmUsed = false;
+    podUsed = false;
+    medtrumUsed = false;
     // No stale CCCD: a notification that was queued for this link is dropped
     // (the generation check), and a new phone has to subscribe afresh.
     for (int i = 0; i < CGM_CHR_COUNT; i++) cgmSubs[i] = 0;
@@ -262,14 +312,31 @@ class PodCallbacks : public NimBLECharacteristicCallbacks {
 
   void onWrite(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
     if (desc->conn_handle != conn) return;
+    if (!pumpSelected(true)) {
+      pumpRefuse(desc->conn_handle, "pod");
+      return;
+    }
     NimBLEAttValue v = ch->getValue();
     if (v.length() > DASH_PKT_MAX) return;
     if (fail_decide(FAIL_POD, FAIL_CONSUME_MESSAGE, 0)) {
       logf("pod: injected failure: message ignored");
       return;
     }
+    podUsed = true;
     podLastTraffic = (uint32_t)monoMs();
     podPush(cmd ? DASH_EV_CMD : DASH_EV_DATA, v.data(), v.length());
+  }
+
+  // A pod phone subscribes to the data characteristic as it connects, before
+  // its first write; mark the link as the pod's then too (as the Medtrum read
+  // callback does), so a switch releases it even before any write.
+  void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc* desc, uint16_t) override {
+    if (desc && desc->conn_handle != conn) return;
+    if (!pumpSelected(true)) {
+      if (desc) pumpRefuse(desc->conn_handle, "pod");
+      return;
+    }
+    podUsed = true;
   }
 
  private:
@@ -279,18 +346,29 @@ class PodCallbacks : public NimBLECharacteristicCallbacks {
 class MedtrumWriteCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
     if (desc->conn_handle != conn) return;
+    if (!pumpSelected(false)) {
+      pumpRefuse(desc->conn_handle, "medtrum");
+      return;
+    }
     NimBLEAttValue v = ch->getValue();
     if (v.length() > MEDTRUM_FRAME_MAX) return;
     if (fail_decide(FAIL_MEDTRUM, FAIL_CONSUME_MESSAGE, 0)) {
       logf("medtrum: injected failure: message ignored");
       return;
     }
+    medtrumUsed = true;
     medtrumPush(MEDTRUM_EV_WRITE, v.data(), v.length());
   }
 };
 
 class MedtrumReadCallbacks : public NimBLECharacteristicCallbacks {
-  void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc*, uint16_t subValue) override {
+  void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc* desc, uint16_t subValue) override {
+    if (desc && desc->conn_handle != conn) return;
+    if (!pumpSelected(false)) {
+      if (desc) pumpRefuse(desc->conn_handle, "medtrum");
+      return;
+    }
+    medtrumUsed = true;
     medtrumStatusNotify = subValue != 0;
   }
 };
@@ -472,25 +550,23 @@ void tick() {
   l.unlock();
 
   // Who needs to be found? The CGM on the core's schedule (it opens a window
-  // per reading and closes it when the phone has collected); the pod whenever
-  // no phone is connected, and until it is paired; the Medtrum patch whenever
-  // it is switched on and no phone is connected. One advertising set, so when
-  // more than one wants to be found they take turns. An injected quiet window
-  // only clears that device's want flag; its payload string is untouched.
+  // per reading and closes it when the phone has collected); the selected pump
+  // when no phone is connected (and, for the pod, until it is paired). One
+  // advertising set, so when more than one wants to be found they take turns.
+  // An injected quiet window only clears that device's want flag; its payload
+  // string is untouched.
   bool connected = conn != BLE_HS_CONN_HANDLE_NONE;
-  // The pump simulators are mutually exclusive when asked to be: a phone runs an
-  // Omnipod app or a Medtrum app, not both, and a scanner that keys a device by
-  // address never sees the second name while the first keeps rewriting it.
-  bool podWant = !podData.empty() && (!connected || !paired);
-  bool medWant = medOn && !medData.empty() && !connected;
+  // The pod and the Medtrum base are mutually exclusive: exactly one of the two
+  // may advertise, and PUMP_OFF lets neither. A scanner that keys a device by
+  // address never sees the second name, because the second is never in the set.
+  // adv_wants() is the pure choice (test/medtrum/test_adv.c pins it).
   int sel = pump();
-  if (sel == PUMP_POD) medWant = false;
-  if (sel == PUMP_MEDTRUM) podWant = false;
-  adv_wants_t wants = {
-      .g7 = adv_cgm_wants((int)sensor::kind(), cgmOn && !connected) && fail_decide(FAIL_CGM, FAIL_ADVERTISE, now),
-      .pod = podWant && fail_decide(FAIL_POD, FAIL_ADVERTISE, now),
-      .med = medWant && fail_decide(FAIL_MEDTRUM, FAIL_ADVERTISE, now),
-  };
+  adv_wants_t wants = adv_wants((int)sensor::kind(), cgmOn && !connected, sel,
+                                !podData.empty() && (!connected || !paired),
+                                medOn && !medData.empty() && !connected);
+  wants.g7 = wants.g7 && fail_decide(FAIL_CGM, FAIL_ADVERTISE, now);
+  wants.pod = wants.pod && fail_decide(FAIL_POD, FAIL_ADVERTISE, now);
+  wants.med = wants.med && fail_decide(FAIL_MEDTRUM, FAIL_ADVERTISE, now);
   int choice = adv_rotation_slot(&wants, now);
   // Log the WANT set, not the slot: the slot changes every 1.5 s, the wants change
   // only when a device appears or stops. Answers "did Medtrum ever want the set?"
@@ -739,10 +815,21 @@ void medtrumDisconnect() {
 }
 
 void setPump(int p) {
-  if (p != PUMP_POD && p != PUMP_MEDTRUM && p != PUMP_BOTH) return;
-  std::lock_guard<std::mutex> l(mu);
-  pumpSel = p;
-  advForce = true;
+  if (p != PUMP_OFF && p != PUMP_POD && p != PUMP_MEDTRUM) return;
+  {
+    std::lock_guard<std::mutex> l(mu);
+    pumpSel = p;
+    advForce = true;
+  }
+  // The pump that is no longer selected must not keep the one link. A link the
+  // CGM alone touched is not a pump's, so it is left alone.
+  uint16_t c = conn;
+  bool heldByOther = (p == PUMP_OFF && (podUsed || medtrumUsed)) || (p == PUMP_POD && medtrumUsed) ||
+                     (p == PUMP_MEDTRUM && podUsed);
+  if (c != BLE_HS_CONN_HANDLE_NONE && heldByOther) {
+    logf("pump simulators: dropping the link the unselected pump held");
+    ble_gap_terminate(c, BLE_ERR_REM_USER_CONN_TERM);
+  }
 }
 
 int pump() {

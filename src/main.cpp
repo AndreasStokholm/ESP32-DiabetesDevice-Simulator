@@ -34,10 +34,9 @@
 #include "home_html.h"
 #include "index_html.h"
 #include "medtrum_app.h"
-#include "medtrum_html.h"
 #include "pod.h"
-#include "pod_html.h"
 #include "portal.h"
+#include "pump_html.h"
 #include "radio.h"
 #include "sensor_app.h"
 #include "settings_html.h"
@@ -245,6 +244,61 @@ static String savedSsid() {
   return ssid;
 }
 
+// MARK: - The pump selector
+
+// The selector's canonical values, and the old names they replace: `pod` and
+// `both` both become pod-o5 (there is no "both" any more -- the pod and the
+// Medtrum base are mutually exclusive), and `medtrum` is unchanged. Returns the
+// canonical name, or nullptr for anything else; *wasBoth is set when the old
+// "both" was seen, so the caller can say it is gone.
+static const char* canonicalPump(const char* v, bool* wasBoth) {
+  *wasBoth = false;
+  if (!v) return nullptr;
+  if (strcmp(v, "off") == 0) return "off";
+  if (strcmp(v, "pod-dash") == 0) return "pod-dash";
+  if (strcmp(v, "pod-o5") == 0) return "pod-o5";
+  if (strcmp(v, "medtrum") == 0) return "medtrum";
+  if (strcmp(v, "pod") == 0) return "pod-o5";
+  if (strcmp(v, "both") == 0) {
+    *wasBoth = true;
+    return "pod-o5";
+  }
+  return nullptr;
+}
+
+// Applies a canonical pump choice: the radio gets the selection, and a pod
+// choice also makes the pod the right type (a new pod, as `pod mode` does).
+// Only a pod that is the wrong type is reset, so a reboot keeps its state.
+static void applyPumpChoice(const char* c) {
+  if (strcmp(c, "off") == 0) {
+    radio::setPump(radio::PUMP_OFF);
+  } else if (strcmp(c, "medtrum") == 0) {
+    radio::setPump(radio::PUMP_MEDTRUM);
+  } else {
+    dash_pod_type_t want = strcmp(c, "pod-dash") == 0 ? DASH_POD_DASH : DASH_POD_O5;
+    if (pod::type() != want) pod::setType(want);
+    radio::setPump(radio::PUMP_POD);
+  }
+}
+
+// Persists the selector's canonical value and applies it. Returns that value.
+static const char* savePumpChoice(const char* c) {
+  Preferences pr;
+  pr.begin("board", false);
+  pr.putString("pump", c);
+  pr.end();
+  applyPumpChoice(c);
+  return c;
+}
+
+// What /settings/status reports: the radio's selection, with the pod's type.
+static const char* pumpChoiceName() {
+  int sel = radio::pump();
+  if (sel == radio::PUMP_OFF) return "off";
+  if (sel == radio::PUMP_MEDTRUM) return "medtrum";
+  return pod::type() == DASH_POD_O5 ? "pod-o5" : "pod-dash";
+}
+
 static void sendSettingsStatus() {
   JsonDocument d;
   d["wifi"]["ssid"] = savedSsid();
@@ -253,7 +307,7 @@ static void sendSettingsStatus() {
   d["clock"] = wallMs() ? "set from NTP" : "not set (NTP never ran)";
   d["firmware"]["commit"] = ESP_SIM_COMMIT;
   d["firmware"]["built"] = __DATE__ " " __TIME__;
-  d["pump"] = radio::pump() == radio::PUMP_POD ? "pod" : radio::pump() == radio::PUMP_MEDTRUM ? "medtrum" : "both";
+  d["pump"] = pumpChoiceName();
   sendJson(200, d);
 }
 
@@ -324,30 +378,29 @@ static void startWeb() {
     web.send(200, "text/plain", "rebooting\n");
     restartAt = monoMs() + 1000;
   });
-  // Which pump simulator advertises. A phone runs one pump app, and a Medtrum app
-  // keys a discovered device by address, so it never surfaces while the pod keeps
-  // rewriting the same advertisement with another name.
+  // Which pump simulator advertises. A phone runs one pump app, and the pod and
+  // the Medtrum base are mutually exclusive: exactly one may advertise and hold
+  // the one link. The old `pod`/`both` names are still accepted, so a saved
+  // board (and the old settings page) keeps working.
   web.on("/settings/pump", HTTP_POST, [] {
     JsonDocument j;
     if (deserializeJson(j, web.arg("plain")) || !j["pump"].is<const char*>()) {
-      web.send(400, "text/plain", "want {\"pump\":\"both|pod|medtrum\"}\n");
+      web.send(400, "text/plain", "want {\"pump\":\"off|pod-dash|pod-o5|medtrum\"}\n");
       return;
     }
-    const char* v = j["pump"].as<const char*>();
-    int p = strcmp(v, "pod") == 0 ? radio::PUMP_POD : strcmp(v, "medtrum") == 0 ? radio::PUMP_MEDTRUM : strcmp(v, "both") == 0 ? radio::PUMP_BOTH : -1;
-    if (p < 0) {
-      web.send(400, "text/plain", "pump is both, pod or medtrum\n");
+    bool wasBoth = false;
+    const char* c = canonicalPump(j["pump"].as<const char*>(), &wasBoth);
+    if (!c) {
+      web.send(400, "text/plain", "pump is off, pod-dash, pod-o5 or medtrum\n");
       return;
     }
-    radio::setPump(p);
-    Preferences pr;
-    pr.begin("board", false);
-    pr.putString("pump", v);
-    pr.end();
-    logf("pump simulators: %s", v);
-    web.send(200, "text/plain", p == radio::PUMP_BOTH ? "both pumps take turns\n"
-                                                      : p == radio::PUMP_POD ? "only the pod advertises\n"
-                                                                             : "only the Medtrum base advertises\n");
+    if (wasBoth) logf("pump simulators: \"both\" is gone; the pod and the Medtrum base are mutually exclusive; using pod-o5");
+    savePumpChoice(c);
+    logf("pump simulators: %s", c);
+    web.send(200, "text/plain", strcmp(c, "off") == 0        ? "no pump advertises\n"
+                                  : strcmp(c, "medtrum") == 0 ? "the Medtrum base advertises\n"
+                                  : strcmp(c, "pod-dash") == 0 ? "an Omnipod DASH pod advertises\n"
+                                                               : "an Omnipod 5 pod advertises\n");
   });
   web.on("/fail", HTTP_POST, [] {
     JsonDocument j;
@@ -491,8 +544,11 @@ static void startWeb() {
     restartAt = monoMs() + 1000;
   });
 
-  // The pod's panel and API (ESP-Sim's, under /pod).
-  web.on("/pod", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", podHTML); });
+  // The one pump page (the Simulate box picks Off/DASH/Omnipod 5/Medtrum);
+  // /pod and /medtrum are aliases so a bookmarked URL does not 404. Their API
+  // stays under /pod and /medtrum.
+  web.on("/pump", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", pumpHTML); });
+  web.on("/pod", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", pumpHTML); });
   web.on("/pod/status", HTTP_GET, [] {
     web.sendHeader("Cache-Control", "no-store");
     web.send(200, "application/json", pod::statusJson().c_str());
@@ -505,8 +561,8 @@ static void startWeb() {
     web.send(200, "application/json", pod::statusJson().c_str());
   });
   web.on("/pod/wifi", HTTP_POST, sendWifiSaved);
-  // The Medtrum patch's panel and API (under /medtrum).
-  web.on("/medtrum", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", medtrumHTML); });
+  // The Medtrum patch's API (under /medtrum; its page is the pump page above).
+  web.on("/medtrum", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", pumpHTML); });
   web.on("/medtrum/status", HTTP_GET, [] {
     web.sendHeader("Cache-Control", "no-store");
     web.send(200, "application/json", medtrum::statusJson().c_str());
@@ -914,8 +970,18 @@ static void command(const std::string& line) {
     else if (sub == "selftest") Serial.printf("pod self-test:\n%s", pod::selfTest().c_str());
     else if (sub == "fresh") podCommand("{\"command\":\"resetPod\"}");
     else if (sub == "mode") {
-      if (v == "dash" || v == "o5") podCommand(std::string("{\"command\":\"setPodType\",\"value\":") + (v == "o5" ? "1" : "0") + "}");
-      else Serial.println("pod mode: want dash or o5");
+      if (v == "dash" || v == "o5") {
+        std::string json = std::string("{\"command\":\"setPodType\",\"value\":") + (v == "o5" ? "1" : "0") + "}";
+        if (const char* err = pod::command(json)) {
+          Serial.printf("pod: %s\n", err);
+        } else {
+          Serial.printf("pod: %s\n", pod::statusJson().c_str());
+          // Keep the selector's saved choice in step with the pod's type.
+          savePumpChoice(v == "o5" ? "pod-o5" : "pod-dash");
+        }
+      } else {
+        Serial.println("pod mode: want dash or o5");
+      }
     } else if (sub == "crashNextCommand") {
       if (v == "before" || v == "after" || v == "true" || v == "false")
         podCommand(std::string("{\"command\":\"crashNextCommand\",\"beforeProcessing\":") + (v == "before" || v == "true" ? "true" : "false") + "}");
@@ -988,10 +1054,24 @@ void setup() {
     pr.begin("board", true);
     String p = pr.isKey("pump") ? pr.getString("pump") : "";
     pr.end();
-    if (p == "pod") radio::setPump(radio::PUMP_POD);
-    else if (p == "medtrum") radio::setPump(radio::PUMP_MEDTRUM);
-    else radio::setPump(radio::PUMP_BOTH);
-    logf("pump simulators: %s", p.isEmpty() ? "both take turns" : p.c_str());
+    bool wasBoth = false;
+    const char* c = p.length() ? canonicalPump(p.c_str(), &wasBoth) : nullptr;
+    if (wasBoth) logf("pump simulators: \"both\" is gone; the pod and the Medtrum base are mutually exclusive; using pod-o5");
+    if (c) {
+      applyPumpChoice(c);
+      if (p != c) {
+        // Rewrite the old name so the migration runs once, not every boot.
+        Preferences w;
+        w.begin("board", false);
+        w.putString("pump", c);
+        w.end();
+      }
+      logf("pump simulators: %s", c);
+    } else if (p.length()) {
+      logf("pump simulators: unknown saved value \"%s\"; using %s", p.c_str(), pumpChoiceName());
+    } else {
+      logf("pump simulators: %s", pumpChoiceName());
+    }
   }
   sensor::start();
   pod::start();

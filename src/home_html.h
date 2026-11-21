@@ -38,8 +38,7 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
   <span class="brand">ESP-Sim</span>
   <a class="active" href="/">Home</a>
   <a href="/g7">CGM</a>
-  <a href="/pod">Pod</a>
-  <a href="/medtrum">Medtrum</a>
+  <a href="/pump">Pump</a>
   <a href="/settings">Settings</a>
 </nav>
 <main>
@@ -48,13 +47,9 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
     <div class="t"><span id="cgmTitle">CGM</span><span class="go">Open &rarr;</span></div>
     <div class="s"><span class="dot" id="g7dot"></span><span id="g7line">--</span></div>
   </a>
-  <a class="card" href="/pod">
-    <div class="t"><span id="podTitle">Pod</span><span class="go">Open &rarr;</span></div>
-    <div class="s"><span class="dot" id="poddot"></span><span id="podline">--</span></div>
-  </a>
-  <a class="card" href="/medtrum">
-    <div class="t">Medtrum patch<span class="go">Open &rarr;</span></div>
-    <div class="s"><span class="dot" id="medtrumdot"></span><span id="medtrumline">--</span></div>
+  <a class="card" href="/pump">
+    <div class="t"><span id="pumpTitle">Pump</span><span class="go">Open &rarr;</span></div>
+    <div class="s"><span class="dot" id="pumpdot"></span><span id="pumpline">--</span></div>
   </a>
 </main>
 <footer>One ESP32-S3 &middot; test equipment only &middot; http://esp-sim.local/</footer>
@@ -102,31 +97,36 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
     }
   }
 
-  async function pollPod() {
+  // The one pump selected on the pump page: its name and live status.
+  async function pollPump() {
     try {
+      const sel = await get('/settings/status');
+      const pump = sel.pump || 'pod-o5';
+      if (pump === 'off') {
+        set('pumpTitle', 'Pump (off)');
+        set('pumpline', 'no pump is simulated');
+        dot('pumpdot', '');
+        return;
+      }
+      if (pump === 'medtrum') {
+        const s = await get('/medtrum/status');
+        const fault = PATCH_FAULTS.indexOf(s.state) >= 0;
+        set('pumpTitle', 'Medtrum patch');
+        set('pumpline', (s.serial || '--') + ' · ' + (s.model || '--') + ' ' +
+            (s.model === 'MD8301' ? '300' : '200') + ' U · ' + stateName(s.state) + ' · ' +
+            units(s.reservoir || 0) + ' U · ' + (s.connected ? 'connected' : 'not connected'));
+        dot('pumpdot', fault ? 'bad' : s.connected ? 'ok' : 'warn');
+        return;
+      }
       const s = await get('/pod/status');
-      set('podTitle', s.podType || 'Pod');
       const alerts = popcount(s.alerts || 0);
-      set('podline', (s.paired ? 'Paired' : 'Not paired') + ' · ' + units(s.reservoir || 0) + ' U · active ' +
+      set('pumpTitle', s.podType || 'Pod');
+      set('pumpline', (s.paired ? 'Paired' : 'Not paired') + ' · ' + units(s.reservoir || 0) + ' U · active ' +
           (s.minutesActive || 0) + ' m · ' + (alerts ? alerts + (alerts === 1 ? ' alert' : ' alerts') : 'no alerts'));
-      dot('poddot', s.connected ? 'ok' : 'warn');
+      dot('pumpdot', s.connected ? 'ok' : 'warn');
     } catch (err) {
-      set('podline', '--');
-      dot('poddot', '');
-    }
-  }
-
-  async function pollMedtrum() {
-    try {
-      const s = await get('/medtrum/status');
-      const fault = PATCH_FAULTS.indexOf(s.state) >= 0;
-      set('medtrumline', (s.serial || '--') + ' · ' + (s.model || '--') + ' ' +
-          (s.model === 'MD8301' ? '300' : '200') + ' U · ' + stateName(s.state) + ' · ' +
-          units(s.reservoir || 0) + ' U · ' + (s.connected ? 'connected' : 'not connected'));
-      dot('medtrumdot', fault ? 'bad' : s.connected ? 'ok' : 'warn');
-    } catch (err) {
-      set('medtrumline', '--');
-      dot('medtrumdot', '');
+      set('pumpline', '--');
+      dot('pumpdot', '');
     }
   }
 
@@ -141,8 +141,7 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
 
   async function poll() {
     await pollG7();
-    await pollPod();
-    await pollMedtrum();
+    await pollPump();
   }
 
   poll();

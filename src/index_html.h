@@ -54,8 +54,7 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
   <span class="brand">ESP-Sim</span>
   <a href="/">Home</a>
   <a class="active" href="/g7">CGM</a>
-  <a href="/pod">Pod</a>
-  <a href="/medtrum">Medtrum</a>
+  <a href="/pump">Pump</a>
   <a href="/settings">Settings</a>
 </nav>
 <header>
@@ -66,6 +65,17 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
   <span class="meta" id="link"></span>
 </header>
 <main>
+  <div class="card">
+    <h2>Simulate</h2>
+    <div class="seg" id="kind">
+      <button data-kind="0">Off</button>
+      <button data-kind="6">Dexcom G6</button>
+      <button data-kind="7">Dexcom G7</button>
+    </div>
+    <div class="muted" id="kindMsg" style="margin-top:8px"></div>
+    <div class="muted" style="margin-top:6px">Changing the kind starts a new sensor with a new id, so the app pairs it again: a G6's id is set below, a G7's two characters are random.</div>
+  </div>
+
   <div class="card">
     <h2>Current reading</h2>
     <div class="glucose">
@@ -78,12 +88,7 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
   </div>
 
   <div class="card">
-    <h2>What it is</h2>
-    <div class="seg" id="kind">
-      <button data-kind="6">Dexcom G6</button>
-      <button data-kind="7">Dexcom G7</button>
-      <button data-kind="0">Off</button>
-    </div>
+    <h2>Sensor</h2>
     <div class="row">
       <div>
         <label for="g6id">G6 transmitter id (6 characters: 0-9, A-Z without I/O)</label>
@@ -92,9 +97,8 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
       <div style="flex:0 0 auto; display:flex; align-items:flex-end"><button id="applyId">Set id</button></div>
     </div>
     <div style="margin-top:14px"><button class="danger" id="newSensor">New sensor, same kind</button></div>
-    <div class="muted" id="kindMsg" style="margin-top:8px"></div>
-    <div class="muted" style="margin-top:6px">Changing the kind starts a new sensor with a new id, so the app pairs it again: a G6's id is set here, a G7's two characters are random. 
-    "New sensor" restarts the session of the kind now in use.</div>
+    <div class="muted" id="sensorMsg" style="margin-top:8px"></div>
+    <div class="muted" style="margin-top:6px">"New sensor" restarts the session of the kind now in use.</div>
   </div>
 
   <div class="card">
@@ -207,8 +211,8 @@ function sync(id, val){ const el = document.getElementById(id); if(document.acti
 
 document.querySelectorAll('#kind button').forEach(b=>b.onclick=()=>
   cmd({command:'cgmSetKind', kind:+b.dataset.kind}, 'kindMsg', 'Set'));
-document.getElementById('applyId').onclick = ()=>cmd({command:'cgmSetId', id:document.getElementById('g6id').value.trim()}, 'kindMsg', 'Id set');
-document.getElementById('newSensor').onclick = ()=>cmd({command:'cgmNewSensor', kind:(s.kind||7)}, 'kindMsg', 'New sensor started');
+document.getElementById('applyId').onclick = ()=>cmd({command:'cgmSetId', id:document.getElementById('g6id').value.trim()}, 'sensorMsg', 'Id set');
+document.getElementById('newSensor').onclick = ()=>cmd({command:'cgmNewSensor', kind:(s.kind||7)}, 'sensorMsg', 'New sensor started');
 document.getElementById('applyGlucose').onclick = ()=>cmd({command:'cgmSetGlucose',
   glucose:+document.getElementById('glucoseIn').value,
   trend:Math.round(+document.getElementById('trendIn').value*10)}, 'glucoseMsg', 'Applied ✓');

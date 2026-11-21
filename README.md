@@ -1,11 +1,12 @@
 # ESP32 Diabetes Device Simulator
 
-One ESP32-S3 that is an **Omnipod pod simulator** (DASH or Omnipod 5), a **Dexcom G6
-transmitter / G7 sensor simulator**, and a **Medtrum patch simulator**. On a test phone, add
-the CGM in the app and also the pod (from Loop or Trio) or the patch (from a
-MedtrumKit-capable app): the app has a CGM and a pump, with no real hardware. A new board
-starts as an Omnipod 5; one button switches it to DASH and back. The CGM is a Dexcom **G7**
-sensor, or a **G6** transmitter if you give it a 6-character transmitter id on the panel.
+One ESP32-S3 that simulates **one CGM and one pump at a time**, each chosen on its own page.
+The CGM page (`/g7`) picks Off, a **Dexcom G6** transmitter or a **Dexcom G7** sensor; the
+pump page (`/pump`) picks Off, an **Omnipod DASH** pod, an **Omnipod 5** pod or a **Medtrum
+patch**. Everything not chosen is off: it does not advertise and does not hold the board's
+single Bluetooth link. On a test phone, add the chosen CGM in the app and the chosen pump
+(from Loop or Trio, or a MedtrumKit-capable app): the app has a CGM and a pump, with no real
+hardware. A new board starts as a Dexcom G7 and an Omnipod 5.
 
 > **Test equipment only.** Not a Dexcom, Insulet or Medtrum product, and not a medical
 > device. It delivers no insulin and every value it reports is made up. Never use it, or an
@@ -22,18 +23,18 @@ It builds on two projects:
   shape of this board's console and JSON API (see
   [Differences](#differences-from-the-originals)).
 
-## How one board is three devices
+## How one board is a CGM and a pump
 
 A phone can't hold several Bluetooth connections to the same radio, so the board can't be
 several separate devices to one phone. Instead it is **one Bluetooth device** that carries
-the pod's, the CGM's and the Medtrum base's services. The app's pod code, its CGM code and
-its MedtrumKit code each connect to "their" device and share the single connection
-underneath.
+the selected CGM's service and the selected pump's service. The app's CGM code and its pump
+code each connect to "their" device and share the single connection underneath.
 
-- **Advertising** takes turns on one Bluetooth 5 advertising set: the pod's advertisement
-  (` :: Fake POD ::`), the CGM's (the `0xFEBC` service plus its name, `Dexcomxx` for a G6
-  or `DXCMxx` for a G7) and the Medtrum base's (`MT` plus its serial), depending on which
-  needs to be found. Each keeps its own bytes exactly; they cannot be merged into one
+- **Advertising** takes turns on one Bluetooth 5 advertising set: the CGM's advertisement
+  (the `0xFEBC` service plus its name, `Dexcomxx` for a G6 or `DXCMxx` for a G7) and the
+  selected pump's. The pod's (` :: Fake POD ::`) and the Medtrum base's (`MT` plus its
+  serial) are **mutually exclusive**: exactly one of the two may advertise, and the pump
+  page's Off lets neither. Each keeps its own bytes exactly; they cannot be merged into one
   payload.
 - **The CGM advertises around each reading**, as a real sensor does: a 60-second window
   after a reading, and only while that reading has not been collected.
@@ -100,7 +101,8 @@ flash.
   *Erase device* unticked, or run `git pull` and `pio run -t upload`.
 - **Starting over** wipes all of that. Tick *Erase device* in the browser, or run
   `pio run -t erase` and then `pio run -t upload`. To replace only the sensor, pod or
-  patch, use `new`, `pod fresh`, or **New patch** on the Medtrum panel instead.
+  patch, use `new`, `pod fresh`, or **New patch** on the pump page's Medtrum panel
+  instead.
 
 ### If flashing fails
 
@@ -141,16 +143,17 @@ core (and the G6 mode in particular) has not been on hardware yet.
 
 - **CGM:** add a Dexcom G7 in the app; it finds the board as `DXCMxx` (`xx` is the id the
   panel shows), and there is **no pairing code**: the board reports itself as already
-  bonded. For a **G6**, switch the kind on the `/g7` panel, then enter the **6-character
-  transmitter id** there (`81ABC2`-style: digits and capitals, no I or O) and the same id in
-  the app; the board then advertises as `Dexcomxx` with that transmitter's id.
-- **Pod:** pair a new Omnipod 5 pod, which is what a new board starts as. For DASH, switch
-  the pod type first: the **Switch to DASH** button on either panel, or `pod mode dash`.
-  The button always offers the other type, and switching starts a new, unpaired pod.
-- **Medtrum patch:** activate a patch in an app with MedtrumKit support. The base serial
-  is `4A12D828` for a 200 U base (MD0201) and `52DF1614` for a 300 U base (MD8301). The
-  patch panel's **Set model** swaps the serial and model together; switching either ends
-  the current activation, so the app activates a fresh patch.
+  bonded. For a **G6**, pick **Dexcom G6** in the CGM page's **Simulate** box, then enter the
+  **6-character transmitter id** there (`81ABC2`-style: digits and capitals, no I or O) and
+  the same id in the app; the board then advertises as `Dexcomxx` with that transmitter's
+  id.
+- **Pump:** choose the pump in the pump page's **Simulate** box. Pick **Omnipod 5** (what a
+  new board starts as) or **Omnipod DASH** and pair a new pod of that type; switching type
+  starts a new, unpaired pod. Pick **Medtrum patch** and activate a patch in an app with
+  MedtrumKit support: the base serial is `4A12D828` for a 200 U base (MD0201) and
+  `52DF1614` for a 300 U base (MD8301). The patch panel's **Set model** swaps the serial and
+  model together; switching either ends the current activation, so the app activates a
+  fresh patch.
 
 Use a **test phone**, never one that runs a real sensor, pod or patch.
 
@@ -188,33 +191,40 @@ itself never shows the AP password: the reader is already on the AP.
 The sheet is also at `http://192.168.4.1/setup`. To put the board on your network later,
 use `/settings` or `wifi <name> <password>`.
 
-All pages share one nav: **Home, CGM (at `/g7`), Pod, Medtrum, Settings**.
+All pages share one nav: **Home, CGM, Pump, Settings**.
 
-- `/` is the home page: one card per simulator with a live line (the CGM's kind, name,
-  glucose and state from `/g7/status`; pod type, pairing, reservoir, active minutes and
-  alerts; Medtrum serial, model, state, reservoir and connection), plus a no-clock banner
-  that links to `/setup`.
-- `/g7` is the CGM panel: the kind (Dexcom G6 / Dexcom G7 / off), a G6 transmitter id, the
-  next reading and its trend, a calibration, the sensor state, signal loss, skip warm-up,
-  a new sensor, and the failure-injection card.
-- `/pod` is the pod panel: reservoir, pod age, alerts, faults, crash on the next command,
-  the pod type switch, new pod.
-- `/medtrum` is the patch panel: model and serial, reservoir, patch state, fault, crash,
-  new patch.
+- `/` is the home page: two cards, **CGM** and **Pump**, each showing the selected device
+  and its live line (the CGM's kind, name, glucose and state from `/g7/status`; the selected
+  pump's type, pairing, reservoir and connection), plus a no-clock banner that links to
+  `/setup`.
+- `/g7` is the CGM page: a **Simulate** box at the top (Off / Dexcom G6 / Dexcom G7), then
+  a G6 transmitter id, the next reading and its trend, a calibration, the sensor state,
+  signal loss, skip warm-up, a new sensor, and the failure-injection card.
+- `/pump` is the pump page: a **Simulate** box at the top (Off / Omnipod DASH / Omnipod 5 /
+  Medtrum patch), then the selected pump's panel only — the pod's reservoir, pod age,
+  alerts, faults, crash and new pod, or the patch's model and serial, reservoir, state,
+  fault, crash and new patch. `/pod` and `/medtrum` are aliases for this page, so an old
+  bookmark still works.
 - `/settings` owns the board: joined SSID and address, clock/NTP state, join or forget the
-  network, firmware, hardware, and reboot. Wi‑Fi setup left the device panels for here.
+  network, the selected pump (a read-out that links to `/pump`), firmware, hardware, and
+  reboot. Wi‑Fi setup left the device pages for here.
 - `/setup` is the captive-portal Wi‑Fi sheet (also at `http://192.168.4.1/setup`).
+
+The pod and the Medtrum base are **mutually exclusive**: a phone runs one pump app, and the
+board has one BLE link, so exactly one of the two may advertise and hold it. Selecting a
+pump stops the other one advertising and drops any link it held; selecting Off leaves no
+pump advertising and no pump connection accepted. The CGM keeps its own link either way.
 
 The JSON APIs are the originals': g7sim's four stay at the root (`/status`, `/glucose`,
 `/forget`, `/new`), and the CGM's own core has `/g7/status` and `/g7/command`; loopkit/pod's
 are under `/pod` (`/pod/status`, `/pod/command`), the patch's under `/medtrum`
-(`/medtrum/status`, `/medtrum/command`), plus `/settings/status`, `/settings/wifi`,
-`/settings/forget`, `/settings/reboot` and `/fail` (see
+(`/medtrum/status`, `/medtrum/command`), plus `/settings/status`, `/settings/pump` (the
+selector), `/settings/wifi`, `/settings/forget`, `/settings/reboot` and `/fail` (see
 [Failure injection](#failure-injection)). `/setup/wifi`, `/pod/wifi` and `/medtrum/wifi`
 are aliases to the same save handler.
 
 The console commands below cover the CGM, the pod and the board; the Medtrum patch is
-controlled from its panel or `/medtrum/command`.
+controlled from the pump page or `/medtrum/command`.
 
 ## Commands
 
@@ -404,7 +414,7 @@ The host suites need only `cc` and `make` (no PlatformIO, no board):
 | Command | What it covers |
 |---|---|
 | `make -C test/cgm` | The CGM core, with ESP-Sim's own checks (the sources are byte-identical) |
-| `make -C test/medtrum` | The patch core, the 3-way advertising rotation and the bytes of all three advertisements |
+| `make -C test/medtrum` | The patch core, the advertising-rotation choice and the bytes of all three advertisements |
 | `make -C test/fail` | The failure-injection decisions (drop, refuse, quiet, delay, ignore) for each device |
 | `make -C test/portal` | The captive-portal probe and redirect decision |
 
@@ -416,8 +426,8 @@ platform split behind a fake-able interface.
 
 ## Failure injection
 
-The **Failure injection** card on `/g7`, `/pod` and `/medtrum`, the console's `fail`
-command and `/fail` put real Bluetooth failures in front of the simulators. All five knobs
+The **Failure injection** card on `/g7` and on the selected pump's panel on `/pump`, the
+console's `fail` command and `/fail` put real Bluetooth failures in front of the simulators. All five knobs
 are enforced by the radio; the values live in RAM and reset on reboot.
 
 | Knob | What it does | pod | CGM (`g7`) | Medtrum |
@@ -509,18 +519,19 @@ Devices we want to add:
 - **ESP-Sim** is an ESP-IDF project; here its **portable cores** run under Arduino/PlatformIO
   with new board glue in place of its `main/`: `lib/dashpod` (`src/pod.cpp`), `lib/cgmsim`
   (`src/sensor_app.cpp`) and `lib/medtrumpatch` (`src/medtrum_app.cpp`), plus each device's
-  side of `src/radio.cpp`. The pod's panel moved to `/pod`, and its pod type dropdown became
-  one switch button. A new board starts as an Omnipod 5, where ESP-Sim starts as a DASH.
-  The pod core gained loopkit/pod's `ignoreNextMessages` and `failNextConnects` commands.
-  ESP-Sim's host tests are not copied, except the CGM's (`make -C test/cgm`, the same
-  checks ESP-Sim runs).
+  side of `src/radio.cpp`. The pod's panel moved to the pump page at `/pump`, where the pump
+  type is one of the Simulate box's choices rather than a dropdown. A new board starts as an
+  Omnipod 5, where ESP-Sim starts as a DASH. The pod core gained loopkit/pod's
+  `ignoreNextMessages` and `failNextConnects` commands. ESP-Sim's host tests are not copied,
+  except the CGM's (`make -C test/cgm`, the same checks ESP-Sim runs).
 - **ESP-Sim's Medtrum patch** is ported here as a third device. Its portable patch core
   (`lib/medtrumpatch`, plain C with no ESP-IDF or mbedTLS) runs under Arduino/PlatformIO
   with new board glue (`src/medtrum_app.cpp`, and the patch's side of `src/radio.cpp`).
-  The one radio now takes turns between the pod's, the CGM's and the Medtrum pump base's
-  advertisements. The patch's panel is at `/medtrum`, its host tests run with
-  `make -C test/medtrum`, and its controls are the panel and `/medtrum/command` (there is
-  no console command prefix for it).
+  The one radio takes turns between the CGM's advertisement and the selected pump's; the pod
+  and the Medtrum base are mutually exclusive, so at most one of them is ever in the set.
+  The patch's panel is the pump page at `/pump` (the Medtrum patch choice), its host tests
+  run with `make -C test/medtrum`, and its controls are the panel and `/medtrum/command`
+  (there is no console command prefix for it).
 - **The CGM is ESP-Sim's core**, not the g7sim port. `lib/cgmsim` is ESP-Sim's portable
   G6/G7 protocol, verbatim, with `src/sensor_app.cpp` for its clock, flash and task and the
   CGM's side of `src/radio.cpp`. The g7sim port that used to run the G7 (`src/sensor.cpp`,
@@ -553,11 +564,12 @@ Devices we want to add:
   headers) is kept in the tree for reference but left out of the build by
   `platformio.ini`'s `build_src_filter`, so it costs no flash and cannot be compiled back
   in by accident.
-- **Pages and the captive portal** are new here: `/` is a home page, `/g7` the CGM panel,
-  `/pod` and `/medtrum` the device panels, and `/settings` the board (network, clock,
-  firmware, reboot). The board's own access point answers as a captive portal and serves
-  the Wi-Fi sheet at `/setup`; dismissing it sets a `setup=done` cookie. The
-  failure-injection card is on the three device panels, backed by `/fail`.
+- **Pages and the captive portal** are new here: `/` is a home page, `/g7` the CGM page,
+  `/pump` the pump page (`/pod` and `/medtrum` alias it), and `/settings` the board
+  (network, clock, firmware, reboot). The board's own access point answers as a captive
+  portal and serves the Wi-Fi sheet at `/setup`; dismissing it sets a `setup=done` cookie.
+  The failure-injection card is on the CGM page and on the selected pump's panel, backed by
+  `/fail`.
 
 ## Layout
 
@@ -574,10 +586,11 @@ Devices we want to add:
 | `src/main.cpp` | Boot, Wi‑Fi, captive-portal routes, web pages, failure API, console |
 | `src/portal.h`, `src/portal.cpp` | The pure captive-probe and AP-mode redirect decision |
 | `src/fail.h`, `src/fail.cpp` | The pure failure-injection state machine |
-| `src/home_html.h` | The home page with one card per simulator |
-| `src/index_html.h` | The CGM panel |
-| `src/pod_html.h`, `src/medtrum_html.h` | Generated pod and patch panels |
-| `src/settings_html.h` | The Settings page (Network + Board) |
+| `src/home_html.h` | The home page with two cards, CGM and Pump |
+| `src/index_html.h` | The CGM page |
+| `src/pump_html.h` | The pump page (generated) |
+| `src/pod_html.h`, `src/medtrum_html.h` | The pod and patch panels (generated; now folded into the pump page) |
+| `src/settings_html.h` | The Settings page (Network, pump read-out, Board) |
 | `src/setup_html.h` | The captive-portal Wi‑Fi sheet |
 | `src/adv_rotation.h` | The pure advertising-rotation choice, shared with `test/medtrum/test_adv.c` |
 | `src/adv_payload.h` | The pure builders for the three advertising payloads and the name field, pinned by the same test |
@@ -586,8 +599,9 @@ Devices we want to add:
 | `test/portal/` | Host tests for the captive-portal decision |
 | `test/fail/` | Host tests for the failure-injection state |
 | `flasher/`, `tools/make_flasher.sh` | The browser flasher |
-| `tools/pod_panel.html`, `tools/gen_pod_panel.py` | The pod's web panel and its generator |
-| `tools/medtrum_panel.html`, `tools/gen_medtrum_panel.py` | The patch's web panel and its generator |
+| `tools/pump_panel.html`, `tools/gen_pump_panel.py` | The pump page's shell and its generator (reuses the pod and Medtrum panels) |
+| `tools/pod_panel.html`, `tools/gen_pod_panel.py` | The pod panel source and its generator |
+| `tools/medtrum_panel.html`, `tools/gen_medtrum_panel.py` | The patch panel source and its generator |
 | `tools/g7client.py`, `tools/podcheck.py` | Test clients for a Mac (`g7client.py` speaks the retired g7sim pairing and no longer works) |
 
 ## License
