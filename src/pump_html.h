@@ -237,6 +237,8 @@ static const char pumpHTML[] PROGMEM = R"PUMPHTML(<!doctype html>
       <div style="flex:0"><button class="primary" id="msnSet">Set serial</button></div>
     </div>
     <div class="muted" style="margin-top:8px">Type this exact string in the app when it asks for the base serial: 4A12D828 is a 200U base (MD0201), 52DF1614 a 300U base (MD8301). A serial the app cannot derive a model from is refused here.</div>
+    <label style="display:flex;gap:8px;align-items:center;margin-top:10px;font-size:14px;color:var(--fg)"><input type="checkbox" id="msnRev"> Advertise the serial reversed</label>
+    <div class="muted" style="margin-top:6px">Off (ESP-Sim's order) advertises 4A 12 D8 28. On advertises 28 D8 12 4A, which is what an app comparing the advertisement with the reverse of the typed serial expects. Only the advertisement changes; the serial above stays the one you type.</div>
   </section>
 
   <section class="card" aria-labelledby="mh-res">
@@ -586,6 +588,7 @@ async function send(body, done){
 
 $('modelSet').onclick = ()=>{ edited.modelIn=false; send({command:'medtrumSetModel', units:+$('modelIn').value}, 'Model set'); };
 $('snSet').onclick = ()=>{ edited.snIn=false; send({command:'medtrumSetSerial', sn:$('snIn').value.trim().toUpperCase()}, 'Serial set'); };
+$('snRev').onchange = ()=>send({command:'medtrumSetSnOrder', reversed:$('snRev').checked}, $('snRev').checked ? 'Advertising it reversed' : 'Advertising ESP-Sim order');
 $('resSet').onclick = ()=>{ edited.resIn=false; send({command:'medtrumSetReservoir', units:+$('resIn').value}, 'Reservoir set'); };
 $('stateSet').onclick = ()=>{ edited.stateIn=false; send({command:'medtrumSetState', state:+$('stateIn').value}, 'State set'); };
 $('faultSet').onclick = ()=>{ const c=+$('faultIn').value;
@@ -613,6 +616,7 @@ function show(p){
   $('fault').textContent = isFault(p.state) ? hex(p.state)+' — '+faultName(p.state) : 'none';
   if(!edited.resIn && document.activeElement!==$('resIn')) $('resIn').value = Math.round(p.reservoir*100)/100;
   if(!edited.snIn && document.activeElement!==$('snIn')) $('snIn').value = p.serial;
+  $('snRev').checked = !!p.snReversed;
   if(!edited.stateIn) $('stateIn').value = String(p.state);
   chip($('link'), p.connected ? 'connected' : 'not connected', p.connected ? 'ok' : '');
 }

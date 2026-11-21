@@ -70,6 +70,24 @@ static const medtrum_io_t io = {
 
 // MARK: - The serial and its model
 
+// Which bytes the advertisement carries. MedtrumKit compares the advertisement's
+// manufacturer bytes with the reverse of the serial the user typed
+// (BluetoothManager.swift:271-287), so with the panel showing the typed order the
+// base must advertise it reversed -- but ESP-Sim (whose PR worked) advertised it
+// as typed. Both readings are defensible and only hardware can settle it, so it is
+// a switch, persisted in NVS, and the panel exposes it.
+static bool reverseSn = false;
+
+static void advertiseNow() {
+  uint8_t sn[4];
+  memcpy(sn, patch.sn, 4);
+  if (reverseSn) {
+    uint8_t r[4] = {sn[3], sn[2], sn[1], sn[0]};
+    memcpy(sn, r, 4);
+  }
+  io.advertise(io.ctx, true, sn);
+}
+
 // MedtrumKit reads the serial big-endian and simpleDecrypts it.
 static const char* modelName(const uint8_t sn[4]) {
   uint32_t word = ((uint32_t)sn[0] << 24) | ((uint32_t)sn[1] << 16) | ((uint32_t)sn[2] << 8) | sn[3];
@@ -200,6 +218,10 @@ void begin() {
   }
   mu = xSemaphoreCreateMutex();
   medtrum_request_init(&req);
+  {
+    uint8_t rev = 0;
+    if (nvs_get_u8(nvs, "revsn", &rev) == ESP_OK) reverseSn = rev != 0;
+  }
 
   medtrum_saved_t st;
   bool have = loadState(&st);
@@ -232,7 +254,7 @@ void begin() {
 }
 
 void start() {
-  radio::medtrumAdvertise(true, patch.sn);
+  advertiseNow();
   xTaskCreatePinnedToCore(
       [](void*) {
         medtrumTask(nullptr);
@@ -244,6 +266,24 @@ void start() {
 // MARK: - The panel
 
 // The number after "key": in a small JSON object, or false.
+static bool jsonBool(const char* j, const char* key, bool* out) {
+  char pat[24];
+  snprintf(pat, sizeof pat, "\"%s\"", key);
+  const char* p = strstr(j, pat);
+  if (!p) return false;
+  p += strlen(pat);
+  while (*p == ' ' || *p == ':' || *p == '\t') p++;
+  if (strncmp(p, "true", 4) == 0) {
+    *out = true;
+    return true;
+  }
+  if (strncmp(p, "false", 5) == 0) {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
 static bool jsonNumber(const char* j, const char* key, long* out) {
   char pat[24];
   snprintf(pat, sizeof pat, "\"%s\"", key);
@@ -293,11 +333,12 @@ std::string statusJson() {
   LOCKED({
     n = snprintf(json, sizeof json,
                  "{\"serial\":\"%02X%02X%02X%02X\",\"model\":\"%s\",\"state\":%u,"
-                 "\"reservoir\":%.2f,\"battery\":%.2f,\"patchTime\":%u,\"connected\":%s}",
+                 "\"reservoir\":%.2f,\"battery\":%.2f,\"patchTime\":%u,\"connected\":%s,"
+                 "\"snReversed\":%s}",
                  patch.sn[0], patch.sn[1], patch.sn[2], patch.sn[3], modelName(patch.sn),
                  (unsigned)patch.status.state, patch.status.reservoir * 0.05,
                  (double)(patch.status.battery >> 12) / 512.0, (unsigned)patch.delivery.patch_time,
-                 radio::medtrumConnected() ? "true" : "false");
+                 radio::medtrumConnected() ? "true" : "false", reverseSn ? "true" : "false");
   });
   if (n <= 0 || n >= (int)sizeof json) return "{}";
   return std::string(json, n);
@@ -326,7 +367,16 @@ const char* command(const std::string& json) {
       memcpy(patch.sn, sn, 4);
       patch.authenticated = false;
       saveState();
-      io.advertise(io.ctx, true, patch.sn);
+      advertiseNow();
+    });
+  } else if (strcmp(cmd, "medtrumSetSnOrder") == 0) {
+    bool rev;
+    if (!jsonBool(body, "reversed", &rev)) return "reversed is true or false";
+    LOCKED({
+      reverseSn = rev;
+      nvs_set_u8(nvs, "revsn", rev ? 1 : 0);
+      nvs_commit(nvs);
+      advertiseNow();
     });
   } else if (strcmp(cmd, "medtrumSetModel") == 0) {
     if (!jsonNumber(body, "units", &v) || (v != 200 && v != 300)) return "units is 200 or 300";
@@ -341,7 +391,7 @@ const char* command(const std::string& json) {
       memcpy(patch.sn, sn, 4);
       patch.authenticated = false;
       saveState();
-      io.advertise(io.ctx, true, patch.sn);
+      advertiseNow();
     });
   } else if (strcmp(cmd, "medtrumSetReservoir") == 0) {
     double units;
