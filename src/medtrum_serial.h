@@ -1,11 +1,19 @@
 /* The base serial, and the check that keeps the panel and the app agreeing.
  *
- * There is ONE order, and it is the order the advertisement carries: a 200U base
- * advertises 4A 12 D8 28 and the user types 4A12D828, a 300U base advertises
- * 52 DF 16 14 and the user types 52DF1614. MedtrumKit looks like it reverses the
- * typed serial (BluetoothManager.swift:271), but its Data.toInt64() is
- * little-endian, so the two reversals cancel: the string it validates is this
- * order. Proven with the core's own decrypt, in test/medtrum/serial_tests:
+ * There are TWO orders, and they are related by a reversal:
+ *
+ *   the user types   4A12D828      (the panel shows this string)
+ *   the advertisement carries     28 D8 12 4A     <-- reverse of what was typed
+ *
+ * MedtrumKit's scan compares the advertisement's manufacturer bytes with the
+ * reverse of the typed serial (BluetoothManager.swift:271,287), so the
+ * advertisement must carry the reverse. Its model check reads the typed serial
+ * through Data.toInt64(), which is little-endian, and that cancellation is what
+ * makes 4A12D828 validate as MD0201. Confirmed on hardware: with the reversed
+ * advertisement Trio finds and offers the base.
+ *
+ * The model the app derives from the typed serial, measured with the core's own
+ * decrypt (test/medtrum/serial_tests pins these numbers):
  *
  *   4A12D828 -> 126022576  MD0201      (valid)
  *   28D8124A -> 1847467079 INVALID
@@ -71,4 +79,13 @@ static inline const char *medtrum_serial_model(const uint8_t sn[4]) {
 
 static inline bool medtrum_serial_valid(const uint8_t sn[4]) {
     return strcmp(medtrum_serial_model(sn), "INVALID") != 0;
+}
+
+/* The bytes the advertisement must carry for a serial the user typed: the
+ * reverse. This is the one conversion in the firmware, and Trio needs it. */
+static inline void medtrum_serial_advert_bytes(const uint8_t sn[4], uint8_t out[4]) {
+    out[0] = sn[3];
+    out[1] = sn[2];
+    out[2] = sn[1];
+    out[3] = sn[0];
 }

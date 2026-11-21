@@ -153,11 +153,9 @@ core (and the G6 mode in particular) has not been on hardware yet.
   new board starts as) or **Omnipod DASH** and pair a new pod of that type; switching type
   starts a new, unpaired pod. Pick **Medtrum patch** and activate a patch in an app with
   MedtrumKit support: the base serial is `4A12D828` for a 200 U base (MD0201) and
-  `52DF1614` for a 300 U base (MD8301) -- the panel shows the same string and refuses a
-  serial the app would reject. The panel's **Advertise the serial reversed** switch changes
-  only the bytes in the advertisement (off: `4A 12 D8 28`, ESP-Sim's order; on:
-  `28 D8 12 4A`, for an app that compares the advertisement with the reverse of the typed
-  serial). Try it on if a pump app scans but never offers the base. The patch panel's **Set model** swaps the serial and
+  `52DF1614` for a 300 U base (MD8301) -- the panel shows the same string, refuses a serial
+  the app would reject, and advertises it reversed (`28 D8 12 4A`), because the app matches
+  the advertisement against the reverse of what you type. The patch panel's **Set model** swaps the serial and
   model together; switching either ends the current activation, so the app activates a
   fresh patch.
 

@@ -55,7 +55,24 @@ static void test_parse_rejects(void) {
     CHECK(!medtrum_serial_parse(NULL, sn));
 }
 
+/* The advertisement must carry the typed serial reversed. Trio was only found
+ * with it reversed on hardware; if this flips, the base stops being offered. */
+static void test_advert_bytes(void) {
+    uint8_t sn[4] = {0}, adv[4] = {0};
+    CHECK(medtrum_serial_parse("4A12D828", sn));
+    medtrum_serial_advert_bytes(sn, adv);
+    CHECK(adv[0] == 0x28 && adv[1] == 0xD8 && adv[2] == 0x12 && adv[3] == 0x4A);
+    CHECK(medtrum_serial_parse("52DF1614", sn));
+    medtrum_serial_advert_bytes(sn, adv);
+    CHECK(adv[0] == 0x14 && adv[1] == 0x16 && adv[2] == 0xDF && adv[3] == 0x52);
+    /* reversing twice is the identity */
+    uint8_t back[4] = {0};
+    medtrum_serial_advert_bytes(adv, back);
+    CHECK(back[0] == 0x52 && back[1] == 0xDF && back[2] == 0x16 && back[3] == 0x14);
+}
+
 int main(void) {
+    test_advert_bytes();
     test_accepted();
     test_rejected_by_the_app();
     test_parse_rejects();
