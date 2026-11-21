@@ -745,6 +745,10 @@ void podDisconnect() {
   if (c != BLE_HS_CONN_HANDLE_NONE) ble_gap_terminate(c, BLE_ERR_REM_USER_CONN_TERM);
 }
 
+// These two are REQUESTS. The pump selector (radio::pump()) decides whose payload
+// the pump advertising set actually carries; only tick() logs what went on air
+// ("advertising <label> (n bytes)"), so a "wants" line here is not evidence that
+// the device is on the air.
 void podAdvertise(const dash_adv_t* adv) {
   bool o5 = adv->pod_type == DASH_POD_O5;
   // The pod's bytes are the reference's; the pure builders in adv_payload.h
@@ -769,7 +773,7 @@ void podAdvertise(const dash_adv_t* adv) {
     podPaired = paired;
     podAdvData = p;
   }
-  logf("pod: advertising as %s %s pod (fault 0x%02x, alerts 0x%02x)", paired ? "a paired" : "an unpaired",
+  logf("pod: wants the advertising set as %s %s pod (fault 0x%02x, alerts 0x%02x)", paired ? "a paired" : "an unpaired",
        o5 ? "Omnipod 5" : "DASH", adv->fault, adv->alerts);
 }
 
@@ -856,7 +860,7 @@ void medtrumAdvertise(bool on, const uint8_t sn[4]) {
     medtrumAdvOn = on;
     medtrumAdvData = p;
   }
-  logf("medtrum: %s, serial %02X%02X%02X%02X", on ? "advertising" : "not advertising", snv[0], snv[1], snv[2],
+  logf("medtrum: %s the advertising set, serial %02X%02X%02X%02X", on ? "wants" : "releases", snv[0], snv[1], snv[2],
        snv[3]);
 }
 
