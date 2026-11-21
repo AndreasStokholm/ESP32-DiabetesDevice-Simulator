@@ -11,13 +11,19 @@ CFLAGS ?= -O1 -g
 WARN := -Wall -Wextra -Werror
 CFLAGS += -std=c11 -D_DEFAULT_SOURCE -I$(MED)/include -I.
 
-all: medtrum_tests
+all: medtrum_tests adv_payload_tests
 	./medtrum_tests
+	./adv_payload_tests
 
 medtrum_tests: $(SRCS) $(wildcard $(MED)/include/*.h) test.h
 	$(CC) $(CFLAGS) $(WARN) -o $@ $(SRCS)
 
+# The three payload builders are in src/adv_payload.h, the same pure header
+# src/radio.cpp uses, so this pins the production bytes rather than a copy.
+adv_payload_tests: test_adv_payload.c ../../src/adv_payload.h
+	$(CC) $(CFLAGS) $(WARN) -I../../src -o $@ test_adv_payload.c
+
 clean:
-	rm -f medtrum_tests
+	rm -f medtrum_tests adv_payload_tests
 
 .PHONY: all clean

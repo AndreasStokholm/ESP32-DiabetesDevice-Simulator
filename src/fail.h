@@ -8,7 +8,7 @@
 //
 //   drop     one connection is accepted, then dropped at once
 //   refuse   the next N connections are accepted, then dropped
-//   quiet    the device is left out of the advertising rotation for that time
+//   quiet    the device is left out of its advertising set for that time
 //   delay    every outgoing notification waits that long (the CGM's too: its
 //            notifications have a task of their own, so the wait never holds
 //            the CGM core's mutex)
