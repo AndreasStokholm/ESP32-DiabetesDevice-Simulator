@@ -21,7 +21,6 @@
 #include <string.h>
 #include <sys/time.h>
 
-#include "medtrum_serial.h"
 #include "radio.h"
 #include "util.h"
 
@@ -70,9 +69,7 @@ static const medtrum_io_t io = {
 
 // MARK: - The serial and its model
 
-// The wire bytes are the advertisement's; the app asks the user for their reverse
-// (medtrum_serial.h). The panel shows the app order, so what you read is what you
-// type in Trio. MedtrumKit reads these bytes big-endian and simpleDecrypts them.
+// MedtrumKit reads the serial big-endian and simpleDecrypts it.
 static const char* modelName(const uint8_t sn[4]) {
   uint32_t word = ((uint32_t)sn[0] << 24) | ((uint32_t)sn[1] << 16) | ((uint32_t)sn[2] << 8) | sn[3];
   uint32_t type = medtrum_simple_decrypt(word);
@@ -85,6 +82,17 @@ static const char* modelName(const uint8_t sn[4]) {
   return "INVALID";
 }
 
+static bool serialHex(const char* s, uint8_t sn[4]) {
+  if (strlen(s) != 8) return false;
+  for (int i = 0; i < 4; i++) {
+    char b[3] = {s[i * 2], s[i * 2 + 1], 0};
+    char* end;
+    long v = strtol(b, &end, 16);
+    if (*end != 0) return false;
+    sn[i] = (uint8_t)v;
+  }
+  return true;
+}
 
 // MARK: - Persistence (NVS "medtrum"/"state", distinct from the pod's)
 
@@ -229,11 +237,8 @@ void begin() {
     assignPatchId();
     saveState();
   }
-  char serialApp[9];
-  medtrum_serial_wire_to_app(patch.sn, serialApp);
-  logf("medtrum: simulating a Medtrum %s. Advertises %02X%02X%02X%02X; enter %s in the app. "
-       "TEST EQUIPMENT: delivers nothing.",
-       modelName(patch.sn), patch.sn[0], patch.sn[1], patch.sn[2], patch.sn[3], serialApp);
+  logf("medtrum: simulating a Medtrum %s, serial %02X%02X%02X%02X. TEST EQUIPMENT: delivers nothing.",
+       modelName(patch.sn), patch.sn[0], patch.sn[1], patch.sn[2], patch.sn[3]);
 }
 
 void start() {
@@ -296,12 +301,10 @@ std::string statusJson() {
   char json[512];
   int n = 0;
   LOCKED({
-    char serialApp[9];
-    medtrum_serial_wire_to_app(patch.sn, serialApp);
     n = snprintf(json, sizeof json,
-                 "{\"serial\":\"%s\",\"model\":\"%s\",\"state\":%u,"
+                 "{\"serial\":\"%02X%02X%02X%02X\",\"model\":\"%s\",\"state\":%u,"
                  "\"reservoir\":%.2f,\"battery\":%.2f,\"patchTime\":%u,\"connected\":%s}",
-                 serialApp, modelName(patch.sn),
+                 patch.sn[0], patch.sn[1], patch.sn[2], patch.sn[3], modelName(patch.sn),
                  (unsigned)patch.status.state, patch.status.reservoir * 0.05,
                  (double)(patch.status.battery >> 12) / 512.0, (unsigned)patch.delivery.patch_time,
                  radio::medtrumConnected() ? "true" : "false");
@@ -310,7 +313,7 @@ std::string statusJson() {
   return std::string(json, n);
 }
 
-// {"command": "medtrumSetSerial", "sn": "28D8124A"}, "medtrumSetModel" {units:
+// {"command": "medtrumSetSerial", "sn": "4A12D828"}, "medtrumSetModel" {units:
 // 200|300}, "medtrumSetReservoir" {units}, "medtrumSetState" {state},
 // "medtrumSetFault" {state}, "medtrumReset". Returns NULL, or what was wrong.
 const char* command(const std::string& json) {
@@ -320,8 +323,8 @@ const char* command(const std::string& json) {
   if (!jsonStr(body, "command", cmd, sizeof cmd)) return "want {\"command\": ...}";
   if (strcmp(cmd, "medtrumSetSerial") == 0) {
     uint8_t sn[4];
-    if (!jsonStr(body, "sn", hex, sizeof hex) || !medtrum_serial_app_to_wire(hex, sn)) {
-      return "sn is 8 hex digits, as the app asks for it, e.g. \"28D8124A\"";
+    if (!jsonStr(body, "sn", hex, sizeof hex) || !serialHex(hex, sn)) {
+      return "sn is 8 hex digits, e.g. \"4A12D828\"";
     }
     LOCKED({
       memcpy(patch.sn, sn, 4);

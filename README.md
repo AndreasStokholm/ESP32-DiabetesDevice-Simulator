@@ -152,10 +152,8 @@ core (and the G6 mode in particular) has not been on hardware yet.
 - **Pump:** choose the pump in the pump page's **Simulate** box. Pick **Omnipod 5** (what a
   new board starts as) or **Omnipod DASH** and pair a new pod of that type; switching type
   starts a new, unpaired pod. Pick **Medtrum patch** and activate a patch in an app with
-  MedtrumKit support: enter `28D8124A` for a 200 U base (MD0201) or `1416DF52` for a
-  300 U base (MD8301) when the app asks for the base serial -- the panel shows the same
-  string, because the app compares the advertisement's bytes with the reverse of what
-  you type (src/medtrum_serial.h does that conversion, and test/medtrum pins it). The patch panel's **Set model** swaps the serial and
+  MedtrumKit support: the base serial is `4A12D828` for a 200 U base (MD0201) and
+  `52DF1614` for a 300 U base (MD8301). The patch panel's **Set model** swaps the serial and
   model together; switching either ends the current activation, so the app activates a
   fresh patch.
 
