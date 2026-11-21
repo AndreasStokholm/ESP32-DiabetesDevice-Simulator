@@ -1,4 +1,5 @@
 .pio/
+.venv/
 .vscode/
 flasher/dist/
 test/portal/portal_tests
