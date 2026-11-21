@@ -38,21 +38,37 @@ static inline size_t adv_name(const char *name, uint8_t *out, size_t cap)
  *   03 03 BC FE   complete list of 16-bit service UUIDs: 0xFEBC, little-endian
  *   LL 09 <name>  complete local name (the phone filters its scan on both)
  * Returns 0 when the whole advertisement would not fit. */
-static inline size_t adv_cgm(const char *name, uint8_t *out, size_t cap)
+/* The CGM (a G6 transmitter or a G7 sensor): flags, the 0xFEBC service the
+ * phones filter their scan on, the Dexcom manufacturer data a real sensor sends
+ * -- company 0x00D0, the CRC-16 of the serial, the display types in use, 0x04 --
+ * then the complete local name. This is the shape the pre-port build sent
+ * (g7Advertisement() on main) and the shape a real Dexcom device sends.
+ *
+ * `crc` is CRC-16/XModem over the serial's characters (cgm_crc16()), `types` the
+ * bitmask of display types that have collected a reading. */
+static inline size_t adv_cgm(const char *name, uint16_t crc, uint8_t types, uint8_t *out, size_t cap)
 {
     size_t len = name ? strlen(name) : 0;
-    if (7 + 2 + len > cap) {
+    if (17 + len > cap) {
         return 0;
     }
     size_t n = 0;
-    out[n++] = 0x02;
+    out[n++] = 0x02; /* flags */
     out[n++] = 0x01;
     out[n++] = 0x06;
-    out[n++] = 0x03;
+    out[n++] = 0x03; /* 16-bit service 0xFEBC, little-endian */
     out[n++] = 0x03;
     out[n++] = 0xBC;
     out[n++] = 0xFE;
-    out[n++] = (uint8_t)(len + 1);
+    out[n++] = 0x07; /* manufacturer data, 6 bytes: company, crc, types, 0x04 */
+    out[n++] = 0xFF;
+    out[n++] = 0xD0;
+    out[n++] = 0x00; /* Dexcom */
+    out[n++] = (uint8_t)(crc & 0xff);
+    out[n++] = (uint8_t)(crc >> 8);
+    out[n++] = types;
+    out[n++] = 0x04;
+    out[n++] = (uint8_t)(len + 1); /* complete local name */
     out[n++] = 0x09;
     if (len) {
         memcpy(out + n, name, len);
@@ -61,8 +77,6 @@ static inline size_t adv_cgm(const char *name, uint8_t *out, size_t cap)
     return n;
 }
 
-/* The DASH pod's: flags, then the 16-bit service list (9 UUIDs, little-endian)
- * that dash_advertised_services() supplies, as ESP-Sim's ble.c sends it. */
 static inline size_t adv_pod(const uint16_t svc[9], uint8_t *out, size_t cap)
 {
     if (3 + 2 + 9 * 2 > cap) {

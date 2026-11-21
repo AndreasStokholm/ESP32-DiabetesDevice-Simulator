@@ -526,6 +526,12 @@ cgm_kind_t kind() {
   return k;
 }
 
+uint16_t serialChecksum() {
+  uint16_t crc = 0;
+  LOCKED({ crc = cgm_crc16((const uint8_t*)c.st.id, strnlen(c.st.id, sizeof c.st.id)); });
+  return crc;
+}
+
 std::string name() {
   char nm[16] = {0};
   LOCKED({ cgm_name(&c.st, nm); });

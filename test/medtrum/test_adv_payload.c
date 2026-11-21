@@ -24,29 +24,33 @@ static int checks, failures;
  * filter on (little-endian), then the complete name (ESP-Sim's main/ble.c). */
 static void test_cgm_payload(void) {
     uint8_t b[ADV_MAX];
+    /* flags, 0xFEBC, the Dexcom manufacturer data (company 0x00D0, crc, types,
+     * 0x04), then the complete local name. */
     static const uint8_t g7[] = {0x02, 0x01, 0x06, 0x03, 0x03, 0xBC, 0xFE,
+                                 0x07, 0xFF, 0xD0, 0x00, 0x34, 0x12, 0x04, 0x04,
                                  0x07, 0x09, 'D', 'X', 'C', 'M', 'a', 'b'};
-    CHECK(adv_cgm("DXCMab", b, sizeof b) == sizeof g7);
+    CHECK(adv_cgm("DXCMab", 0x1234, 0x04, b, sizeof b) == sizeof g7);
     CHECK(memcmp(b, g7, sizeof g7) == 0);
 
-    /* A G6 is "Dexcom" plus the id's last two characters. */
+    /* A G6 is "Dexcom" plus the id's last characters. */
     static const uint8_t g6[] = {0x02, 0x01, 0x06, 0x03, 0x03, 0xBC, 0xFE,
+                                 0x07, 0xFF, 0xD0, 0x00, 0x78, 0x56, 0x04, 0x04,
                                  0x09, 0x09, 'D', 'e', 'x', 'c', 'o', 'm', 'A', 'B'};
-    CHECK(adv_cgm("DexcomAB", b, sizeof b) == sizeof g6);
+    CHECK(adv_cgm("DexcomAB", 0x5678, 0x04, b, sizeof b) == sizeof g6);
     CHECK(memcmp(b, g6, sizeof g6) == 0);
 
-    /* No name (kind off): flags and the service only. */
-    static const uint8_t none[] = {0x02, 0x01, 0x06, 0x03, 0x03, 0xBC, 0xFE, 0x01, 0x09};
-    CHECK(adv_cgm("", b, sizeof b) == sizeof none);
+    /* No name (kind off): everything but the name field. */
+    static const uint8_t none[] = {0x02, 0x01, 0x06, 0x03, 0x03, 0xBC, 0xFE,
+                                   0x07, 0xFF, 0xD0, 0x00, 0x00, 0x00, 0x04, 0x04, 0x01, 0x09};
+    CHECK(adv_cgm("", 0x0000, 0x04, b, sizeof b) == sizeof none);
     CHECK(memcmp(b, none, sizeof none) == 0);
 
     /* Over 31 bytes is refused, not truncated; so is a short buffer. */
-    CHECK(adv_cgm("01234567890123456789012", b, sizeof b) == 0);
-    CHECK(adv_cgm("DXCMab", b, sizeof g7 - 1) == 0);
-    CHECK(adv_cgm("DXCMab", b, sizeof g7) == sizeof g7);
+    CHECK(adv_cgm("01234567890123456789012", 0x1234, 0x04, b, sizeof b) == 0);
+    CHECK(adv_cgm("DXCMab", 0x1234, 0x04, b, sizeof g7 - 1) == 0);
+    CHECK(adv_cgm("DXCMab", 0x1234, 0x04, b, sizeof g7) == sizeof g7);
 }
 
-/* The scan response: one complete local name field, the same for all three. */
 static void test_name_field(void) {
     uint8_t b[ADV_MAX];
     static const uint8_t want[] = {0x07, 0x09, 'D', 'X', 'C', 'M', 'a', 'b'};

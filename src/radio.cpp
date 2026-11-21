@@ -510,7 +510,11 @@ void cgmAdvertise(bool on, const char* name, const uint8_t addr[6]) {
   // service UUIDs with the 0xFEBC the phones filter their scan on
   // (little-endian), then the complete local name.
   uint8_t buf[ADV_MAX];
-  size_t pn = on ? adv_cgm(nm.c_str(), buf, sizeof buf) : 0;
+  // The advertisement a real sensor sends carries Dexcom's company id, the
+  // CRC-16 of the serial and the display types collecting readings; the apps
+  // read the serial out of it (and g7sim's build sent exactly this).
+  uint16_t crc = sensor::serialChecksum();
+  size_t pn = on ? adv_cgm(nm.c_str(), crc, 0x04, buf, sizeof buf) : 0;
   if (on && !pn) logf("cgm: \"%s\" does not fit one advertisement; without one it cannot be found", nm.c_str());
   std::string p(pn ? (const char*)buf : "", pn);
   {
