@@ -6,7 +6,6 @@
 #include <mutex>
 
 #include "adv_payload.h"
-#include "adv_rotation.h"
 #include "dash_internal.h"
 #include "fail.h"
 #include "sensor_app.h"
@@ -14,11 +13,11 @@
 
 namespace radio {
 
-// adv_wants() takes the pump selection as an int; the values must be radio.h's.
-static_assert(PUMP_OFF == ADV_PUMP_OFF && PUMP_POD == ADV_PUMP_POD && PUMP_MEDTRUM == ADV_PUMP_MEDTRUM,
-              "the pump selection and the advertising-rotation want flags must agree");
-
-static const uint8_t inst = 0;  // the one advertising set
+// The two advertising sets, numbered as ESP-Sim's main/ble.c numbers them:
+// instance 0 is the pump's (the pod, or the Medtrum base), instance 1 the
+// CGM's. They advertise at the same time.
+static const uint8_t pumpInstance = 0;
+static const uint8_t cgmInstance = 1;
 
 // MARK: - The CGM's GATT layout (the core's characteristics, lib/cgmsim)
 
@@ -114,13 +113,9 @@ static uint16_t medtrumReadHandle, medtrumWriteHandle;
 static volatile bool medtrumStatusNotify = false;
 static std::string medtrumAdvData;  // guarded by mu
 static bool medtrumAdvOn = false;
-// Which pump simulator is selected (see radio.h), and a flag that forces the
-// next tick to restart the set even if its payload is unchanged -- switching
-// the selection must show up immediately, not on the next rotation. The default
-// is PUMP_POD, so a board with no saved choice behaves as it did before the
-// selector existed.
+// Which pump simulator is selected (see radio.h). The default is PUMP_POD, so
+// a board with no saved choice behaves as it did before the selector existed.
 static int pumpSel = PUMP_POD;
-static bool advForce = false;
 // Whether the current link is a pump's: its GATT service was written or
 // subscribed, or (with the CGM off) it connected while that pump was selected.
 // A link the CGM alone touched is not a pump's, so switching the pump selection
@@ -247,7 +242,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 // The CGM's first event on a link: tell the core, then mirror its
 // advertising-off. cgm_on_connect() sets the core's c->advertising = false
 // without calling advertise(false), so the radio's copy is cleared here to
-// match; otherwise the rotation would keep advertising the CGM outside the
+// match; otherwise the CGM set would keep advertising the CGM outside the
 // core's 60-second window, and signal loss could not stop it.
 //
 // The clear comes AFTER sensor::onConnect() returns, and that order is what
@@ -390,7 +385,7 @@ void begin() {
 
   // The GAP device name is the CGM's: the app's CGM code knows its device by
   // name (Dexcom+id for a G6, DXCM+id for a G7). The pod's code only looks for
-  // its own name in the advertisement, which the rotation supplies.
+  // its own name in the advertisement, which the pump set supplies.
   std::string name = sensor::name();
   if (name.empty()) name = "ESP-Sim";  // no CGM kind set: still a named device
   NimBLEDevice::init(name.c_str());
@@ -459,10 +454,12 @@ static std::string named(const std::string& name) {
   return n ? std::string((const char*)b, n) : std::string();
 }
 
-// (Re)configures the advertising set as a legacy connectable advert and starts it.
-static bool advertise(const std::string& data, const std::string& scanRsp, uint32_t interval, const char* label) {
+// (Re)configures one advertising set as a legacy connectable advert and starts
+// it. instance 0 is the pump's, instance 1 the CGM's.
+static bool advertise(uint8_t instance, const std::string& data, const std::string& scanRsp,
+                      uint32_t interval) {
   NimBLEExtAdvertising* adv = NimBLEDevice::getAdvertising();
-  if (ble_gap_ext_adv_active(inst)) adv->stop(inst);
+  if (ble_gap_ext_adv_active(instance)) adv->stop(instance);
   NimBLEExtAdvertisement a;
   a.setLegacyAdvertising(true);
   a.setConnectable(true);
@@ -471,17 +468,41 @@ static bool advertise(const std::string& data, const std::string& scanRsp, uint3
   a.setMaxInterval(interval);
   a.setTxPower(9);
   a.setData((const uint8_t*)data.data(), data.size());
-  if (!adv->setInstanceData(inst, a)) return false;
+  if (!adv->setInstanceData(instance, a)) return false;
   NimBLEExtAdvertisement r;
   r.setLegacyAdvertising(true);
   r.setData((const uint8_t*)scanRsp.data(), scanRsp.size());
-  if (!adv->setScanResponseData(inst, r)) return false;
-  return adv->start(inst);}
+  if (!adv->setScanResponseData(instance, r)) return false;
+  return adv->start(instance);
+}
+
+// (Re)starts one set with this payload and scan response, or stops it when the
+// payload is empty. Each set keeps its own `current`, so one set's change never
+// restarts the other. Returns true when the set was (re)started.
+static bool advertiseSet(uint8_t instance, std::string& current, const std::string& data,
+                         const std::string& scanRsp, uint32_t interval, const char* label) {
+  if (data.empty()) {
+    if (ble_gap_ext_adv_active(instance)) NimBLEDevice::getAdvertising()->stop(instance);
+    current.clear();
+    return false;
+  }
+  if (ble_gap_ext_adv_active(instance) && data == current) return false;
+  if (!advertise(instance, data, scanRsp, interval)) {
+    static int64_t last = -60000;
+    if (monoMs() - last > 10000) {
+      last = monoMs();
+      logf("advertising %s could not start (%u bytes)", label, (unsigned)data.size());
+    }
+    return false;
+  }
+  current = data;
+  return true;
+}
 
 void cgmAdvertise(bool on, const char* name, const uint8_t addr[6]) {
-  // One advertising set, on the chip's own address: the core's per-sensor
-  // random static address is for the reference's second extended-adv instance
-  // and is not used here (the apps find the device by name and service).
+  // The CGM's own advertising set, on the chip's own address: the core's
+  // per-sensor random static address is not applied here (the apps find the
+  // device by name and service).
   (void)addr;
   std::string nm = name ? name : "";
   // Exactly the reference's CGM advertisement (ESP-Sim's main/ble.c), built by
@@ -545,85 +566,67 @@ void tick() {
   bool paired = podPaired;
   std::string medData = medtrumAdvData;
   bool medOn = medtrumAdvOn;
-  bool force = advForce;
-  advForce = false;
   l.unlock();
 
-  // Who needs to be found? The CGM on the core's schedule (it opens a window
-  // per reading and closes it when the phone has collected); the selected pump
-  // when no phone is connected (and, for the pod, until it is paired). One
-  // advertising set, so when more than one wants to be found they take turns.
-  // An injected quiet window only clears that device's want flag; its payload
-  // string is untouched.
+  // Who wants to be found? Two sets now: instance 0 is the pump's (the pod, or
+  // the Medtrum base when the selector says so; never both, never the CGM),
+  // instance 1 is the CGM's. The pump set is chosen by the selector; the CGM
+  // set follows the core's schedule (it opens a window per reading and closes
+  // it when the phone has collected). An injected quiet window only clears that
+  // device's want flag; its payload string is untouched.
   bool connected = conn != BLE_HS_CONN_HANDLE_NONE;
   // The pod and the Medtrum base are mutually exclusive: exactly one of the two
-  // may advertise, and PUMP_OFF lets neither. A scanner that keys a device by
-  // address never sees the second name, because the second is never in the set.
-  // adv_wants() is the pure choice (test/medtrum/test_adv.c pins it).
+  // may use the pump set, and PUMP_OFF lets neither.
   int sel = pump();
-  adv_wants_t wants = adv_wants((int)sensor::kind(), cgmOn && !connected, sel,
-                                !podData.empty() && (!connected || !paired),
-                                medOn && !medData.empty() && !connected);
-  wants.g7 = wants.g7 && fail_decide(FAIL_CGM, FAIL_ADVERTISE, now);
-  wants.pod = wants.pod && fail_decide(FAIL_POD, FAIL_ADVERTISE, now);
-  wants.med = wants.med && fail_decide(FAIL_MEDTRUM, FAIL_ADVERTISE, now);
-  int choice = adv_rotation_slot(&wants, now);
-  // Log the WANT set, not the slot: the slot changes every 1.5 s, the wants change
-  // only when a device appears or stops. Answers "did Medtrum ever want the set?"
-  // in one line, without spamming the console.
+  bool podWants = sel == PUMP_POD && !podData.empty() && (!connected || !paired);
+  bool medWants = sel == PUMP_MEDTRUM && medOn && !medData.empty() && !connected;
+  bool cgmWants = (int)sensor::kind() != 0 && cgmOn && !connected;
+  cgmWants = cgmWants && fail_decide(FAIL_CGM, FAIL_ADVERTISE, now);
+  podWants = podWants && fail_decide(FAIL_POD, FAIL_ADVERTISE, now);
+  medWants = medWants && fail_decide(FAIL_MEDTRUM, FAIL_ADVERTISE, now);
+  // Log the WANT set, not what each set is doing: the wants change only when a
+  // device appears or stops. Answers "did Medtrum ever want the set?" in one
+  // line, without spamming the console.
   static int lastWants = -1;
-  int w = (wants.g7 ? 1 : 0) | (wants.pod ? 2 : 0) | (wants.med ? 4 : 0);
+  int w = (cgmWants ? 1 : 0) | (podWants ? 2 : 0) | (medWants ? 4 : 0);
   if (w != lastWants) {
     lastWants = w;
-    logf("advertising wants: cgm=%d pod=%d medtrum=%d", wants.g7, wants.pod, wants.med);
+    logf("advertising wants: cgm=%d pod=%d medtrum=%d", cgmWants, podWants, medWants);
   }
 
-  static std::string current;
-  bool active = ble_gap_ext_adv_active(inst);
-  if (choice == ADV_NONE) {
-    if (active) NimBLEDevice::getAdvertising()->stop(inst);
-    current.clear();
-    return;
+  // Each set keeps its own payload string: "already carrying this" is decided
+  // per set, so one set's change never restarts the other.
+  static std::string pumpCurrent, cgmCurrent;
+  static unsigned seen = 0;
+
+  // Instance 0: the pump set. The selector names the one pump that may use it;
+  // PUMP_OFF, or a pump that does not want to be found, leaves it stopped.
+  std::string pumpData, pumpRsp;
+  const char* pumpLabel = sel == PUMP_MEDTRUM ? "Medtrum" : "pod";
+  unsigned pumpBit = sel == PUMP_MEDTRUM ? 4u : 2u;
+  if (sel == PUMP_POD && podWants) {
+    pumpData = podData;
+    pumpRsp = named(DASH_ADVERTISED_NAME);
+  } else if (sel == PUMP_MEDTRUM && medWants) {
+    pumpData = medData;
+    pumpRsp = named("MT");
   }
-  // The order (CGM, pod, Medtrum) keeps the pod's payload byte-exact: it is
-  // the same string it always was, only now sharing the set three ways.
-  std::string data, scanRsp;
-  const char* label;
-  uint32_t interval;
-  if (choice == ADV_CGM) {
-    data = cgmData;
-    scanRsp = named(cgmNm);
-    interval = cgmAdvInterval;  // the CGM's 160 ms
-    label = "CGM";
-  } else if (choice == ADV_POD) {
-    data = podData;
-    scanRsp = named(DASH_ADVERTISED_NAME);
-    interval = 0x00f4;
-    label = "pod";
-  } else {
-    data = medData;
-    scanRsp = named("MT");
-    interval = 0x00f4;  // 152.5 ms, as ESP-Sim
-    label = "Medtrum";
+  if (advertiseSet(pumpInstance, pumpCurrent, pumpData, pumpRsp, 0x00f4, pumpLabel) &&
+      !(seen & pumpBit)) {
+    seen |= pumpBit;
+    logf("advertising %s (%u bytes)", pumpLabel, (unsigned)pumpData.size());
   }
-  if (!force && active && data == current) return;
-  bool ok = advertise(data, scanRsp, interval, label);
-  if (ok) {
-    current = data;
-    // Once per device per boot: proves the set really carried it, without a line
-    // every 1.5 s while the rotation is running.
-    static unsigned seen = 0;
-    unsigned bit = choice == ADV_CGM ? 1u : choice == ADV_POD ? 2u : 4u;
-    if (!(seen & bit)) {
-      seen |= bit;
-      logf("advertising %s (%u bytes)", label, (unsigned)data.size());
-    }
-  } else {
-    static int64_t last = -60000;
-    if (monoMs() - last > 10000) {
-      last = monoMs();
-      logf("advertising %s could not start (%u bytes)", label, (unsigned)data.size());
-    }
+
+  // Instance 1: the CGM set, whenever the core wants it. Otherwise it stops.
+  std::string cgmSetData, cgmSetRsp;
+  if (cgmWants) {
+    cgmSetData = cgmData;
+    cgmSetRsp = named(cgmNm);
+  }
+  if (advertiseSet(cgmInstance, cgmCurrent, cgmSetData, cgmSetRsp, cgmAdvInterval, "CGM") &&
+      !(seen & 1u)) {
+    seen |= 1u;
+    logf("advertising CGM (%u bytes)", (unsigned)cgmSetData.size());
   }
 }
 
@@ -819,7 +822,6 @@ void setPump(int p) {
   {
     std::lock_guard<std::mutex> l(mu);
     pumpSel = p;
-    advForce = true;
   }
   // The pump that is no longer selected must not keep the one link. A link the
   // CGM alone touched is not a pump's, so it is left alone.

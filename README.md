@@ -30,12 +30,14 @@ several separate devices to one phone. Instead it is **one Bluetooth device** th
 the selected CGM's service and the selected pump's service. The app's CGM code and its pump
 code each connect to "their" device and share the single connection underneath.
 
-- **Advertising** takes turns on one Bluetooth 5 advertising set: the CGM's advertisement
-  (the `0xFEBC` service plus its name, `Dexcomxx` for a G6 or `DXCMxx` for a G7) and the
-  selected pump's. The pod's (` :: Fake POD ::`) and the Medtrum base's (`MT` plus its
-  serial) are **mutually exclusive**: exactly one of the two may advertise, and the pump
-  page's Off lets neither. Each keeps its own bytes exactly; they cannot be merged into one
-  payload.
+- **Advertising** runs on two Bluetooth 5 advertising sets at once, as ESP-Sim does it:
+  the pump set carries the selected pump's advertisement, and the CGM set carries the
+  CGM's (the `0xFEBC` service plus its name, `Dexcomxx` for a G6 or `DXCMxx` for a G7).
+  The two sets advertise at the same time, so the phone sees the CGM and the pump
+  simultaneously. The pod's (` :: Fake POD ::`) and the Medtrum base's (`MT` plus its
+  serial) are **mutually exclusive** on the pump set: exactly one of the two may use it,
+  and the pump page's Off lets neither. Each keeps its own bytes exactly; they cannot be
+  merged into one payload.
 - **The CGM advertises around each reading**, as a real sensor does: a 60-second window
   after a reading, and only while that reading has not been collected.
 - **The board hangs up when the reading is out**, about 3 seconds after the phone has had
@@ -414,7 +416,7 @@ The host suites need only `cc` and `make` (no PlatformIO, no board):
 | Command | What it covers |
 |---|---|
 | `make -C test/cgm` | The CGM core, with ESP-Sim's own checks (the sources are byte-identical) |
-| `make -C test/medtrum` | The patch core, the advertising-rotation choice and the bytes of all three advertisements |
+| `make -C test/medtrum` | The Medtrum patch core |
 | `make -C test/fail` | The failure-injection decisions (drop, refuse, quiet, delay, ignore) for each device |
 | `make -C test/portal` | The captive-portal probe and redirect decision |
 
@@ -434,7 +436,7 @@ are enforced by the radio; the values live in RAM and reset on reboot.
 |---|---|---|---|---|
 | `drop` | Accept the next connection, then disconnect at once | yes | yes | yes |
 | `refuse` | Drop the next N connections | yes | yes | yes |
-| `quiet` | Leave that device out of the advertising rotation for the chosen time | yes | yes | yes |
+| `quiet` | Leave that device out of its advertising set for the chosen time | yes | yes | yes |
 | `delay` | Wait before each outgoing notification from that device | yes | yes | yes |
 | `ignore` | Drop the next N messages the phone sends to that device | yes | yes | yes |
 
@@ -527,8 +529,9 @@ Devices we want to add:
 - **ESP-Sim's Medtrum patch** is ported here as a third device. Its portable patch core
   (`lib/medtrumpatch`, plain C with no ESP-IDF or mbedTLS) runs under Arduino/PlatformIO
   with new board glue (`src/medtrum_app.cpp`, and the patch's side of `src/radio.cpp`).
-  The one radio takes turns between the CGM's advertisement and the selected pump's; the pod
-  and the Medtrum base are mutually exclusive, so at most one of them is ever in the set.
+  The radio advertises on two sets at once: the CGM's advertisement and the selected pump's
+  (the pod's, or the Medtrum base's). The pod and the Medtrum base are mutually exclusive,
+  so at most one of them is ever in the pump set.
   The patch's panel is the pump page at `/pump` (the Medtrum patch choice), its host tests
   run with `make -C test/medtrum`, and its controls are the panel and `/medtrum/command`
   (there is no console command prefix for it).
@@ -592,10 +595,9 @@ Devices we want to add:
 | `src/pod_html.h`, `src/medtrum_html.h` | The pod and patch panels (generated; now folded into the pump page) |
 | `src/settings_html.h` | The Settings page (Network, pump read-out, Board) |
 | `src/setup_html.h` | The captive-portal Wi‑Fi sheet |
-| `src/adv_rotation.h` | The pure advertising-rotation choice, shared with `test/medtrum/test_adv.c` |
-| `src/adv_payload.h` | The pure builders for the three advertising payloads and the name field, pinned by the same test |
+| `src/adv_payload.h` | The pure builders for the three advertising payloads and the name field |
 | `test/cgm/` | Host tests for the CGM core |
-| `test/medtrum/` | Host tests for the Medtrum patch core and the advertising rotation |
+| `test/medtrum/` | Host tests for the Medtrum patch core |
 | `test/portal/` | Host tests for the captive-portal decision |
 | `test/fail/` | Host tests for the failure-injection state |
 | `flasher/`, `tools/make_flasher.sh` | The browser flasher |

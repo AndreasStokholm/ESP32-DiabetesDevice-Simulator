@@ -1,8 +1,8 @@
 /* The three devices' advertising payloads, assembled byte by byte.
  *
- * Pure C (no Arduino, no NimBLE), so the host test can pin every byte:
- * test/medtrum/test_adv.c checks these against the bytes the bases send.
- * src/radio.cpp only hands the result to the advertiser.
+ * Pure C (no Arduino, no NimBLE): each device's bytes are exactly ESP-Sim's,
+ * so they can be read and diffed without a radio. src/radio.cpp only hands the
+ * result to the advertiser.
  *
  * SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once

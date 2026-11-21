@@ -8,9 +8,12 @@
 // The app's CGM code and its pod code each connect to "their" device and share
 // the one link underneath.
 //
-// - Advertising: one set. Its payload is the pod's advertisement, the CGM's,
-//   or the two taking turns, depending on who needs to be found (the pod's
-//   must carry exactly its own service list, so they cannot be merged).
+// - Advertising: two sets, as ESP-Sim numbers them. Instance 0 is the pump's:
+//   the pod's advertisement, or the Medtrum base's, whichever the selector
+//   chose (the pod and the base are mutually exclusive). Instance 1 is the
+//   CGM's (G6 or G7), whenever the core has a window open. The pod's and the
+//   base's advertisements each carry exactly their own service list, so they
+//   cannot share a set; the two sets advertise at the same time.
 // - The link: a real CGM ends the session when the phone has its reading, and
 //   the app's code only asks for a reading after connecting. So the core ends
 //   the link by itself (cgmDisconnect, done from tick()), and both sides
@@ -26,11 +29,11 @@ extern "C" {
 #include "medtrum.h"
 
 namespace radio {
-// Sets up the GATT table and the advertising set. Call once the core has
+// Sets up the GATT table and the advertising sets. Call once the core has
 // started (sensor::begin()) and before the pod's and patch's tasks.
 void begin();
-// Call every ~50 ms: applies a hang-up the CGM asked for, and keeps the one
-// advertising set rotating between the CGM, the pod and the Medtrum patch.
+// Call every ~50 ms: applies a hang-up the CGM asked for, and keeps the pump
+// set (instance 0) and the CGM set (instance 1) advertising what they should.
 void tick();
 int openLinks();
 
