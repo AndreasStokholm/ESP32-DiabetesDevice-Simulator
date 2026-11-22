@@ -16,13 +16,16 @@ starts as a Dexcom G7 and an Omnipod 5.
 
 It builds on two projects:
 
-- the pod, the CGM and the Medtrum patch are [nightscout/ESP-Sim](https://github.com/nightscout/ESP-Sim)'s
+- the pod and the Medtrum patch are [nightscout/ESP-Sim](https://github.com/nightscout/ESP-Sim)'s
   **portable C cores**, unmodified: `lib/dashpod` (commit `26c5219`, plus loopkit/pod's
-  `ignoreNextMessages` and `failNextConnects` commands), `lib/cgmsim` (the G6/G7 protocol)
-  and `lib/medtrumpatch`, each with small Arduino/PlatformIO glue;
-- the CGM is the same code ESP-Sim runs, so there is one CGM engine on the board, not a
-  port of [LoopKit/g7sim](https://github.com/LoopKit/g7sim); g7sim's ideas live on in the
-  shape of this board's console and JSON API (see
+  `ignoreNextMessages` and `failNextConnects` commands) and `lib/medtrumpatch`, each with
+  small Arduino/PlatformIO glue;
+- the CGM is ESP-Sim's portable G6/G7 core, `lib/cgmsim`, with one deliberate change: it
+  keeps a **session per central** so a phone and a watch can read at the same time, which
+  ESP-Sim's single-session core cannot (see
+  [Differences](#differences-from-the-originals)). It is still the only CGM engine on the
+  board, not a port of [LoopKit/g7sim](https://github.com/LoopKit/g7sim); g7sim's ideas live
+  on in the shape of this board's console and JSON API (see
   [Differences](#differences-from-the-originals)).
 
 ## How one board is a CGM and a pump
@@ -50,15 +53,17 @@ logged.
 - **The CGM advertises around each reading**, as a real sensor does: a 60-second window
   after a reading while no central has collected it. While one CGM central is connected the
   window stays open as long as the second link is free, so a watch that scans after the
-  phone connected can still find the sensor; it closes once both links are the CGM's, when
-  the core's window ends, or when the hang-up starts.
-- **The board hangs up when the reading is out**, once **every** CGM central subscribed to
-  it has collected (a phone and a watch can take it at their own pace), and never later
-  than 20 seconds. A central that subscribes after the phone collected is sent the current
-  reading at once. The app's CGM code only asks for a reading after connecting, so this is
-  what makes it collect the next one; the centrals reconnect within a second or two. The
-  CGM core still models **one session**: the first central opens it and the last one leaving
-  closes it, so a watch hanging up does not reset the phone's session.
+  phone connected can still find the sensor; it closes once both links are the CGM's or
+  when the core's window ends. A central hanging up does not close it while the other
+  session or a free slot still needs it.
+- **Each CGM central has its own session.** One reading is made every five minutes, and
+  each central is sent it on its own schedule; a central already subscribed to CONTROL
+  is sent a new reading as soon as it is made, and one that connects later gets the cached
+  reading at once. The app's CGM code only asks for a reading after connecting. Once a
+  central has its reading and has gone quiet the board hangs up **that** central, so the
+  phone and the watch reconnect independently, within a second or two. One central
+  collecting, idle or leaving does not hold open or reset the other's session; a central
+  that was away while the other read backfills its own missed history when it returns.
 - **Two centrals at once, a third refused.** The CGM may use both links (a phone and a
   watch); a pump phone and its CGM use one each. With two CGM centrals connected, a pump
   cannot also connect.
@@ -436,7 +441,7 @@ The host suites need only `cc` and `make` (no PlatformIO, no board):
 
 | Command | What it covers |
 |---|---|
-| `make -C test/cgm` | The CGM core, with ESP-Sim's own checks (the sources are byte-identical) |
+| `make -C test/cgm` | The CGM core: ESP-Sim's checks adapted to the per-session API, plus two-session cases |
 | `make -C test/medtrum` | The Medtrum patch core |
 | `make -C test/fail` | The failure-injection decisions (drop, refuse, quiet, delay, ignore) for each device |
 | `make -C test/portal` | The captive-portal probe and redirect decision |
@@ -503,9 +508,12 @@ pod's and Medtrum's advertisement bytes do not change. `ignore` drops the messag
 BLE write, for all three devices.
 
 The CGM's notifications are sent from a task of its own, so `delay` holds them without
-blocking the CGM core. A delayed message is sent to every central that was subscribed when
-it was queued: if one has hung up by then, that copy is dropped rather than delivered to a
-new connection that reused the handle.
+blocking the CGM core. The core queues one frame per session: a delayed frame goes to the
+central whose session asked for it, and that session's hang-up waits until its queue has
+drained, so the delay does not lose the reading. If the link closes for another reason in
+the meantime, the generation check drops the frame rather than delivering it to a new
+connection that reused the handle; the next session to subscribe is served the cached
+reading by the core itself.
 
 ## Good to know
 
@@ -516,8 +524,8 @@ new connection that reused the handle.
 - In the app the pod may briefly show as reconnecting after each CGM reading. That's the
   hang-up described above.
 - Unlike a real CGM, the board serves a phone that has already collected the current
-  reading. It does serve a second display (a watch or another phone), up to two CGM
-  centrals at once; a third is refused.
+  reading. It serves a second display (a watch or another phone) independently too: each
+  central has its own session, up to two at once; a third is refused.
 - The simulators don't appear in iOS Settings → Bluetooth. That's expected.
 - Not yet tested on hardware: the captive Wi-Fi sheet on iOS and Android; long runs; what
   the app does after `crashNextCommand` and `ignoreNextMessages` (the board accepts them);
@@ -550,7 +558,8 @@ Devices we want to add:
   type is one of the Simulate box's choices rather than a dropdown. A new board starts as an
   Omnipod 5, where ESP-Sim starts as a DASH. The pod core gained loopkit/pod's
   `ignoreNextMessages` and `failNextConnects` commands. ESP-Sim's host tests are not copied,
-  except the CGM's (`make -C test/cgm`, the same checks ESP-Sim runs).
+  except the CGM's: `make -C test/cgm` keeps ESP-Sim's checks (adapted to the per-session
+  API) and adds two-session cases.
 - **ESP-Sim's Medtrum patch** is ported here as a third device. Its portable patch core
   (`lib/medtrumpatch`, plain C with no ESP-IDF or mbedTLS) runs under Arduino/PlatformIO
   with new board glue (`src/medtrum_app.cpp`, and the patch's side of `src/radio.cpp`).
@@ -566,13 +575,25 @@ Devices we want to add:
   The patch's panel is the pump page at `/pump` (the Medtrum patch choice), its host tests
   run with `make -C test/medtrum`, and its controls are the panel and `/medtrum/command`
   (there is no console command prefix for it).
-- **The CGM is ESP-Sim's core**, not the g7sim port. `lib/cgmsim` is ESP-Sim's portable
-  G6/G7 protocol, verbatim, with `src/sensor_app.cpp` for its clock, flash and task and the
-  CGM's side of `src/radio.cpp`. The g7sim port that used to run the G7 (`src/sensor.cpp`,
-  `handler.cpp`, `crypto.cpp`, `link.h`) is still in the tree but **retired**: nothing
-  starts it. In exchange for g7sim's extras, the board gains a real **G6 transmitter mode**
-  (a 6-character id, G6 calibration, a 2-hour warm-up and a 10-day session), signal loss
-  with backfill, skip warm-up, and the full sensor-state table.
+- **The CGM is ESP-Sim's core, no longer byte-identical.** `lib/cgmsim` is ESP-Sim's
+  portable G6/G7 protocol with one deliberate change: ESP-Sim keeps **one session** (one
+  `connected`, one login, one delivery cursor), which cannot give a phone and a watch each
+  their own reading. Here the core keeps up to two sessions, one per central, each with its
+  own login, sent-reading flag and per-central backfill cursor (the last reading that
+  central was sent, kept across its reconnects; a new central starts from the oldest reading
+  still in the history), while the sensor state, reading history, signal loss, forced state
+  and advertising window stay shared. That deviation is what lets the phone and the watch
+  read at the same time, and why a silent watch no longer makes the phone's readings wait or
+  go irregular; a single central's normal frames and reconnect cadence are unchanged, and
+  a connected, subscribed central now receives a newly made reading instead of waiting for
+  its reconnect. The glue also holds a session's hang-up until that session's queued
+  notification has actually been sent, so an injected `delay` cannot lose the reading.
+  `src/sensor_app.cpp` supplies the clock, flash and task and the CGM's side of
+  `src/radio.cpp` maps each Bluetooth link to its session. The g7sim port that used to run
+  the G7 (`src/sensor.cpp`, `handler.cpp`, `crypto.cpp`, `link.h`) is still in the tree but
+  **retired**: nothing starts it. In exchange for g7sim's extras, the board gains a real
+  **G6 transmitter mode** (a 6-character id, G6 calibration, a 2-hour warm-up and a 10-day
+  session), signal loss with backfill, skip warm-up, and the full sensor-state table.
 - **g7sim's interface is kept where it can be**: the panel is at `/g7`, and `/status`,
   `/glucose`, `/new` and `/forget` stay exactly where g7sim has them, with g7sim's field
   names and its JSON bodies. `/g7/status` and `/g7/command` are new (the panel uses them).
@@ -610,7 +631,7 @@ Devices we want to add:
 | Path | What |
 |---|---|
 | `lib/dashpod/` | ESP-Sim's pod core with two commands added (GPL-3.0-or-later) |
-| `lib/cgmsim/` | ESP-Sim's portable Dexcom G6/G7 core, verbatim (GPL-3.0-or-later) |
+| `lib/cgmsim/` | ESP-Sim's portable Dexcom G6/G7 core, with one session per central (GPL-3.0-or-later) |
 | `lib/medtrumpatch/` | ESP-Sim's portable Medtrum patch core (GPL-3.0-or-later) |
 | `src/pod.cpp` | The pod's clock, storage and task |
 | `src/sensor_app.cpp` | The CGM's clock, storage and task |
