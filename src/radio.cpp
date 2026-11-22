@@ -464,6 +464,12 @@ static std::string named(const std::string& name) {
 // (Re)configures one advertising set as a legacy connectable advert and starts
 // it. instance 0 is the pump's, instance 1 the CGM's. addr, for the CGM set, is
 // the sensor's random static address; NULL keeps the device address.
+// Every write below is per instance: setInstanceData() configures this instance
+// and sets its advertising data, setScanResponseData() sets this instance's
+// scan response, set_addr() sets this instance's random address, and start()
+// starts this instance. NimBLE-Arduino 1.4.3 has no device-wide data setter on
+// this path (its m_scanResp/m_advParams members are unused), so no field here
+// can reach the other set.
 static bool advertise(uint8_t instance, const std::string& data, const std::string& scanRsp,
                       uint32_t interval, const uint8_t* addr) {
   NimBLEExtAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -510,17 +516,20 @@ static bool advertise(uint8_t instance, const std::string& data, const std::stri
 }
 
 // (Re)starts one set with this payload and scan response, or stops it when the
-// payload is empty. Each set keeps its own `current`, so one set's change never
-// restarts the other. Returns true when the set was (re)started.
-static bool advertiseSet(uint8_t instance, std::string& current, const std::string& data,
-                         const std::string& scanRsp, uint32_t interval, const char* label,
-                         const uint8_t* addr = nullptr) {
+// payload is empty. Each set keeps its own payload and scan-response strings, so
+// one set's change never restarts the other and a stale scan response cannot be
+// kept: the scan response is re-applied whenever either part changes. Returns
+// true when the set was (re)started.
+static bool advertiseSet(uint8_t instance, std::string& current, std::string& currentRsp,
+                         const std::string& data, const std::string& scanRsp, uint32_t interval,
+                         const char* label, const uint8_t* addr = nullptr) {
   if (data.empty()) {
     if (ble_gap_ext_adv_active(instance)) NimBLEDevice::getAdvertising()->stop(instance);
     current.clear();
+    currentRsp.clear();
     return false;
   }
-  if (ble_gap_ext_adv_active(instance) && data == current) return false;
+  if (ble_gap_ext_adv_active(instance) && data == current && scanRsp == currentRsp) return false;
   if (!advertise(instance, data, scanRsp, interval, addr)) {
     static int64_t last = -60000;
     if (monoMs() - last > 10000) {
@@ -530,6 +539,7 @@ static bool advertiseSet(uint8_t instance, std::string& current, const std::stri
     return false;
   }
   current = data;
+  currentRsp = scanRsp;
   return true;
 }
 
@@ -636,9 +646,9 @@ void tick() {
     logf("advertising wants: cgm=%d pod=%d medtrum=%d", cgmWants, podWants, medWants);
   }
 
-  // Each set keeps its own payload string: "already carrying this" is decided
-  // per set, so one set's change never restarts the other.
-  static std::string pumpCurrent, cgmCurrent;
+  // Each set keeps its own payload and scan-response strings: "already carrying
+  // this" is decided per set, so one set's change never restarts the other.
+  static std::string pumpCurrent, pumpCurrentRsp, cgmCurrent, cgmCurrentRsp;
   static bool pumpLogged = false, cgmLogged = false;
   // The address the CGM set is advertising from. It belongs to the advertising
   // instance rather than the payload, and a new sensor can keep the same name
@@ -649,7 +659,10 @@ void tick() {
   bool cgmAddrChanged =
       cgmAddrValid &&
       (!cgmCurrentAddrValid || memcmp(cgmAddr, cgmCurrentAddr, sizeof cgmCurrentAddr) != 0);
-  if (cgmAddrChanged) cgmCurrent.clear();
+  if (cgmAddrChanged) {
+    cgmCurrent.clear();
+    cgmCurrentRsp.clear();
+  }
 
   // Instance 0: the pump set. The selector names the one pump that may use it;
   // PUMP_OFF, or a pump that does not want to be found, leaves it stopped.
@@ -662,7 +675,8 @@ void tick() {
     pumpData = medData;
     pumpRsp = named("MT");
   }
-  if (advertiseSet(pumpInstance, pumpCurrent, pumpData, pumpRsp, 0x00f4, pumpLabel) && !pumpLogged) {
+  if (advertiseSet(pumpInstance, pumpCurrent, pumpCurrentRsp, pumpData, pumpRsp, 0x00f4, pumpLabel) &&
+      !pumpLogged) {
     pumpLogged = true;
     std::string pumpAddr = NimBLEDevice::getAddress().toString();
     logf("advertising pump on %s (%s, %u bytes)", pumpAddr.c_str(), pumpLabel, (unsigned)pumpData.size());
@@ -674,8 +688,9 @@ void tick() {
     cgmSetData = cgmData;
     cgmSetRsp = named(cgmNm);
   }
-  bool cgmStarted = advertiseSet(cgmInstance, cgmCurrent, cgmSetData, cgmSetRsp, cgmAdvInterval, "CGM",
-                                 cgmAddrValid ? cgmAddr : nullptr);
+  bool cgmStarted =
+      advertiseSet(cgmInstance, cgmCurrent, cgmCurrentRsp, cgmSetData, cgmSetRsp, cgmAdvInterval, "CGM",
+                    cgmAddrValid ? cgmAddr : nullptr);
   if (cgmStarted && !cgmLogged) {
     cgmLogged = true;
     std::string cgmAddrText = cgmAddrValid ? addrString(cgmAddr) : "(device address)";
