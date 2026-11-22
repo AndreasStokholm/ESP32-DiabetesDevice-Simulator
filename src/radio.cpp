@@ -649,7 +649,11 @@ void tick() {
   // Each set keeps its own payload and scan-response strings: "already carrying
   // this" is decided per set, so one set's change never restarts the other.
   static std::string pumpCurrent, pumpCurrentRsp, cgmCurrent, cgmCurrentRsp;
-  static bool pumpLogged = false, cgmLogged = false;
+  // The pump instance is shared by two families, so log its first start and any
+  // later start of the other family (the address is the same; which pump is on
+  // the air is not). The CGM set has one family and needs one line.
+  static std::string pumpLoggedAs;
+  static bool cgmLogged = false;
   // The address the CGM set is advertising from. It belongs to the advertising
   // instance rather than the payload, and a new sensor can keep the same name
   // and serial (the same payload) but get a new random address: force the set
@@ -676,8 +680,8 @@ void tick() {
     pumpRsp = named("MT");
   }
   if (advertiseSet(pumpInstance, pumpCurrent, pumpCurrentRsp, pumpData, pumpRsp, 0x00f4, pumpLabel) &&
-      !pumpLogged) {
-    pumpLogged = true;
+      pumpLoggedAs != pumpLabel) {
+    pumpLoggedAs = pumpLabel;
     std::string pumpAddr = NimBLEDevice::getAddress().toString();
     logf("advertising pump on %s (%s, %u bytes)", pumpAddr.c_str(), pumpLabel, (unsigned)pumpData.size());
   }
