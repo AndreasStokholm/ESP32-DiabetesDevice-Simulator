@@ -74,7 +74,7 @@ void onDisconnect(cgm_session_t session);
 void onSubscribe(cgm_session_t session, cgm_chr_t chr, bool on);
 void onWrite(cgm_session_t session, cgm_chr_t chr, const uint8_t* p, size_t n);
 // Fills out with the auth characteristic's value; returns its length.
-int onRead(cgm_session_t session, cgm_chr_t chr, uint8_t* out, size_t cap);
+size_t onRead(cgm_session_t session, cgm_chr_t chr, uint8_t* out, size_t cap);
 
 // Panel-only: how many CGM links actually received a reading notification. The
 // radio owns this because only its send task knows the notification left the
