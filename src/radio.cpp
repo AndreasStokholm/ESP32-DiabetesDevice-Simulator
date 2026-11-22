@@ -61,10 +61,6 @@ static const int kMaxLinks = 2;
 static_assert(kMaxLinks == CGM_MAX_SESSIONS, "one core session per Bluetooth link");
 struct Link {
   uint16_t handle;
-  // The peer's Bluetooth address, from the connect callback. The CGM identity
-  // of the slot is kept across disconnects (CgmSeat below) and compared with
-  // this to tell a returning central from a different one.
-  uint8_t peer[6];
   bool used;
   bool podUsed;
   bool medtrumUsed;
@@ -88,15 +84,6 @@ struct Link {
   uint32_t gen;
 };
 static Link links[kMaxLinks];
-// The CGM peer last seen on each link slot, kept across disconnects. A central
-// connecting into a slot it did not leave gets a closing cgm_on_disconnect for
-// that slot first, which clears the previous occupant's core session; a
-// returning central keeps it and resumes. Guarded by mu.
-struct CgmSeat {
-  bool known;
-  uint8_t peer[6];
-};
-static CgmSeat cgmSeats[kMaxLinks];
 // Unique per connection, never reset: a queued CGM notification or a pending
 // termination must not match a later link that reused the handle.
 static uint32_t linkGenCounter = 0;
@@ -309,22 +296,14 @@ static bool markPump(uint16_t h, bool podSide) {
 }
 
 // The CGM's first GATT event on a link: the link is marked the CGM's and gets a
-// core session token (the link's slot). reset says the slot's previous CGM
-// peer was a different central, so the caller must clear that closed session
-// before connecting this one. The caller tells the core once, outside this
-// lock. A link that is already the CGM's keeps its session.
-static bool markCgmUsed(uint16_t h, cgm_session_t* session, bool* fresh, bool* reset) {
+// core session token (the link's slot). The caller tells the core once, outside
+// this lock. A link that is already the CGM's keeps its session.
+static bool markCgmUsed(uint16_t h, cgm_session_t* session, bool* fresh) {
   std::lock_guard<std::mutex> l(mu);
   Link* lk = linkLocked(h);
   if (!lk) return false;
   if (!lk->cgmUsed) {
-    int slot = slotLocked(h);
-    if (slot < 0) return false;
-    CgmSeat& seat = cgmSeats[slot];
-    *reset = !seat.known || memcmp(seat.peer, lk->peer, sizeof seat.peer) != 0;
-    seat.known = true;
-    memcpy(seat.peer, lk->peer, sizeof seat.peer);
-    lk->cgmSession = (cgm_session_t)slot;
+    lk->cgmSession = (cgm_session_t)slotLocked(h);
     lk->cgmUsed = true;
     *fresh = true;
   } else {
@@ -452,7 +431,6 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       *lk = Link{};
       lk->handle = h;
       lk->used = true;
-      memcpy(lk->peer, desc->peer_ota_addr.val, sizeof lk->peer);
       lk->gen = ++linkGenCounter;
       lk->acceptMask = device >= 0 ? (uint8_t)(1u << device) : 0;
       // With the CGM off the link can only be a pump's, so mark the selected
@@ -533,9 +511,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 // The CGM's first event on a link: give the link a core session and tell the
 // core, once. The session token is the link's slot, so every later send and
 // hang-up names exactly one central; cgmNotify and cgmDisconnect map it back
-// through linkForSessionLocked(). If a different central has taken the slot,
-// a closing disconnect clears the old session before the new connect: same
-// slot, but no state from the central before it.
+// through linkForSessionLocked(). cgm_on_connect() starts a fresh session for
+// that connection, so no state from an earlier connection is needed or used.
 //
 // The CGM advertising set is deliberately NOT cleared here. cgm_on_connect()
 // sets the core's own advertising flag false without calling advertise(false),
@@ -545,9 +522,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 // onDisconnect() clears the radio's copy to match that silent false; the core
 // calls advertise(true) again if it opens a new window.
 static bool cgmLinkUp(uint16_t h, cgm_session_t* session) {
-  bool fresh = false, reset = false;
-  if (!markCgmUsed(h, session, &fresh, &reset)) return false;
-  if (fresh && reset) sensor::onDisconnect(*session);
+  bool fresh = false;
+  if (!markCgmUsed(h, session, &fresh)) return false;
   if (fresh) sensor::onConnect(*session);
   return true;
 }

@@ -287,7 +287,9 @@ static void test_g7(void)
     for (int i = 0; i < fk.n_sent; i++) {
         recs += fk.sent[i].chr == CGM_CHR_BACKFILL;
     }
-    CHECK(recs == 3);
+    /* A reconnect is a fresh session: it backfills the whole history, not only
+     * the readings missed while the link was down. */
+    CHECK(recs == c.st.n_hist - 1);
     CHECK(find(CGM_CHR_CONTROL, 0x59, 0) > find(CGM_CHR_CONTROL, 0x4e, 0));
     cgm_on_disconnect(&c, 0);
 
@@ -634,10 +636,9 @@ static void test_tick_delivery(void)
     cgm_on_disconnect(&c, 1);
 }
 
-/* A different central that takes a slot someone else used must start fresh; a
- * central reconnecting into a slot it left itself resumes. The radio signals
- * the difference with a closing cgm_on_disconnect for the already closed slot
- * before the new central's connect. */
+/* A different central that takes a slot someone else used must start fresh.
+ * Nothing is inferred from who the central is: the connect itself clears the
+ * session. */
 static void test_slot_reuse(void)
 {
     static cgm_t c;
@@ -664,7 +665,45 @@ static void test_slot_reuse(void)
     CHECK(count_session(CGM_CHR_BACKFILL, 0) == 2);
     cgm_on_disconnect(&c, 0);
 
-    /* Dirty every field the old central left, so a leak is visible. */
+    /* A second central reuses slot 0. Its connect is a fresh session, so it
+     * cannot inherit the phone's cursor. */
+    connect_n(&c, 0);
+    CHECK(c.sessions[0].delivered == 0 && c.sessions[0].prev_delivered == 0);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    cgm_on_subscribe(&c, 0, CGM_CHR_BACKFILL, true);
+    CHECK(c.sessions[0].delivered == last_seq && c.sessions[0].prev_delivered == 0);
+    CHECK(count_session(CGM_CHR_BACKFILL, 0) == 2);
+    CHECK(find_session(CGM_CHR_CONTROL, 0x4e, 0, 0) >= 0);
+    cgm_on_disconnect(&c, 0);
+}
+
+/* The peer's privacy address rotates on reconnect. The core never sees an
+ * address, and a session is one connection, so the reconnect must clear every
+ * field the previous connection left -- not resume. */
+static void test_address_rotate(void)
+{
+    static cgm_t c;
+    cgm_state_t st;
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_skip_warmup(&c);
+    cgm_set_glucose(&c, 120, 0);
+    cgm_tick(&c);
+    run(&c, CGM_READING_INTERVAL);
+    run(&c, CGM_READING_INTERVAL);
+    CHECK(c.st.n_hist == 3);
+    uint32_t last_seq = c.st.hist[c.st.n_hist - 1].seq;
+
+    connect_n(&c, 0);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    cgm_on_subscribe(&c, 0, CGM_CHR_BACKFILL, true);
+    CHECK(c.sessions[0].delivered == last_seq);
+
+    /* Dirty every field one connection describes, then close it. */
     c.sessions[0].authed = true;
     memset(c.sessions[0].challenge, 0xaa, sizeof c.sessions[0].challenge);
     memset(c.sessions[0].auth_value, 0xbb, sizeof c.sessions[0].auth_value);
@@ -674,38 +713,23 @@ static void test_slot_reuse(void)
     c.sessions[0].prev_delivered = 42;
     c.sessions[0].connected_at = fk.now - 10;
     c.sessions[0].last_activity = fk.now - 10;
-
-    /* A different central reuses slot 0. The radio tells the core: a
-     * disconnect for the already closed slot, which clears all of it. */
     cgm_on_disconnect(&c, 0);
-    CHECK(!c.sessions[0].connected);
+    CHECK(c.sessions[0].delivered == last_seq); /* the close itself does not clear */
+
+    /* The same slot reconnects with a rotated address; the connect clears all. */
+    connect_n(&c, 0);
+    CHECK(c.sessions[0].connected);
     CHECK(c.sessions[0].delivered == 0 && c.sessions[0].prev_delivered == 0);
     CHECK(!c.sessions[0].sent_glucose && !c.sessions[0].authed && !c.sessions[0].control_on);
     CHECK(c.sessions[0].auth_len == 0);
     CHECK(c.sessions[0].challenge[0] == 0 && c.sessions[0].auth_value[0] == 0);
-
-    connect_n(&c, 0);
-    CHECK(c.sessions[0].connected);
     CHECK(c.sessions[0].connected_at == fk.now && c.sessions[0].last_activity == fk.now);
-    CHECK(c.sessions[0].delivered == 0 && c.sessions[0].prev_delivered == 0);
 
-    /* It receives the latest reading and a full backfill from the fresh cursor. */
     clear_sent();
     cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
     cgm_on_subscribe(&c, 0, CGM_CHR_BACKFILL, true);
     CHECK(c.sessions[0].delivered == last_seq && c.sessions[0].prev_delivered == 0);
     CHECK(count_session(CGM_CHR_BACKFILL, 0) == 2);
-    CHECK(find_session(CGM_CHR_CONTROL, 0x4e, 0, 0) >= 0);
-    cgm_on_disconnect(&c, 0);
-
-    /* The same central reconnects (no closing disconnect): it resumes, so
-     * there is nothing old to backfill again. */
-    connect_n(&c, 0);
-    CHECK(c.sessions[0].delivered == last_seq && c.sessions[0].prev_delivered == last_seq);
-    clear_sent();
-    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
-    cgm_on_subscribe(&c, 0, CGM_CHR_BACKFILL, true);
-    CHECK(count_session(CGM_CHR_BACKFILL, 0) == 0);
     CHECK(find_session(CGM_CHR_CONTROL, 0x4e, 0, 0) >= 0);
     cgm_on_disconnect(&c, 0);
 }
@@ -865,6 +889,7 @@ void test_cgm_all(void)
     test_two_sessions();
     test_tick_delivery();
     test_slot_reuse();
+    test_address_rotate();
     test_single_boundary();
     test_bad_session();
     test_drop_all_sessions();
