@@ -62,6 +62,11 @@ static volatile uint16_t cgmSubs[CGM_CHR_COUNT];
 static std::string cgmAdvData;
 static std::string cgmAdvName;
 static bool cgmAdvOn = false;
+// The sensor's random static address, applied to the CGM advertising instance
+// by tick() (the core hands it in with every advertise() call). Guarded by mu
+// like the advertisement itself.
+static uint8_t cgmAdvAddr[6];
+static bool cgmAdvAddrValid = false;
 // A hang-up the core asked for, done from tick(): the core calls
 // radio::cgmDisconnect from inside its own mutex, so no sensor:: call may
 // happen here before that call returns. The link is the pod's too, so the
@@ -123,11 +128,13 @@ static int pumpSel = PUMP_POD;
 static volatile bool podUsed = false;
 static volatile bool medtrumUsed = false;
 
-static std::string addrString(const ble_addr_t& a) {
+static std::string addrString(const uint8_t* val) {
   char b[18];
-  snprintf(b, sizeof b, "%02X:%02X:%02X:%02X:%02X:%02X", a.val[5], a.val[4], a.val[3], a.val[2], a.val[1], a.val[0]);
+  snprintf(b, sizeof b, "%02X:%02X:%02X:%02X:%02X:%02X", val[5], val[4], val[3], val[2], val[1], val[0]);
   return b;
 }
+
+static std::string addrString(const ble_addr_t& a) { return addrString(a.val); }
 
 static void podPush(uint8_t type, const uint8_t* data, size_t n) {
   dash_ev_t ev = {};
@@ -391,7 +398,7 @@ void begin() {
   NimBLEDevice::init(name.c_str());
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEDevice::setMTU(251);  // Omnipod 5 packets are 244 bytes
-  logf("Bluetooth address %s (the pod, the CGM and the patch are one device)",
+  logf("Bluetooth address %s (the pump and the patch advertise from it; the CGM uses the sensor's)",
        NimBLEDevice::getAddress().toString().c_str());
 
   server = NimBLEDevice::createServer();
@@ -455,9 +462,10 @@ static std::string named(const std::string& name) {
 }
 
 // (Re)configures one advertising set as a legacy connectable advert and starts
-// it. instance 0 is the pump's, instance 1 the CGM's.
+// it. instance 0 is the pump's, instance 1 the CGM's. addr, for the CGM set, is
+// the sensor's random static address; NULL keeps the device address.
 static bool advertise(uint8_t instance, const std::string& data, const std::string& scanRsp,
-                      uint32_t interval) {
+                      uint32_t interval, const uint8_t* addr) {
   NimBLEExtAdvertising* adv = NimBLEDevice::getAdvertising();
   if (ble_gap_ext_adv_active(instance)) adv->stop(instance);
   NimBLEExtAdvertisement a;
@@ -468,7 +476,32 @@ static bool advertise(uint8_t instance, const std::string& data, const std::stri
   a.setMaxInterval(interval);
   a.setTxPower(9);
   a.setData((const uint8_t*)data.data(), data.size());
+  if (addr) {
+    // A set with its own random address has to be configured with the random
+    // own-address type, and NimBLEExtAdvertisement has no other setter for it.
+    // setAddress() also makes setInstanceData() apply the address, and wants
+    // it in printed order: the core's addr[] is the controller's little-endian
+    // order, so reverse it here.
+    uint8_t printed[6];
+    for (int i = 0; i < 6; i++) printed[i] = addr[5 - i];
+    a.setAddress(NimBLEAddress(printed, BLE_ADDR_RANDOM));
+  }
   if (!adv->setInstanceData(instance, a)) return false;
+  // The random address belongs to the instance, not to the advertising data.
+  // setInstanceData() reconfigures the instance, so apply the address again
+  // after it: start() then advertises from the sensor's address, not the
+  // chip's. It also keeps working when the payload changes but the address does
+  // not, since every reconfiguration goes through here.
+  if (addr) {
+    ble_addr_t ra;
+    ra.type = BLE_ADDR_RANDOM;
+    memcpy(ra.val, addr, 6);
+    int rc = ble_gap_ext_adv_set_addr(instance, &ra);
+    if (rc) {
+      logf("advertising set %u: could not set its address: %d", instance, rc);
+      return false;
+    }
+  }
   NimBLEExtAdvertisement r;
   r.setLegacyAdvertising(true);
   r.setData((const uint8_t*)scanRsp.data(), scanRsp.size());
@@ -480,14 +513,15 @@ static bool advertise(uint8_t instance, const std::string& data, const std::stri
 // payload is empty. Each set keeps its own `current`, so one set's change never
 // restarts the other. Returns true when the set was (re)started.
 static bool advertiseSet(uint8_t instance, std::string& current, const std::string& data,
-                         const std::string& scanRsp, uint32_t interval, const char* label) {
+                         const std::string& scanRsp, uint32_t interval, const char* label,
+                         const uint8_t* addr = nullptr) {
   if (data.empty()) {
     if (ble_gap_ext_adv_active(instance)) NimBLEDevice::getAdvertising()->stop(instance);
     current.clear();
     return false;
   }
   if (ble_gap_ext_adv_active(instance) && data == current) return false;
-  if (!advertise(instance, data, scanRsp, interval)) {
+  if (!advertise(instance, data, scanRsp, interval, addr)) {
     static int64_t last = -60000;
     if (monoMs() - last > 10000) {
       last = monoMs();
@@ -500,10 +534,8 @@ static bool advertiseSet(uint8_t instance, std::string& current, const std::stri
 }
 
 void cgmAdvertise(bool on, const char* name, const uint8_t addr[6], uint16_t serialCrc) {
-  // The CGM's own advertising set, on the chip's own address: the core's
-  // per-sensor random static address is not applied here (the apps find the
-  // device by name and service).
-  (void)addr;
+  // The CGM's own advertising set, on the sensor's random static address: the
+  // core generates it and hands it in here; tick() applies it to instance 1.
   std::string nm = name ? name : "";
   // Exactly the reference's CGM advertisement (ESP-Sim's main/ble.c), built by
   // the pure adv_cgm() the host test pins: flags, the complete list of 16-bit
@@ -521,6 +553,10 @@ void cgmAdvertise(bool on, const char* name, const uint8_t addr[6], uint16_t ser
     cgmAdvOn = on && pn != 0;
     cgmAdvData = p;
     cgmAdvName = nm;
+    if (addr) {
+      memcpy(cgmAdvAddr, addr, 6);
+      cgmAdvAddrValid = true;
+    }
   }
   logf("cgm: %s as %s", on && pn ? "advertising" : "not advertising", nm.empty() ? "(off)" : nm.c_str());
 }
@@ -565,6 +601,9 @@ void tick() {
   std::unique_lock<std::mutex> l(mu);
   bool cgmOn = cgmAdvOn;
   std::string cgmData = cgmAdvData, cgmNm = cgmAdvName;
+  uint8_t cgmAddr[6];
+  memcpy(cgmAddr, cgmAdvAddr, sizeof cgmAddr);
+  bool cgmAddrValid = cgmAdvAddrValid;
   std::string podData = podAdvData;
   bool paired = podPaired;
   std::string medData = medtrumAdvData;
@@ -600,13 +639,22 @@ void tick() {
   // Each set keeps its own payload string: "already carrying this" is decided
   // per set, so one set's change never restarts the other.
   static std::string pumpCurrent, cgmCurrent;
-  static unsigned seen = 0;
+  static bool pumpLogged = false, cgmLogged = false;
+  // The address the CGM set is advertising from. It belongs to the advertising
+  // instance rather than the payload, and a new sensor can keep the same name
+  // and serial (the same payload) but get a new random address: force the set
+  // to be reconfigured when that happens.
+  static uint8_t cgmCurrentAddr[6];
+  static bool cgmCurrentAddrValid = false;
+  bool cgmAddrChanged =
+      cgmAddrValid &&
+      (!cgmCurrentAddrValid || memcmp(cgmAddr, cgmCurrentAddr, sizeof cgmCurrentAddr) != 0);
+  if (cgmAddrChanged) cgmCurrent.clear();
 
   // Instance 0: the pump set. The selector names the one pump that may use it;
   // PUMP_OFF, or a pump that does not want to be found, leaves it stopped.
   std::string pumpData, pumpRsp;
   const char* pumpLabel = sel == PUMP_MEDTRUM ? "Medtrum" : "pod";
-  unsigned pumpBit = sel == PUMP_MEDTRUM ? 4u : 2u;
   if (sel == PUMP_POD && podWants) {
     pumpData = podData;
     pumpRsp = named(DASH_ADVERTISED_NAME);
@@ -614,10 +662,10 @@ void tick() {
     pumpData = medData;
     pumpRsp = named("MT");
   }
-  if (advertiseSet(pumpInstance, pumpCurrent, pumpData, pumpRsp, 0x00f4, pumpLabel) &&
-      !(seen & pumpBit)) {
-    seen |= pumpBit;
-    logf("advertising %s (%u bytes)", pumpLabel, (unsigned)pumpData.size());
+  if (advertiseSet(pumpInstance, pumpCurrent, pumpData, pumpRsp, 0x00f4, pumpLabel) && !pumpLogged) {
+    pumpLogged = true;
+    std::string pumpAddr = NimBLEDevice::getAddress().toString();
+    logf("advertising pump on %s (%s, %u bytes)", pumpAddr.c_str(), pumpLabel, (unsigned)pumpData.size());
   }
 
   // Instance 1: the CGM set, whenever the core wants it. Otherwise it stops.
@@ -626,10 +674,16 @@ void tick() {
     cgmSetData = cgmData;
     cgmSetRsp = named(cgmNm);
   }
-  if (advertiseSet(cgmInstance, cgmCurrent, cgmSetData, cgmSetRsp, cgmAdvInterval, "CGM") &&
-      !(seen & 1u)) {
-    seen |= 1u;
-    logf("advertising CGM (%u bytes)", (unsigned)cgmSetData.size());
+  bool cgmStarted = advertiseSet(cgmInstance, cgmCurrent, cgmSetData, cgmSetRsp, cgmAdvInterval, "CGM",
+                                 cgmAddrValid ? cgmAddr : nullptr);
+  if (cgmStarted && !cgmLogged) {
+    cgmLogged = true;
+    std::string cgmAddrText = cgmAddrValid ? addrString(cgmAddr) : "(device address)";
+    logf("advertising CGM on %s (%u bytes)", cgmAddrText.c_str(), (unsigned)cgmSetData.size());
+  }
+  if (cgmStarted && cgmAddrValid) {
+    memcpy(cgmCurrentAddr, cgmAddr, sizeof cgmCurrentAddr);
+    cgmCurrentAddrValid = true;
   }
 }
 
@@ -746,8 +800,8 @@ void podDisconnect() {
 
 // These two are REQUESTS. The pump selector (radio::pump()) decides whose payload
 // the pump advertising set actually carries; only tick() logs what went on air
-// ("advertising <label> (n bytes)"), so a "wants" line here is not evidence that
-// the device is on the air.
+// ("advertising pump on <addr> ..."), so a "wants" line here is not evidence
+// that the device is on the air.
 void podAdvertise(const dash_adv_t* adv) {
   bool o5 = adv->pod_type == DASH_POD_O5;
   // The pod's bytes are the reference's; the pure builders in adv_payload.h

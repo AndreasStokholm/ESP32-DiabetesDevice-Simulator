@@ -3,17 +3,19 @@
 // a pod.
 //
 // A phone cannot hold two connections to one radio, so the board cannot be
-// two Bluetooth devices to the same phone. It is one device, at the chip's
-// own address, whose GATT table carries both the CGM's services and the pod's.
-// The app's CGM code and its pod code each connect to "their" device and share
-// the one link underneath.
+// two Bluetooth devices to the same phone. It is one peripheral (one GATT
+// table, one link) that advertises under two addresses, as ESP-Sim does: the
+// pump set uses the chip's own (device) address, the CGM set the sensor's
+// random static address. The app's CGM code and its pod code each connect to
+// "their" device and share the one link underneath.
 //
 // - Advertising: two sets, as ESP-Sim numbers them. Instance 0 is the pump's:
 //   the pod's advertisement, or the Medtrum base's, whichever the selector
-//   chose (the pod and the base are mutually exclusive). Instance 1 is the
-//   CGM's (G6 or G7), whenever the core has a window open. The pod's and the
-//   base's advertisements each carry exactly their own service list, so they
-//   cannot share a set; the two sets advertise at the same time.
+//   chose (the pod and the base are mutually exclusive), on the device
+//   address. Instance 1 is the CGM's (G6 or G7), whenever the core has a window
+//   open, on the per-sensor random static address the core supplies. The pod's
+//   and the base's advertisements each carry exactly their own service list, so
+//   they cannot share a set; the two sets advertise at the same time.
 // - The link: a real CGM ends the session when the phone has its reading, and
 //   the app's code only asks for a reading after connecting. So the core ends
 //   the link by itself (cgmDisconnect, done from tick()), and both sides
@@ -44,6 +46,8 @@ void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n);
 void cgmDisconnect();
 // serialCrc is CRC-16/XModem of the CGM id, computed by the glue under the
 // core lock: computing it here would take that lock again and deadlock.
+// addr is the sensor's random static address: the CGM set advertises from it;
+// the pump set keeps the device address.
 void cgmAdvertise(bool on, const char* name, const uint8_t addr[6], uint16_t serialCrc);
 bool cgmConnected();
 
