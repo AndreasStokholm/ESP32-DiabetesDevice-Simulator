@@ -63,22 +63,16 @@ int forcedState();
 
 // From the radio, one call per GATT event. These take the core's mutex; the
 // radio must not hold its own lock while calling them (the core calls back
-// into radio::cgmNotify/cgmAdvertise from inside the same lock).
+// into radio::cgmNotify/cgmDisconnect from inside the same lock).
 //
-// The core models one session, but the board has up to two CGM centrals: the
-// first onConnect opens the core's session (cgm_on_connect) and only the last
-// onDisconnect closes it (cgm_on_disconnect). A watch coming or going while the
-// phone reads therefore does not reset the session's state machine.
-void onConnect();
-void onDisconnect();
-void onSubscribe(cgm_chr_t chr, bool on);
-void onWrite(cgm_chr_t chr, const uint8_t* p, size_t n);
+// The session token is the central's core session (0..CGM_MAX_SESSIONS-1). The
+// radio creates one on a link's first CGM event and closes that one when the
+// link goes: a watch coming or going does not reset the phone's login or
+// reading cursor.
+void onConnect(cgm_session_t session);
+void onDisconnect(cgm_session_t session);
+void onSubscribe(cgm_session_t session, cgm_chr_t chr, bool on);
+void onWrite(cgm_session_t session, cgm_chr_t chr, const uint8_t* p, size_t n);
 // Fills out with the auth characteristic's value; returns its length.
-size_t onRead(cgm_chr_t chr, uint8_t* out, size_t cap);
-
-// How many live CGM links are subscribed to a reading characteristic and have
-// been sent a reading this session. The radio owns this per-link count; this
-// wrapper exists for the status panel and delegates to it (taking the radio's
-// mutex), so it must not be called while the radio's lock is held.
-int cgmCollectedCentrals();
+size_t onRead(cgm_session_t session, cgm_chr_t chr, uint8_t* out, size_t cap);
 }  // namespace sensor

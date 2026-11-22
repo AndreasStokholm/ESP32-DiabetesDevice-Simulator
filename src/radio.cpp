@@ -58,52 +58,33 @@ static std::mutex mu;
 // phone's pump -- so their code asks the helpers below for "the" link. Guarded
 // by mu.
 static const int kMaxLinks = 2;
+static_assert(kMaxLinks == CGM_MAX_SESSIONS, "one core session per Bluetooth link");
 struct Link {
   uint16_t handle;
   bool used;
   bool podUsed;
   bool medtrumUsed;
-  bool cgmSubscribed;  // subscribed to a characteristic that carries readings
   uint32_t lastTraffic;
-  // Beyond the bookkeeping above: whether the CGM touched this link (its first
-  // GATT event), whether it has been sent a reading since it connected (the
-  // hang-up's "collected" test), whether the injected-accept decision was
-  // deferred until the first event named the device, and a generation so a
-  // queued notification cannot reach a link that reused the handle.
+  // The CGM's session for this link (a core session token, 0..CGM_MAX_SESSIONS-1)
+  // and whether the CGM touched the link at all. The core owns each central's
+  // login, deliveries and backfill cursor; the radio only maps token -> link.
   bool cgmUsed;
-  bool cgmCollected;
+  cgm_session_t cgmSession;
   // One bit per FailDevice whose injected accept decision was taken on this
   // link. Deferred decisions are per (link, device): a link that first touched
   // the CGM service can still exercise a pending pod drop on its first pod
   // event, and vice versa.
   uint8_t acceptMask;
-  // Serial of the last CONTROL reading queued to this link. A CONTROL
-  // subscription after the core stopped sending (sent_glucose set) replays the
-  // cached reading unless this link was already a recipient of the latest one.
-  uint32_t cgmReadingQueued;
   uint32_t gen;
 };
 static Link links[kMaxLinks];
 // Unique per connection, never reset: a queued CGM notification or a pending
 // termination must not match a later link that reused the handle.
 static uint32_t linkGenCounter = 0;
-// The CCCD value per link and CGM characteristic: a notification goes to every
-// central subscribed to the characteristic that carries it. Guarded by mu.
+// The CCCD value per link and CGM characteristic: the core sends to one
+// session, and this says whether that link subscribed to the characteristic.
+// Guarded by mu.
 static uint16_t cgmSubs[kMaxLinks][CGM_CHR_COUNT];
-// The handle of the subscribed central that made the last hang-up wait (0 when
-// none did), only so the wait is logged once per handle. Guarded by mu.
-static uint16_t cgmHeldBy = 0;
-// The last CONTROL reading frame the core emitted this session. The core's
-// push_glucose() refuses to send again once sent_glucose is set, so a central
-// that subscribes CONTROL after the first reading would otherwise never receive
-// one; onSubscribe replays this frame to that link. Guarded by mu.
-static uint8_t cgmLastReading[32];  // CgmOut::data below
-static size_t cgmLastReadingLen = 0;
-static bool cgmLastReadingValid = false;
-// Bumped whenever the core emits a CONTROL reading. onSubscribe snapshots it to
-// tell whether the core answered the subscription itself (and replay is then
-// unnecessary). Guarded by mu.
-static uint32_t cgmReadingSerial = 0;
 
 // The CGM's side of the link: the handles the core's notifications go to and
 // the advert the core asked for. Guarded by mu (handles are written before the
@@ -122,31 +103,27 @@ static bool cgmAdvOn = false;
 // like the advertisement itself.
 static uint8_t cgmAdvAddr[6];
 static bool cgmAdvAddrValid = false;
-// A hang-up the core asked for, done from tick(): the core calls
-// radio::cgmDisconnect from inside its own mutex, so no sensor:: call may
-// happen here before that call returns. The CGM's links are independent of the
-// pump's, so there is no pump-traffic pause to wait for; the hang-up waits
-// until every subscribed CGM central has been sent a reading, with a 20 s
-// deadline (see tick()).
-static volatile bool cgmDrop = false;
-// The 20 s deadline: a separate flag, so a zero timestamp is not also "no
-// deadline" (tick is the only writer while the drop is pending; cgmDisconnect
-// starts a fresh one when a new request arrives).
-static volatile bool cgmDropTimed = false;
-static volatile uint32_t cgmDropAt = 0;  // 32-bit monotonic ms; tick's clock
+// A hang-up the core asked for, one entry per session. The core calls
+// radio::cgmDisconnect(session) from inside its own mutex, so tick() carries
+// out the termination: no sensor:: call may happen there before the core's call
+// returns. Each entry names the link and generation that held the session when
+// the core asked, so a reused link cannot be terminated by a stale request.
+// Guarded by mu.
+struct CgmDrop {
+  bool on;
+  uint16_t handle;
+  uint32_t gen;
+};
+static CgmDrop cgmDrops[kMaxLinks];
 
 // The CGM's notifications go through a queue and a task of their own: the core
-// calls radio::cgmNotify from inside its mutex, so the injected delay is
-// waited out here, never while the core's mutex is held. The order is kept,
-// and every recipient's link, generation and subscription are re-checked after
-// the wait.
+// calls radio::cgmNotify from inside its mutex, so the injected delay is waited
+// out here, never while the core's mutex is held. One queue entry is one core
+// send to one session's link; the order is kept and the recipient's link,
+// generation and subscription are re-checked after the wait.
 struct CgmOut {
-  struct To {
-    uint16_t handle;  // the link it was queued for
-    uint32_t gen;     // ...and its generation
-  };
-  To to[kMaxLinks];
-  uint8_t nTo;       // 0..kMaxLinks: every central subscribed at queue time
+  uint16_t handle;  // the link it was queued for
+  uint32_t gen;     // ...and its generation
   uint8_t chr;
   uint8_t len;
   uint8_t data[32];
@@ -249,6 +226,16 @@ static int cgmCountLocked() {
   return n;
 }
 
+// The link a core session is on, or nullptr. Session tokens are not reused by
+// a new link until cgm_on_disconnect has closed the old session, and every
+// queued frame also carries the link's generation.
+static Link* linkForSessionLocked(cgm_session_t session) {
+  for (int i = 0; i < kMaxLinks; i++) {
+    if (links[i].used && links[i].cgmUsed && links[i].cgmSession == session) return &links[i];
+  }
+  return nullptr;
+}
+
 static bool isLive(uint16_t h) {
   std::lock_guard<std::mutex> l(mu);
   return slotLocked(h) >= 0;
@@ -303,21 +290,22 @@ static bool markPump(uint16_t h, bool podSide) {
   return fresh;
 }
 
-// The CGM's first GATT event on a link: the core is told once per link (the
-// glue maps that to its one session), and the link is marked the CGM's. The
-// first CGM event of a session drops the previous session's cached reading.
-static bool markCgmUsed(uint16_t h) {
+// The CGM's first GATT event on a link: the link is marked the CGM's and gets a
+// core session token (the link's slot). The caller tells the core once, outside
+// this lock. A link that is already the CGM's keeps its session.
+static bool markCgmUsed(uint16_t h, cgm_session_t* session, bool* fresh) {
   std::lock_guard<std::mutex> l(mu);
   Link* lk = linkLocked(h);
   if (!lk) return false;
   lk->lastTraffic = (uint32_t)monoMs();
-  if (lk->cgmUsed) return false;
-  if (cgmCountLocked() == 0) {
-    cgmLastReadingValid = false;
-    cgmLastReadingLen = 0;
-    ++cgmReadingSerial;  // a subscription in flight must not replay the old one
+  if (!lk->cgmUsed) {
+    lk->cgmSession = (cgm_session_t)slotLocked(h);
+    lk->cgmUsed = true;
+    *fresh = true;
+  } else {
+    *fresh = false;
   }
-  lk->cgmUsed = true;
+  *session = lk->cgmSession;
   return true;
 }
 
@@ -326,20 +314,6 @@ static void setCgmSub(uint16_t h, cgm_chr_t chr, uint16_t subValue) {
   int i = slotLocked(h);
   if (i < 0) return;
   cgmSubs[i][chr] = subValue;
-  // "Subscribed" for the hang-up means subscribed to something that carries a
-  // reading: CONTROL (the glucose notifications) or BACKFILL (the records a
-  // receiver catches up on). Auth and COMM alone are not a reading collector.
-  links[i].cgmSubscribed = cgmSubs[i][CGM_CHR_CONTROL] != 0 || cgmSubs[i][CGM_CHR_BACKFILL] != 0;
-}
-
-// Whether this notification carries a reading, so the link that receives it has
-// collected. CONTROL is the glucose message (G6 0x31/0x4f, G7 0x4e); BACKFILL
-// carries the missed records. Other CONTROL replies (session status, version)
-// are not the reading.
-static bool cgmCarriesReading(uint8_t chr, const uint8_t* d, size_t n) {
-  if (chr == CGM_CHR_BACKFILL) return n >= 2;
-  if (chr != CGM_CHR_CONTROL || n < 1) return false;
-  return d[0] == 0x31 || d[0] == 0x4f || d[0] == 0x4e;
 }
 
 // Whether another live link already holds this pump. A pump is one phone's, so
@@ -352,34 +326,6 @@ static bool pumpOwnedByOther(uint16_t h, bool podSide) {
     if (podSide ? links[i].podUsed : links[i].medtrumUsed) return true;
   }
   return false;
-}
-
-// Queue one CGM frame to one link (used to replay the current reading to a
-// late CONTROL subscriber). The send task re-checks the link's generation and
-// subscription before it calls the stack.
-static void cgmQueueTo(uint16_t h, cgm_chr_t chr, const uint8_t* p, size_t n) {
-  if (!cgmOut || n > sizeof(CgmOut::data)) return;
-  CgmOut m = {};
-  m.chr = (uint8_t)chr;
-  m.len = (uint8_t)n;
-  if (n) memcpy(m.data, p, n);
-  {
-    std::lock_guard<std::mutex> l(mu);
-    int i = slotLocked(h);
-    if (i < 0 || !links[i].cgmUsed || cgmSubs[i][chr] == 0) return;
-    m.to[0].handle = links[i].handle;
-    m.to[0].gen = links[i].gen;
-    m.nTo = 1;
-    links[i].cgmReadingQueued = cgmReadingSerial;
-  }
-  if (xQueueSend(cgmOut, &m, 0) != pdTRUE) logf("cgm: notification queue full: a replay was dropped");
-}
-
-static size_t cgmLastReadingSnapshot(uint8_t* out, size_t cap) {
-  std::lock_guard<std::mutex> l(mu);
-  if (!cgmLastReadingValid || cgmLastReadingLen > cap) return 0;
-  memcpy(out, cgmLastReading, cgmLastReadingLen);
-  return cgmLastReadingLen;
 }
 
 // Ends one link, but only the same connection: the handle may have been reused
@@ -503,45 +449,35 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   void onDisconnect(NimBLEServer*, ble_gap_conn_desc* desc) override {
     uint16_t h = desc->conn_handle;
     bool hadCgm = false, hadPod = false, hadMed = false, anyCgmLeft = false;
+    cgm_session_t cgmSession = 0;
     {
       std::lock_guard<std::mutex> l(mu);
       int i = slotLocked(h);
       if (i < 0) return;
       hadCgm = links[i].cgmUsed;
+      cgmSession = links[i].cgmSession;
       hadPod = links[i].podUsed;
       hadMed = links[i].medtrumUsed;
       // No stale CCCD: a notification queued for this link is dropped (the
       // generation check), and a new central has to subscribe afresh.
       for (int c = 0; c < CGM_CHR_COUNT; c++) cgmSubs[i][c] = 0;
+      cgmDrops[i] = CgmDrop{};
       links[i] = Link{};
       anyCgmLeft = cgmCountLocked() > 0;
       // Mirror the core's silent advertising-off after a connection. The core
       // set c->advertising = false in cgm_on_connect without calling
-      // advertise(false); onDisconnect only clears c->connected, so a window
+      // advertise(false); onDisconnect only clears that session, so a window
       // the core considers closed is never announced. With no CGM link left,
       // the radio's copy can only follow that false; if the core opens a new
       // window it calls advertise(true) again.
       if (!anyCgmLeft) cgmAdvOn = false;
-      // Drop the cached reading too: it belongs to the session that just ended.
-      if (!anyCgmLeft) {
-        cgmLastReadingValid = false;
-        cgmLastReadingLen = 0;
-        ++cgmReadingSerial;
-        cgmHeldBy = 0;
-      }
-    }
-    // The hang-up belongs to the CGM session; it survives one central leaving
-    // while another is still on the air.
-    if (!anyCgmLeft) {
-      cgmDrop = false;
-      cgmDropTimed = false;
     }
     std::string addr = addrString(desc->peer_ota_addr);
     logf("%s disconnected (handle 0x%04x; %s%s%s)", addr.c_str(), h, hadCgm ? "cgm " : "",
          hadPod ? "pod " : "", hadMed ? "medtrum" : "");
-    // The core is told once per link; the glue maps that to its one session
-    // (the first connect opens it, the last disconnect closes it).
-    if (hadCgm) sensor::onDisconnect();
+    // Close exactly the core session this link held. A watch leaving does not
+    // touch the phone's session.
+    if (hadCgm) sensor::onDisconnect(cgmSession);
     if (hadMed) {
       medtrumStatusNotify = false;
       medtrumPush(MEDTRUM_EV_DISCONNECTED, nullptr, 0);
@@ -553,20 +489,23 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 // One GATT event each way for the core: the core's own protocol runs inside
 // sensor::, so the radio only maps UUID to cgm_chr_t and hands the bytes over.
 
-// The CGM's first event on a link: tell the core, and mark the link the CGM's.
-// The core is told once per link; sensor_app maps the first connect to its one
-// session and the last disconnect out of it.
+// The CGM's first event on a link: give the link a core session and tell the
+// core, once. The session token is the link's slot, so every later send and
+// hang-up names exactly one central; cgmNotify and cgmDisconnect map it back
+// through linkForSessionLocked().
 //
 // The CGM advertising set is deliberately NOT cleared here. cgm_on_connect()
-// sets the core's c->advertising = false without calling advertise(false), and
-// with two links the set must stay on while a slot remains: otherwise a watch
-// that scans after the phone connected could never find the sensor. tick()
+// sets the core's own advertising flag false without calling advertise(false),
+// and with two links the set must stay on while a slot remains: otherwise a
+// watch that scans after the phone connected could never find the sensor. tick()
 // stops the set once both links are the CGM's. When the last CGM link leaves,
 // onDisconnect() clears the radio's copy to match that silent false; the core
 // calls advertise(true) again if it opens a new window.
-static void cgmLinkUp(uint16_t h) {
-  if (!markCgmUsed(h)) return;
-  sensor::onConnect();
+static bool cgmLinkUp(uint16_t h, cgm_session_t* session) {
+  bool fresh = false;
+  if (!markCgmUsed(h, session, &fresh)) return false;
+  if (fresh) sensor::onConnect(*session);
+  return true;
 }
 
 class CgmCallbacks : public NimBLECharacteristicCallbacks {
@@ -577,51 +516,37 @@ class CgmCallbacks : public NimBLECharacteristicCallbacks {
     uint16_t h = eventHandle(desc);
     if (h == BLE_HS_CONN_HANDLE_NONE || !isLive(h)) return;
     if (!acceptCheck(h, FAIL_CGM, "cgm")) return;
-    cgmLinkUp(h);
+    cgm_session_t session;
+    if (!cgmLinkUp(h, &session)) return;
     if (fail_decide(FAIL_CGM, FAIL_CONSUME_MESSAGE, 0)) {
       logf("cgm: injected failure: message ignored");
       return;
     }
     NimBLEAttValue v = ch->getValue();
-    sensor::onWrite(chr, v.data(), v.length());
+    sensor::onWrite(session, chr, v.data(), v.length());
   }
 
   void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc* desc, uint16_t subValue) override {
     uint16_t h = eventHandle(desc);
     if (h == BLE_HS_CONN_HANDLE_NONE || !isLive(h)) return;
     if (!acceptCheck(h, FAIL_CGM, "cgm")) return;
-    cgmLinkUp(h);
-    // The core answers a subscription at once (the auth status, the reading), so
-    // the CCCD value is recorded first: cgmNotify sends only to a subscriber.
+    cgm_session_t session;
+    if (!cgmLinkUp(h, &session)) return;
+    // The core answers a subscription at once (the auth status, the cached
+    // reading for that session), so the CCCD value is recorded first: cgmNotify
+    // sends only to a subscriber.
     setCgmSub(h, chr, subValue);
-    sensor::onSubscribe(chr, subValue != 0);
-    // A central that subscribes CONTROL after the phone already collected would
-    // otherwise never get a glucose message: replay the session's last reading
-    // to it, unless this link was already a recipient of the latest one (the
-    // core answered the subscription itself).
-    if (chr == CGM_CHR_CONTROL && subValue != 0) {
-      uint8_t cached[32];
-      size_t cachedLen = cgmLastReadingSnapshot(cached, sizeof cached);
-      bool covered = false;
-      {
-        std::lock_guard<std::mutex> l(mu);
-        Link* lk = linkLocked(h);
-        covered = lk && lk->cgmReadingQueued == cgmReadingSerial;
-      }
-      if (cachedLen && !covered) {
-        cgmQueueTo(h, chr, cached, cachedLen);
-        logf("cgm: replayed the current reading to handle 0x%04x", h);
-      }
-    }
+    sensor::onSubscribe(session, chr, subValue != 0);
   }
 
   void onRead(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
     uint16_t h = eventHandle(desc);
     if (h == BLE_HS_CONN_HANDLE_NONE || !isLive(h)) return;
     if (!acceptCheck(h, FAIL_CGM, "cgm")) return;
-    cgmLinkUp(h);
+    cgm_session_t session;
+    if (!cgmLinkUp(h, &session)) return;
     uint8_t buf[64];
-    size_t n = sensor::onRead(chr, buf, sizeof buf);
+    size_t n = sensor::onRead(session, chr, buf, sizeof buf);
     if (n) ch->setValue(buf, n);
   }
 
@@ -925,75 +850,28 @@ void cgmAdvertise(bool on, const char* name, const uint8_t addr[6], uint16_t ser
 }
 
 void tick() {
-  // A hang-up the core asked for: carried out here, never from inside the
-  // call that asked (the core holds its mutex there, and the NimBLE disconnect
-  // callback calls back into the core). With two CGM links it must end only
-  // when every subscribed central has collected (or the 20 s deadline fires).
-  // The CGM links no longer share a link with the pump, so there is no pump
-  // traffic pause to wait for.
+  // A hang-up the core asked for, one session at a time: carried out here,
+  // never from inside the call that asked (the core holds its mutex there, and
+  // the NimBLE disconnect callback calls back into it). Each entry names the
+  // link and generation the session was on, so a reused handle is left alone.
   int64_t now = monoMs();
-  uint32_t now32 = (uint32_t)now;  // the cross-task timestamps are 32-bit
-  if (cgmDrop) {
+  {
     uint16_t victims[kMaxLinks];
     uint32_t gens[kMaxLinks];
     int nVictims = 0;
-    uint16_t heldBy = 0;
-    bool heldChanged = false;
-    int cgmCount = 0;
     {
       std::lock_guard<std::mutex> l(mu);
       for (int i = 0; i < kMaxLinks; i++) {
-        Link& lk = links[i];
-        if (!lk.used || !lk.cgmUsed) continue;
-        cgmCount++;
-        victims[nVictims] = lk.handle;
-        gens[nVictims] = lk.gen;
+        if (!cgmDrops[i].on) continue;
+        victims[nVictims] = cgmDrops[i].handle;
+        gens[nVictims] = cgmDrops[i].gen;
         nVictims++;
-        // A subscribed central that has not been sent a reading yet is still
-        // collecting. Its handle is the one that holds the hang-up: every CGM
-        // link stays up until all of them have collected.
-        if (lk.cgmSubscribed && !lk.cgmCollected && heldBy == 0) heldBy = lk.handle;
-      }
-      // Only for one log line, but every read and write is under mu.
-      if (cgmCount == 0) {
-        cgmHeldBy = 0;
-      } else if (heldBy) {
-        if (cgmHeldBy != heldBy) {
-          cgmHeldBy = heldBy;
-          heldChanged = true;
-        }
-      } else {
-        cgmHeldBy = 0;
+        cgmDrops[i] = CgmDrop{};
       }
     }
-    if (heldChanged) {
-      logf("cgm: hang-up held open by handle 0x%04x: it is subscribed to the reading but has not collected yet",
-           heldBy);
-    }
-    if (!cgmCount) {
-      // The links are gone, or the CGM never used them: nothing to end here.
-      cgmDrop = false;
-      cgmDropTimed = false;
-    } else {
-      if (!cgmDropTimed) {
-        cgmDropTimed = true;
-        cgmDropAt = now32;
-      }
-      int32_t sinceDrop = (int32_t)(now32 - cgmDropAt);
-      bool overdue = sinceDrop >= 20000;
-      // All subscribed centrals have collected, or the 20 s deadline fired.
-      // Only the same connections are ended: the handle may have been reused
-      // while this tick decided (terminateLink checks under mu).
-      if (!heldBy || overdue) {
-        {
-          std::lock_guard<std::mutex> l(mu);
-          cgmHeldBy = 0;
-        }
-        cgmDrop = false;
-        cgmDropTimed = false;
-        logf("cgm: hanging up so the centrals collect the reading");
-        for (int i = 0; i < nVictims; i++) terminateLink(victims[i], gens[i]);
-      }
+    if (nVictims) {
+      logf("cgm: hanging up %d session%s", nVictims, nVictims == 1 ? "" : "s");
+      for (int i = 0; i < nVictims; i++) terminateLink(victims[i], gens[i]);
     }
   }
 
@@ -1017,15 +895,16 @@ void tick() {
   // instance 1 is the CGM's. The pump set stops once its own phone is on the
   // link; another link (a CGM central) does not stop it. The CGM set stays on
   // while a link is free, so a watch can find the sensor after the phone
-  // connected, and closes when both links are in use, when the core's window
-  // closes, or while a hang-up is pending. An injected quiet window only clears
+  // connected, and closes when both links are in use or when the core's window
+  // closes. A hang-up of one session does not stop the set while the other
+  // session (or a free slot) needs it. An injected quiet window only clears
   // that device's want flag; its payload string is untouched.
   // The pod and the Medtrum base are mutually exclusive: exactly one of the two
   // may use the pump set, and PUMP_OFF lets neither.
   int sel = pump();
   bool podWants = sel == PUMP_POD && !podData.empty() && (!podUp || !paired);
   bool medWants = sel == PUMP_MEDTRUM && medOn && !medData.empty() && !medUp;
-  bool cgmWants = (int)sensor::kind() != 0 && cgmOn && live < kMaxLinks && !cgmDrop;
+  bool cgmWants = (int)sensor::kind() != 0 && cgmOn && live < kMaxLinks;
   cgmWants = cgmWants && fail_decide(FAIL_CGM, FAIL_ADVERTISE, now);
   podWants = podWants && fail_decide(FAIL_POD, FAIL_ADVERTISE, now);
   medWants = medWants && fail_decide(FAIL_MEDTRUM, FAIL_ADVERTISE, now);
@@ -1106,65 +985,58 @@ int openLinks() {
 
 // MARK: - The CGM's radio
 
-// Sends every queued notification to each central that was subscribed to the
-// characteristic when it was queued, after the injected delay. "Every" is the
-// difference from the old single-link code: a phone and a watch subscribed to
-// CONTROL both receive the reading.
+// Sends one queued notification to the one session's link, after the injected
+// delay. The core emits one send per session, so a phone and a watch each get
+// their own frame; this task only delivers it.
 static void cgmSendTask(void*) {
   CgmOut m = {};
   for (;;) {
     if (xQueueReceive(cgmOut, &m, portMAX_DELAY) != pdTRUE) continue;
     unsigned delay = (unsigned)fail_decide(FAIL_CGM, FAIL_NOTIFY_DELAY_MS, 0);
     if (delay) vTaskDelay(pdMS_TO_TICKS(delay));
-    for (int r = 0; r < m.nTo; r++) {
-      uint16_t c = m.to[r].handle;
-      bool notSub = false, noBuf = false;
-      int failRc = 0;
-      {
-        // The liveness/generation/subscription check and the stack call are
-        // under one lock: a disconnect + handle reuse cannot slip in between.
-        // GATT/GAP events are queued, so the call does not dispatch into us.
-        std::lock_guard<std::mutex> l(mu);
-        int i = slotLocked(c);
-        if (i < 0 || links[i].gen != m.to[r].gen || !links[i].cgmUsed) continue;
-        uint16_t sub = cgmSubs[i][m.chr];
-        if (!sub) {
-          notSub = true;
+    uint16_t c = m.handle;
+    bool notSub = false, noBuf = false;
+    int failRc = 0;
+    {
+      // The liveness/generation/subscription check and the stack call are
+      // under one lock: a disconnect + handle reuse cannot slip in between.
+      // GATT/GAP events are queued, so the call does not dispatch into us.
+      std::lock_guard<std::mutex> l(mu);
+      int i = slotLocked(c);
+      if (i < 0 || links[i].gen != m.gen || !links[i].cgmUsed) continue;
+      uint16_t sub = cgmSubs[i][m.chr];
+      if (!sub) {
+        notSub = true;
+      } else {
+        os_mbuf* om = ble_hs_mbuf_from_flat(m.data, m.len);
+        if (!om) {
+          noBuf = true;
         } else {
-          os_mbuf* om = ble_hs_mbuf_from_flat(m.data, m.len);
-          if (!om) {
-            noBuf = true;
-          } else {
-            // A central subscribes to notify, or (the auth characteristic) to
-            // indicate.
-            failRc = (sub & 1) ? ble_gattc_notify_custom(c, cgmHandles[m.chr], om)
-                               : ble_gattc_indicate_custom(c, cgmHandles[m.chr], om);
-            if (failRc == 0) {
-              // Delivered: if it carries the reading, this central has
-              // collected, so it no longer holds a hang-up.
-              if (cgmCarriesReading(m.chr, m.data, m.len)) links[i].cgmCollected = true;
-              links[i].lastTraffic = (uint32_t)monoMs();
-            }
-          }
+          // A central subscribes to notify, or (the auth characteristic) to
+          // indicate.
+          failRc = (sub & 1) ? ble_gattc_notify_custom(c, cgmHandles[m.chr], om)
+                             : ble_gattc_indicate_custom(c, cgmHandles[m.chr], om);
+          if (failRc == 0) links[i].lastTraffic = (uint32_t)monoMs();
         }
       }
-      if (notSub) {
-        logf("cgm: %s -> %s dropped: handle 0x%04x is no longer subscribed", cgmCharNames[m.chr],
-             hexstr(m.data, m.len).c_str(), c);
-      } else if (noBuf) {
-        logf("cgm: notification dropped: no buffers");
-      } else if (failRc != 0) {
-        logf("cgm: notification to handle 0x%04x failed: %d", c, failRc);
-      }
+    }
+    if (notSub) {
+      logf("cgm: %s -> %s dropped: handle 0x%04x is no longer subscribed", cgmCharNames[m.chr],
+           hexstr(m.data, m.len).c_str(), c);
+    } else if (noBuf) {
+      logf("cgm: notification dropped: no buffers");
+    } else if (failRc != 0) {
+      logf("cgm: notification to handle 0x%04x failed: %d", c, failRc);
     }
   }
 }
 
-// Called by the core from inside its own mutex: queue the message for every
-// central subscribed to its characteristic and return. The task above sends
-// it once per central, as the reference's ble_cgm_send does (no ENOMEM retry
-// loop), and applies that device's injected delay once.
-void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n) {
+// Called by the core from inside its own mutex, with the session that asked for
+// this send: queue it for that session's link and return. The task above sends
+// it (no ENOMEM retry loop), applying the injected delay once. If the session's
+// link has gone, or never subscribed to the characteristic, there is nobody to
+// send to.
+void cgmNotify(cgm_session_t session, cgm_chr_t chr, const uint8_t* p, size_t n) {
   if (!cgmOut) return;
   if (n > sizeof(CgmOut::data)) {
     logf("cgm: a %u-byte notification does not fit the queue; dropped", (unsigned)n);
@@ -1176,59 +1048,42 @@ void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n) {
   if (n) memcpy(m.data, p, n);
   {
     std::lock_guard<std::mutex> l(mu);
-    // Keep the session's last CONTROL reading for a late CONTROL subscriber.
-    bool reading = chr == CGM_CHR_CONTROL && cgmCarriesReading((uint8_t)chr, p, n);
-    if (reading) {
-      memcpy(cgmLastReading, p, n);
-      cgmLastReadingLen = n;
-      cgmLastReadingValid = true;
-      ++cgmReadingSerial;
+    Link* lk = linkForSessionLocked(session);
+    if (!lk) {
+      logf("cgm: session %u has no live link", (unsigned)session);
+      return;
     }
-    for (int i = 0; i < kMaxLinks; i++) {
-      if (!links[i].used || !links[i].cgmUsed || cgmSubs[i][chr] == 0) continue;
-      if (reading) links[i].cgmReadingQueued = cgmReadingSerial;
-      m.to[m.nTo].handle = links[i].handle;
-      m.to[m.nTo].gen = links[i].gen;
-      m.nTo++;
+    int i = slotLocked(lk->handle);
+    if (i < 0 || cgmSubs[i][chr] == 0) {
+      logf("cgm: %s -> session %u is not subscribed", cgmCharNames[chr], (unsigned)session);
+      return;
     }
-  }
-  if (m.nTo == 0) {
-    logf("cgm: %s -> no subscribed central", cgmCharNames[chr]);
-    return;
+    m.handle = lk->handle;
+    m.gen = lk->gen;
   }
   if (xQueueSend(cgmOut, &m, 0) != pdTRUE) logf("cgm: notification queue full: a message was dropped");
 }
 
 // The core calls this from inside its own mutex, possibly on the NimBLE
-// callback thread: only mark the hang-up. tick() terminates the CGM's links
-// (if the CGM ever used them), and the NimBLE disconnect callback then calls
-// sensor::onDisconnect for each.
-void cgmDisconnect() {
-  bool any;
-  {
-    std::lock_guard<std::mutex> l(mu);
-    any = cgmCountLocked() > 0;
-  }
-  if (!any) return;
-  // A request that arrives while none is pending starts a fresh 20 s deadline;
-  // the core asks again every second while it is pending, which must not
-  // restart it.
-  if (!cgmDrop) cgmDropTimed = false;
-  cgmDrop = true;
+// callback thread, with the one session it is done with: only mark that
+// session's hang-up. tick() terminates that link, and the NimBLE disconnect
+// callback then calls sensor::onDisconnect for that session.
+void cgmDisconnect(cgm_session_t session) {
+  std::lock_guard<std::mutex> l(mu);
+  Link* lk = linkForSessionLocked(session);
+  if (!lk) return;  // the session's link has already gone
+  int i = slotLocked(lk->handle);
+  if (i < 0) return;
+  // The core asks again every second until the link closes; overwriting with
+  // the current link is harmless and keeps a reused link's request current.
+  cgmDrops[i].on = true;
+  cgmDrops[i].handle = lk->handle;
+  cgmDrops[i].gen = lk->gen;
 }
 
 bool cgmConnected() {
   std::lock_guard<std::mutex> l(mu);
   return cgmCountLocked() > 0;
-}
-
-int cgmCollectedCentrals() {
-  std::lock_guard<std::mutex> l(mu);
-  int n = 0;
-  for (int i = 0; i < kMaxLinks; i++) {
-    if (links[i].used && links[i].cgmUsed && links[i].cgmSubscribed && links[i].cgmCollected) n++;
-  }
-  return n;
 }
 
 // MARK: - The pod's radio
