@@ -323,7 +323,9 @@ enum {
 
 /* The delivery model. The commands project it into `status`, and
  * medtrum_patch_tick keeps the clock, the bolus progress, the temp basal and
- * the patch age moving. */
+ * the patch age moving. A running bolus consumes the reservoir in `status`:
+ * each tick subtracts the pulses it newly delivered, and an empty reservoir
+ * stops the bolus short of its total. */
 typedef struct {
     uint8_t patch_id[4];      /* the active patch's id */
     uint32_t patch_time;      /* the patch's clock, Medtrum seconds */
@@ -384,7 +386,10 @@ int medtrum_patch_command(medtrum_patch_t *p, uint8_t command, uint8_t sequence,
                           size_t content_len, medtrum_frag_t *frags, size_t max_frags);
 
 /* Advances the patch clock, the bolus progress, the temp basal and the patch
- * age. `now_ms` is the platform's wall clock; the first call only records it. */
+ * age. `now_ms` is the platform's wall clock; the first call only records it.
+ * A running bolus also drains `status.reservoir` by the pulses it newly
+ * delivered (never by the running total), clamping at zero and ending the
+ * bolus when the reservoir is empty. */
 void medtrum_patch_tick(medtrum_patch_t *p, int64_t now_ms);
 
 /* Direct setters, for the control panel and for tests. */

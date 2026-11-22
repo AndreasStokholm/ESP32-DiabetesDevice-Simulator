@@ -328,15 +328,31 @@ void medtrum_patch_tick(medtrum_patch_t *p, int64_t now_ms)
     }
     p->delivery.patch_time += elapsed;
 
-    /* A bolus runs at 1.5 U/min: 0.5 pulses a second, one pulse every two. */
+    /* A bolus runs at 1.5 U/min: 0.5 pulses a second, one pulse every two.
+     * The reservoir is charged the INCREMENT since the last tick, never the
+     * running total, so a repeated tick cannot deliver the same pulse twice. */
     if (p->delivery.bolus_active) {
-        uint32_t delivered = (p->delivery.patch_time - p->delivery.bolus_start) / 2;
-        if (delivered >= p->delivery.bolus_total) {
-            delivered = p->delivery.bolus_total;
+        uint32_t pulses = (p->delivery.patch_time - p->delivery.bolus_start) / 2;
+        if (pulses >= p->delivery.bolus_total) {
+            pulses = p->delivery.bolus_total;
             p->delivery.bolus_active = false;
             p->status.bolus_completed = true;
         }
-        p->status.bolus_delivered = (uint16_t)delivered;
+        uint16_t delivered = (uint16_t)pulses;
+        uint16_t increment = delivered > p->status.bolus_delivered
+                                 ? (uint16_t)(delivered - p->status.bolus_delivered)
+                                 : 0;
+        if (increment > p->status.reservoir) {
+            /* Only what is left in the reservoir can be delivered. */
+            increment = p->status.reservoir;
+        }
+        p->status.reservoir = (uint16_t)(p->status.reservoir - increment);
+        p->status.bolus_delivered = (uint16_t)(p->status.bolus_delivered + increment);
+        if (p->status.reservoir == 0 && p->delivery.bolus_active) {
+            /* A real patch reports an empty reservoir rather than pumping
+             * air, so the bolus stops here, short of its total. */
+            p->delivery.bolus_active = false;
+        }
     }
 
     /* A temp basal ends on its own. */
@@ -351,6 +367,7 @@ void medtrum_patch_tick(medtrum_patch_t *p, int64_t now_ms)
     }
 }
 
+/* Absolute, not a decrement: the control panel's "set the reservoir". */
 void medtrum_patch_set_reservoir(medtrum_patch_t *p, uint16_t pulses)
 {
     p->status.reservoir = pulses;
