@@ -64,7 +64,6 @@ struct Link {
   bool used;
   bool podUsed;
   bool medtrumUsed;
-  uint32_t lastTraffic;
   // The CGM's session for this link (a core session token, 0..CGM_MAX_SESSIONS-1)
   // and whether the CGM touched the link at all. The core owns each central's
   // login, deliveries and backfill cursor; the radio only maps token -> link.
@@ -288,7 +287,6 @@ static bool markPump(uint16_t h, bool podSide) {
   std::lock_guard<std::mutex> l(mu);
   Link* lk = linkLocked(h);
   if (!lk) return false;
-  lk->lastTraffic = (uint32_t)monoMs();
   if (podSide ? !lk->podUsed : !lk->medtrumUsed) {
     if (podSide) lk->podUsed = true;
     else lk->medtrumUsed = true;
@@ -304,7 +302,6 @@ static bool markCgmUsed(uint16_t h, cgm_session_t* session, bool* fresh) {
   std::lock_guard<std::mutex> l(mu);
   Link* lk = linkLocked(h);
   if (!lk) return false;
-  lk->lastTraffic = (uint32_t)monoMs();
   if (!lk->cgmUsed) {
     lk->cgmSession = (cgm_session_t)slotLocked(h);
     lk->cgmUsed = true;
@@ -434,7 +431,6 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       *lk = Link{};
       lk->handle = h;
       lk->used = true;
-      lk->lastTraffic = (uint32_t)monoMs();
       lk->gen = ++linkGenCounter;
       lk->acceptMask = device >= 0 ? (uint8_t)(1u << device) : 0;
       // With the CGM off the link can only be a pump's, so mark the selected
@@ -1047,7 +1043,6 @@ static void cgmSendTask(void*) {
             failRc = (sub & 1) ? ble_gattc_notify_custom(c, cgmHandles[m.chr], om)
                                : ble_gattc_indicate_custom(c, cgmHandles[m.chr], om);
             if (failRc == 0) {
-              links[i].lastTraffic = (uint32_t)monoMs();
               if (cgmCarriesReading(m.chr, m.data, m.len)) links[i].cgmCollected = true;
             }
           }
@@ -1178,7 +1173,6 @@ static void podNotify(uint16_t handle, const uint8_t* p, size_t n) {
       if (!lk || lk->gen != gen || !lk->podUsed) {
         gone = true;
       } else {
-        lk->lastTraffic = (uint32_t)monoMs();
         os_mbuf* om = ble_hs_mbuf_from_flat(p, (uint16_t)n);
         if (!om) {
           rc = BLE_HS_ENOMEM;
@@ -1290,7 +1284,6 @@ static void medtrumNotifyRaw(uint16_t handle, const uint8_t* p, size_t n) {
       if (!lk || lk->gen != gen || !lk->medtrumUsed) {
         gone = true;
       } else {
-        lk->lastTraffic = (uint32_t)monoMs();
         os_mbuf* om = ble_hs_mbuf_from_flat(p, (uint16_t)n);
         if (!om) {
           rc = BLE_HS_ENOMEM;
