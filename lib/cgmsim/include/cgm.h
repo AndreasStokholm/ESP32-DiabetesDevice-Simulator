@@ -34,6 +34,7 @@ typedef enum {
 #define CGM_READING_INTERVAL 300 /* seconds */
 #define CGM_HISTORY 36           /* readings kept for backfill: 3 hours */
 #define CGM_STATE_VERSION 1
+#define CGM_MAX_SESSIONS 2 /* one per Bluetooth link the board can hold */
 
 /* Algorithm states, as both G6 and G7 number them. */
 enum {
@@ -70,19 +71,41 @@ typedef struct {
     bool signal_loss;      /* stop advertising: readings are missed, and backfilled later */
     /* Readings. */
     uint32_t next_n;       /* the next reading is due at activated + next_n * 5 minutes */
-    uint32_t delivered;    /* the last reading's seq the phone was sent, 0 if none */
+    uint32_t delivered;    /* the last reading's seq any central was sent, 0 if none */
     uint16_t calibration;  /* G6: the last calibration, mg/dL */
     uint32_t calibration_t;
     uint8_t n_hist;
     cgm_reading_t hist[CGM_HISTORY]; /* oldest first */
 } cgm_state_t;
 
+/* A session is one central (a phone or a watch). CGM_MAX_SESSIONS mirrors the
+ * board's two Bluetooth links; a central's session is its slot number, 0 or 1.
+ * The sensor's state and reading history above are shared, but what is per
+ * central -- its login, what it has been sent, and its backfill cursor -- is
+ * not. */
+typedef uint8_t cgm_session_t;
+
+typedef struct {
+    bool connected;
+    bool sent_glucose;        /* this central was sent the current reading */
+    bool authed;              /* G6 active mode: this central passed the challenge */
+    uint8_t challenge[8];
+    uint8_t auth_value[17];   /* what a read of the auth characteristic returns */
+    uint8_t auth_len;
+    int64_t connected_at, last_activity;
+    /* The backfill cursor: st.delivered when this session began. Backfill sends
+     * the history readings after it; another central's deliveries do not move it. */
+    uint32_t prev_delivered;
+} cgm_session_state_t;
+
 typedef struct {
     void *ctx;
-    /* Sends p on chr to the connected phone (a notification). */
-    void (*send)(void *ctx, cgm_chr_t chr, const uint8_t *p, size_t n);
-    void (*disconnect)(void *ctx);
-    /* Advertise (or stop) under name, from the sensor's address. */
+    /* Sends p on chr to that central (a notification). */
+    void (*send)(void *ctx, cgm_session_t session, cgm_chr_t chr, const uint8_t *p, size_t n);
+    /* Ends that central's connection only. */
+    void (*disconnect)(void *ctx, cgm_session_t session);
+    /* Advertise (or stop) under name, from the sensor's address. Sensor-wide,
+     * like now/save/log: advertising is not per central. */
     void (*advertise)(void *ctx, bool on, const char *name, const uint8_t addr[6]);
     int64_t (*now)(void *ctx); /* Unix seconds */
     void (*save)(void *ctx, const cgm_state_t *st);
@@ -92,15 +115,9 @@ typedef struct {
 typedef struct {
     cgm_state_t st;
     const cgm_io_t *io;
-    /* The connection. */
-    bool connected;
-    bool sent_glucose;
-    bool authed;              /* G6 active mode: the app passed the challenge */
-    uint8_t challenge[8];
-    uint8_t auth_value[17];   /* what a read of the auth characteristic returns */
-    uint8_t auth_len;
-    int64_t connected_at, last_activity;
-    uint32_t prev_delivered;  /* st.delivered when this connection began */
+    /* One per central. The sensor's state (st) and advertising window are
+     * shared; each session's login, deliveries and backfill cursor are not. */
+    cgm_session_state_t sessions[CGM_MAX_SESSIONS];
     /* Advertising. */
     bool advertising;
     int64_t window_end;
@@ -114,15 +131,19 @@ bool cgm_valid_g6_id(const char *id);
 
 void cgm_init(cgm_t *c, const cgm_state_t *st, const cgm_io_t *io);
 /* Call about once a second: makes readings, opens and closes the advertising
- * window, ends idle connections. */
+ * window, and ends each idle session on its own (the sensor may have more than
+ * one central at a time). */
 void cgm_tick(cgm_t *c);
 
-/* From the radio. read returns the value's length. */
-void cgm_on_connect(cgm_t *c);
-void cgm_on_disconnect(cgm_t *c);
-void cgm_on_subscribe(cgm_t *c, cgm_chr_t chr, bool on);
-void cgm_on_write(cgm_t *c, cgm_chr_t chr, const uint8_t *p, size_t n);
-size_t cgm_on_read(cgm_t *c, cgm_chr_t chr, uint8_t *out, size_t cap);
+/* From the radio. session is the central's slot, 0 .. CGM_MAX_SESSIONS-1; an
+ * out-of-range token is ignored. Every callback names the central it is about,
+ * and the reply (send) and hang-up (disconnect) name it back. read returns the
+ * value's length. */
+void cgm_on_connect(cgm_t *c, cgm_session_t session);
+void cgm_on_disconnect(cgm_t *c, cgm_session_t session);
+void cgm_on_subscribe(cgm_t *c, cgm_session_t session, cgm_chr_t chr, bool on);
+void cgm_on_write(cgm_t *c, cgm_session_t session, cgm_chr_t chr, const uint8_t *p, size_t n);
+size_t cgm_on_read(cgm_t *c, cgm_session_t session, cgm_chr_t chr, uint8_t *out, size_t cap);
 
 /* The control panel. */
 void cgm_set_glucose(cgm_t *c, uint16_t glucose, int8_t trend);

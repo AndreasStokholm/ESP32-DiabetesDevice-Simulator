@@ -247,10 +247,27 @@ static void save(cgm_t *c)
     }
 }
 
-static void send(cgm_t *c, cgm_chr_t chr, const uint8_t *p, size_t n)
+/* The central's session, or NULL for a token that names no slot. */
+static cgm_session_state_t *session_at(cgm_t *c, cgm_session_t session)
 {
-    if (c->connected) {
-        c->io->send(c->io->ctx, chr, p, n);
+    return session < CGM_MAX_SESSIONS ? &c->sessions[session] : NULL;
+}
+
+static bool any_connected(const cgm_t *c)
+{
+    for (int i = 0; i < CGM_MAX_SESSIONS; i++) {
+        if (c->sessions[i].connected) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void send(cgm_t *c, cgm_session_t session, cgm_chr_t chr, const uint8_t *p, size_t n)
+{
+    cgm_session_state_t *s = session_at(c, session);
+    if (s && s->connected) {
+        c->io->send(c->io->ctx, session, chr, p, n);
     }
 }
 
@@ -321,36 +338,59 @@ void cgm_tick(cgm_t *c)
     }
     const cgm_reading_t *r = latest(c);
     bool undelivered = r && r->seq != st->delivered;
-    if (!c->connected) {
+    if (!any_connected(c)) {
         advertise(c, undelivered && !st->signal_loss && now < c->window_end);
-    } else if ((c->sent_glucose && now - c->last_activity >= IDLE_END) || now - c->connected_at >= CONN_MAX) {
-        logf_(c, "hanging up");
-        c->io->disconnect(c->io->ctx);
+    }
+    /* A session that has its reading and has gone quiet is hung up on its own;
+     * a central still collecting does not hold another central's link open. */
+    for (int i = 0; i < CGM_MAX_SESSIONS; i++) {
+        const cgm_session_state_t *s = &c->sessions[i];
+        if (!s->connected) {
+            continue;
+        }
+        if ((s->sent_glucose && now - s->last_activity >= IDLE_END) || now - s->connected_at >= CONN_MAX) {
+            logf_(c, "hanging up");
+            c->io->disconnect(c->io->ctx, (cgm_session_t)i);
+        }
     }
 }
 
-void cgm_on_connect(cgm_t *c)
+void cgm_on_connect(cgm_t *c, cgm_session_t session)
 {
+    cgm_session_state_t *s = session_at(c, session);
+    if (!s) {
+        logf_(c, "ignoring connect for unknown session %u", (unsigned)session);
+        return;
+    }
     int64_t now = c->io->now(c->io->ctx);
-    c->connected = true;
+    s->connected = true;
     c->advertising = false; /* a connection ends the advertising */
-    c->sent_glucose = false;
-    c->authed = false;
-    c->auth_len = 0;
-    c->connected_at = c->last_activity = now;
-    c->prev_delivered = c->st.delivered;
+    s->sent_glucose = false;
+    s->authed = false;
+    s->auth_len = 0;
+    s->connected_at = s->last_activity = now;
+    s->prev_delivered = c->st.delivered;
     logf_(c, "phone connected");
 }
 
-void cgm_on_disconnect(cgm_t *c)
+void cgm_on_disconnect(cgm_t *c, cgm_session_t session)
 {
-    c->connected = false;
+    cgm_session_state_t *s = session_at(c, session);
+    if (!s) {
+        logf_(c, "ignoring disconnect for unknown session %u", (unsigned)session);
+        return;
+    }
+    s->connected = false;
     logf_(c, "phone disconnected");
 }
 
-static void delivered(cgm_t *c, const cgm_reading_t *r)
+static void delivered(cgm_t *c, cgm_session_t session, const cgm_reading_t *r)
 {
-    c->sent_glucose = true;
+    cgm_session_state_t *s = session_at(c, session);
+    if (!s) {
+        return;
+    }
+    s->sent_glucose = true;
     if (c->st.delivered != r->seq) {
         c->st.delivered = r->seq;
         save(c);
@@ -358,34 +398,37 @@ static void delivered(cgm_t *c, const cgm_reading_t *r)
 }
 
 /* Passive mode: what the phone would see the Dexcom app ask for. */
-static void push_glucose(cgm_t *c)
+static void push_glucose(cgm_t *c, cgm_session_t session)
 {
     const cgm_reading_t *r = latest(c);
-    if (!r || c->sent_glucose) {
+    cgm_session_state_t *s = session_at(c, session);
+    if (!s || !r || s->sent_glucose) {
         return;
     }
     int64_t now = c->io->now(c->io->ctx);
     uint8_t m[19];
     if (c->st.kind == CGM_G7) {
-        send(c, CGM_CHR_CONTROL, m, cgm_g7_glucose_msg(&c->st, r, now, m));
+        send(c, session, CGM_CHR_CONTROL, m, cgm_g7_glucose_msg(&c->st, r, now, m));
     } else {
-        send(c, CGM_CHR_CONTROL, m, cgm_g6_time_msg(&c->st, now, m));
-        send(c, CGM_CHR_CONTROL, m, cgm_g6_glucose_msg(&c->st, r, 0x4f, m));
+        send(c, session, CGM_CHR_CONTROL, m, cgm_g6_time_msg(&c->st, now, m));
+        send(c, session, CGM_CHR_CONTROL, m, cgm_g6_glucose_msg(&c->st, r, 0x4f, m));
     }
-    delivered(c, r);
+    delivered(c, session, r);
 }
 
-/* The readings the phone missed, before the one it was just sent. */
-static void send_backfill(cgm_t *c)
+/* The readings the session missed, before the one it was just sent. Its own
+ * backfill cursor (prev_delivered) keeps it to what this central has not had. */
+static void send_backfill(cgm_t *c, cgm_session_t session)
 {
+    cgm_session_state_t *s = session_at(c, session);
     const cgm_reading_t *r = latest(c);
-    if (!r || !c->sent_glucose) {
+    if (!s || !r || !s->sent_glucose) {
         return;
     }
     const cgm_state_t *st = &c->st;
     int first = -1, last = -1;
     for (int i = 0; i < st->n_hist - 1; i++) {
-        if (st->hist[i].seq > c->prev_delivered) {
+        if (st->hist[i].seq > s->prev_delivered) {
             if (first < 0) {
                 first = i;
             }
@@ -399,10 +442,10 @@ static void send_backfill(cgm_t *c)
     if (st->kind == CGM_G7) {
         uint8_t rec[9];
         for (int i = first; i <= last; i++) {
-            send(c, CGM_CHR_BACKFILL, rec, cgm_g7_backfill_record(st, &st->hist[i], rec));
+            send(c, session, CGM_CHR_BACKFILL, rec, cgm_g7_backfill_record(st, &st->hist[i], rec));
         }
         static const uint8_t done[2] = {0x59, 0x00};
-        send(c, CGM_CHR_CONTROL, done, sizeof done);
+        send(c, session, CGM_CHR_CONTROL, done, sizeof done);
         return;
     }
     /* G6: a 4-byte header and 8-byte records, cut into 20-byte frames that
@@ -426,7 +469,7 @@ static void send_backfill(cgm_t *c)
         f[0] = frame_no++;
         f[1] = 0; /* the backfill's id */
         memcpy(f + 2, buf + off, k);
-        send(c, CGM_CHR_BACKFILL, f, k + 2);
+        send(c, session, CGM_CHR_BACKFILL, f, k + 2);
         total += k + 2;
     }
     uint8_t m[20] = {0x51, 0x00, 0x01, 0x00};
@@ -434,12 +477,17 @@ static void send_backfill(cgm_t *c)
     put32(m + 8, tx_time(st, st->hist[last].t));
     put32(m + 12, (uint32_t)total);
     put16(m + 16, cgm_crc16(frames, total));
-    send(c, CGM_CHR_CONTROL, m, with_crc(m, 18));
+    send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 18));
 }
 
-void cgm_on_subscribe(cgm_t *c, cgm_chr_t chr, bool on)
+void cgm_on_subscribe(cgm_t *c, cgm_session_t session, cgm_chr_t chr, bool on)
 {
-    c->last_activity = c->io->now(c->io->ctx);
+    cgm_session_state_t *s = session_at(c, session);
+    if (!s) {
+        logf_(c, "ignoring subscribe for unknown session %u", (unsigned)session);
+        return;
+    }
+    s->last_activity = c->io->now(c->io->ctx);
     if (!on) {
         return;
     }
@@ -447,46 +495,46 @@ void cgm_on_subscribe(cgm_t *c, cgm_chr_t chr, bool on)
     case CGM_CHR_AUTH: {
         /* What a phone sees once the Dexcom app has logged in, bonded. */
         static const uint8_t ok[3] = {0x05, 0x01, 0x01};
-        send(c, CGM_CHR_AUTH, ok, sizeof ok);
+        send(c, session, CGM_CHR_AUTH, ok, sizeof ok);
         break;
     }
     case CGM_CHR_CONTROL:
-        if (!c->authed) { /* active mode asks for each message itself */
-            push_glucose(c);
+        if (!s->authed) { /* active mode asks for each message itself */
+            push_glucose(c, session);
         }
         break;
     case CGM_CHR_BACKFILL:
-        send_backfill(c);
+        send_backfill(c, session);
         break;
     default:
         break;
     }
 }
 
-static void session_reply(cgm_t *c, uint8_t op, uint32_t requested, int64_t now)
+static void session_reply(cgm_t *c, cgm_session_t session, uint8_t op, uint32_t requested, int64_t now)
 {
     /* 27|29 status received requested(4) sessionStart(4) transmitterTime(4) crc */
     uint8_t m[17] = {op, 0x00, 0x01};
     put32(m + 3, requested);
     put32(m + 7, c->st.session_start ? tx_time(&c->st, c->st.session_start) : 0xffffffff);
     put32(m + 11, tx_time(&c->st, now));
-    send(c, CGM_CHR_CONTROL, m, with_crc(m, 15));
+    send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 15));
 }
 
-static void g6_control(cgm_t *c, const uint8_t *p, size_t n, int64_t now)
+static void g6_control(cgm_t *c, cgm_session_t session, const uint8_t *p, size_t n, int64_t now)
 {
     cgm_state_t *st = &c->st;
     uint8_t m[20];
     const cgm_reading_t *r = latest(c);
     switch (p[0]) {
     case 0x24: /* time */
-        send(c, CGM_CHR_CONTROL, m, cgm_g6_time_msg(st, now, m));
+        send(c, session, CGM_CHR_CONTROL, m, cgm_g6_time_msg(st, now, m));
         break;
     case 0x30: /* glucose */
     case 0x4e:
         if (r) {
-            send(c, CGM_CHR_CONTROL, m, cgm_g6_glucose_msg(st, r, p[0] == 0x30 ? 0x31 : 0x4f, m));
-            delivered(c, r);
+            send(c, session, CGM_CHR_CONTROL, m, cgm_g6_glucose_msg(st, r, p[0] == 0x30 ? 0x31 : 0x4f, m));
+            delivered(c, session, r);
         }
         break;
     case 0x32: { /* calibration data: 33 00 … glucose(2) at 11, timestamp(4) at 13 */
@@ -494,7 +542,7 @@ static void g6_control(cgm_t *c, const uint8_t *p, size_t n, int64_t now)
         memcpy(m, tmpl, 17);
         put16(m + 11, st->calibration);
         put32(m + 13, st->calibration ? tx_time(st, st->calibration_t) : 0);
-        send(c, CGM_CHR_CONTROL, m, with_crc(m, 17));
+        send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 17));
         break;
     }
     case 0x26: /* start sensor: startTime(4) secondsSince1970(4) */
@@ -505,7 +553,7 @@ static void g6_control(cgm_t *c, const uint8_t *p, size_t n, int64_t now)
             st->forced_state = 0;
             save(c);
             logf_(c, "sensor session started");
-            session_reply(c, 0x27, start, now);
+            session_reply(c, session, 0x27, start, now);
         }
         break;
     case 0x28: /* stop sensor: stopTime(4) */
@@ -513,7 +561,7 @@ static void g6_control(cgm_t *c, const uint8_t *p, size_t n, int64_t now)
             st->session_start = 0;
             save(c);
             logf_(c, "sensor session stopped");
-            session_reply(c, 0x29, get32(p + 1), now);
+            session_reply(c, session, 0x29, get32(p + 1), now);
         }
         break;
     case 0x34: /* calibrate: glucose(2) time(4) */
@@ -528,7 +576,7 @@ static void g6_control(cgm_t *c, const uint8_t *p, size_t n, int64_t now)
             m[0] = 0x35;
             m[1] = 0x00;
             m[2] = 0x00;
-            send(c, CGM_CHR_CONTROL, m, with_crc(m, 3));
+            send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 3));
         }
         break;
     case 0x42: /* reset */
@@ -541,17 +589,17 @@ static void g6_control(cgm_t *c, const uint8_t *p, size_t n, int64_t now)
         logf_(c, "transmitter reset");
         m[0] = 0x43;
         m[1] = 0x00;
-        send(c, CGM_CHR_CONTROL, m, with_crc(m, 2));
+        send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 2));
         break;
     case 0x4a: { /* version: firmware 1.6.5.25, expiry 112 days */
         static const uint8_t tmpl[17] = {0x4b, 0x00, 0x01, 0x06, 0x05, 0x19, 0xdf, 0x29, 0x00,
                                          0x00, 0x51, 0x00, 0x03, 0x70, 0x00, 0xf0, 0x00};
         memcpy(m, tmpl, 17);
-        send(c, CGM_CHR_CONTROL, m, with_crc(m, 17));
+        send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 17));
         break;
     }
     case 0x09: /* disconnect */
-        c->io->disconnect(c->io->ctx);
+        c->io->disconnect(c->io->ctx, session);
         break;
     default:
         logf_(c, "ignoring control opcode 0x%02x", p[0]);
@@ -559,31 +607,36 @@ static void g6_control(cgm_t *c, const uint8_t *p, size_t n, int64_t now)
     }
 }
 
-void cgm_on_write(cgm_t *c, cgm_chr_t chr, const uint8_t *p, size_t n)
+void cgm_on_write(cgm_t *c, cgm_session_t session, cgm_chr_t chr, const uint8_t *p, size_t n)
 {
+    cgm_session_state_t *s = session_at(c, session);
+    if (!s) {
+        logf_(c, "ignoring write for unknown session %u", (unsigned)session);
+        return;
+    }
     int64_t now = c->io->now(c->io->ctx);
-    c->last_activity = now;
+    s->last_activity = now;
     if (n == 0) {
         return;
     }
     if (chr == CGM_CHR_AUTH) {
         if (p[0] == 0x01 && n >= 9 && c->st.kind == CGM_G6) {
             /* AuthRequestTx: 01 token(8) 02. Answer 03 hash(token) challenge. */
-            c->auth_value[0] = 0x03;
-            cgm_g6_hash(c->st.id, p + 1, c->auth_value + 1);
-            dash_random(c->challenge, 8);
-            memcpy(c->auth_value + 9, c->challenge, 8);
-            c->auth_len = 17;
-        } else if (p[0] == 0x04 && n >= 9 && c->auth_len == 17) {
+            s->auth_value[0] = 0x03;
+            cgm_g6_hash(c->st.id, p + 1, s->auth_value + 1);
+            dash_random(s->challenge, 8);
+            memcpy(s->auth_value + 9, s->challenge, 8);
+            s->auth_len = 17;
+        } else if (p[0] == 0x04 && n >= 9 && s->auth_len == 17) {
             /* AuthChallengeTx: 04 hash(challenge). */
             uint8_t want[8];
-            cgm_g6_hash(c->st.id, c->challenge, want);
-            c->authed = memcmp(want, p + 1, 8) == 0;
-            c->auth_value[0] = 0x05;
-            c->auth_value[1] = c->authed ? 0x01 : 0x02;
-            c->auth_value[2] = c->authed ? 0x01 : 0x02; /* bonded: no Bluetooth pairing is asked for */
-            c->auth_len = 3;
-            logf_(c, "app %s the G6 login", c->authed ? "passed" : "failed");
+            cgm_g6_hash(c->st.id, s->challenge, want);
+            s->authed = memcmp(want, p + 1, 8) == 0;
+            s->auth_value[0] = 0x05;
+            s->auth_value[1] = s->authed ? 0x01 : 0x02;
+            s->auth_value[2] = s->authed ? 0x01 : 0x02; /* bonded: no Bluetooth pairing is asked for */
+            s->auth_len = 3;
+            logf_(c, "app %s the G6 login", s->authed ? "passed" : "failed");
         }
         /* 06 keep-alive and 07 bond request need no answer. */
         return;
@@ -592,21 +645,25 @@ void cgm_on_write(cgm_t *c, cgm_chr_t chr, const uint8_t *p, size_t n)
         return;
     }
     if (c->st.kind == CGM_G6) {
-        g6_control(c, p, n, now);
+        g6_control(c, session, p, n, now);
     } else if (p[0] == 0x52) {
         /* Extended version, as a 10-day G7: session 10.5 days, warm-up 27 minutes. */
         static const uint8_t v[15] = {0x52, 0x00, 0xc0, 0xd7, 0x0d, 0x00, 0x54, 0x06,
                                       0x00, 0x02, 0x04, 0x04, 0xff, 0x0c, 0x00};
-        send(c, CGM_CHR_CONTROL, v, sizeof v);
+        send(c, session, CGM_CHR_CONTROL, v, sizeof v);
     }
 }
 
-size_t cgm_on_read(cgm_t *c, cgm_chr_t chr, uint8_t *out, size_t cap)
+size_t cgm_on_read(cgm_t *c, cgm_session_t session, cgm_chr_t chr, uint8_t *out, size_t cap)
 {
-    c->last_activity = c->io->now(c->io->ctx);
-    if (chr == CGM_CHR_AUTH && c->auth_len && c->auth_len <= cap) {
-        memcpy(out, c->auth_value, c->auth_len);
-        return c->auth_len;
+    cgm_session_state_t *s = session_at(c, session);
+    if (!s) {
+        return 0;
+    }
+    s->last_activity = c->io->now(c->io->ctx);
+    if (chr == CGM_CHR_AUTH && s->auth_len && s->auth_len <= cap) {
+        memcpy(out, s->auth_value, s->auth_len);
+        return s->auth_len;
     }
     return 0;
 }
@@ -630,8 +687,12 @@ void cgm_set_signal_loss(cgm_t *c, bool on)
 {
     c->st.signal_loss = on;
     save(c);
-    if (on && c->connected) {
-        c->io->disconnect(c->io->ctx);
+    if (on) {
+        for (int i = 0; i < CGM_MAX_SESSIONS; i++) {
+            if (c->sessions[i].connected) {
+                c->io->disconnect(c->io->ctx, (cgm_session_t)i);
+            }
+        }
     }
 }
 
@@ -661,8 +722,10 @@ void cgm_skip_warmup(cgm_t *c)
 
 void cgm_new_sensor(cgm_t *c, cgm_kind_t kind, const char *id)
 {
-    if (c->connected) {
-        c->io->disconnect(c->io->ctx);
+    for (int i = 0; i < CGM_MAX_SESSIONS; i++) {
+        if (c->sessions[i].connected) {
+            c->io->disconnect(c->io->ctx, (cgm_session_t)i);
+        }
     }
     advertise(c, false);
     cgm_state_t fresh;
@@ -689,7 +752,7 @@ size_t cgm_status_json(cgm_t *c, char *out, size_t cap)
                      "\"warmupDone\":%lld,\"connected\":%s,\"advertising\":%s,\"nextReading\":%lld",
                      st->kind, name, st->id, st->glucose, st->trend, cgm_current_state(st, now), st->forced_state,
                      st->signal_loss ? "true" : "false", (long long)st->activated, (long long)st->session_start,
-                     (long long)st->warmup_done, c->connected ? "true" : "false", c->advertising ? "true" : "false",
+                     (long long)st->warmup_done, any_connected(c) ? "true" : "false", c->advertising ? "true" : "false",
                      (long long)(st->activated + (int64_t)st->next_n * CGM_READING_INTERVAL));
     if (n < 0 || (size_t)n >= cap) {
         return 0;
