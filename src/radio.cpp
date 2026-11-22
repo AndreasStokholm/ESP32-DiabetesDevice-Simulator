@@ -52,15 +52,70 @@ static const char* medtrumWriteUUID = "669a9101-0008-968F-E311-6050405558B3";  /
 static NimBLEServer* server;
 
 static std::mutex mu;
-static volatile uint16_t conn = BLE_HS_CONN_HANDLE_NONE;
 
-// The CGM's side of the link: the handles the core's notifications go to, the
-// CCCD value per characteristic, and the advert the core asked for. Guarded by
-// mu (handles and subs are written before the server starts and on subscribe).
+// Up to two centrals at once: a phone and a watch (or a phone's CGM and pump
+// connections). The pump and the Medtrum base stay single-link -- they are one
+// phone's pump -- so their code asks the helpers below for "the" link. Guarded
+// by mu.
+static const int kMaxLinks = 2;
+struct Link {
+  uint16_t handle;
+  bool used;
+  bool podUsed;
+  bool medtrumUsed;
+  bool cgmSubscribed;  // subscribed to a characteristic that carries readings
+  uint32_t lastTraffic;
+  // Beyond the bookkeeping above: whether the CGM touched this link (its first
+  // GATT event), whether it has been sent a reading since it connected (the
+  // hang-up's "collected" test), whether the injected-accept decision was
+  // deferred until the first event named the device, and a generation so a
+  // queued notification cannot reach a link that reused the handle.
+  bool cgmUsed;
+  bool cgmCollected;
+  // One bit per FailDevice whose injected accept decision was taken on this
+  // link. Deferred decisions are per (link, device): a link that first touched
+  // the CGM service can still exercise a pending pod drop on its first pod
+  // event, and vice versa.
+  uint8_t acceptMask;
+  // Serial of the last CONTROL reading queued to this link. A CONTROL
+  // subscription after the core stopped sending (sent_glucose set) replays the
+  // cached reading unless this link was already a recipient of the latest one.
+  uint32_t cgmReadingQueued;
+  uint32_t gen;
+};
+static Link links[kMaxLinks];
+// Unique per connection, never reset: a queued CGM notification or a pending
+// termination must not match a later link that reused the handle.
+static uint32_t linkGenCounter = 0;
+// The CCCD value per link and CGM characteristic: a notification goes to every
+// central subscribed to the characteristic that carries it. Guarded by mu.
+static uint16_t cgmSubs[kMaxLinks][CGM_CHR_COUNT];
+// The handle of the subscribed central that made the last hang-up wait (0 when
+// none did), only so the wait is logged once per handle. Guarded by mu.
+static uint16_t cgmHeldBy = 0;
+// The last CONTROL reading frame the core emitted this session. The core's
+// push_glucose() refuses to send again once sent_glucose is set, so a central
+// that subscribes CONTROL after the first reading would otherwise never receive
+// one; onSubscribe replays this frame to that link. Guarded by mu.
+static uint8_t cgmLastReading[32];  // CgmOut::data below
+static size_t cgmLastReadingLen = 0;
+static bool cgmLastReadingValid = false;
+// Bumped whenever the core emits a CONTROL reading. onSubscribe snapshots it to
+// tell whether the core answered the subscription itself (and replay is then
+// unnecessary). Guarded by mu.
+static uint32_t cgmReadingSerial = 0;
+
+// The CGM's side of the link: the handles the core's notifications go to and
+// the advert the core asked for. Guarded by mu (handles are written before the
+// server starts and on subscribe).
 static uint16_t cgmHandles[CGM_CHR_COUNT];
-static volatile uint16_t cgmSubs[CGM_CHR_COUNT];
 static std::string cgmAdvData;
 static std::string cgmAdvName;
+// The core's advertising window. It is NOT cleared when a central connects:
+// with two links the set stays on while a slot remains, so a watch that scans
+// after the phone has connected can still find the sensor. The core's own
+// cgm_tick closes the window when the session is over; the last CGM
+// onDisconnect clears this copy to mirror the core's silent off.
 static bool cgmAdvOn = false;
 // The sensor's random static address, applied to the CGM advertising instance
 // by tick() (the core hands it in with every advertise() call). Guarded by mu
@@ -69,31 +124,29 @@ static uint8_t cgmAdvAddr[6];
 static bool cgmAdvAddrValid = false;
 // A hang-up the core asked for, done from tick(): the core calls
 // radio::cgmDisconnect from inside its own mutex, so no sensor:: call may
-// happen here before that call returns. The link is the pod's too, so the
-// hang-up waits for a pause in the pod's traffic, with a 20 s deadline.
+// happen here before that call returns. The CGM's links are independent of the
+// pump's, so there is no pump-traffic pause to wait for; the hang-up waits
+// until every subscribed CGM central has been sent a reading, with a 20 s
+// deadline (see tick()).
 static volatile bool cgmDrop = false;
 // The 20 s deadline: a separate flag, so a zero timestamp is not also "no
 // deadline" (tick is the only writer while the drop is pending; cgmDisconnect
 // starts a fresh one when a new request arrives).
 static volatile bool cgmDropTimed = false;
 static volatile uint32_t cgmDropAt = 0;  // 32-bit monotonic ms; tick's clock
-// The CGM was told about the current link (its first GATT event). The core is
-// not told at connect time: a link the CGM never touches is the pod's or the
-// patch's, and the core's own session timer (CONN_MAX) would end it, logging a
-// hang-up every second until it did (see cgmLinkUp()).
-static volatile bool cgmUsed = false;
-// A new value for every connection, so a notification queued (or delayed) for
-// the old link cannot reach a new phone that happens to reuse the handle.
-static volatile uint32_t linkGen = 0;
 
 // The CGM's notifications go through a queue and a task of their own: the core
 // calls radio::cgmNotify from inside its mutex, so the injected delay is
 // waited out here, never while the core's mutex is held. The order is kept,
-// and the link, its generation and the subscription are re-checked after the
-// wait.
+// and every recipient's link, generation and subscription are re-checked after
+// the wait.
 struct CgmOut {
-  uint16_t conn;   // the link it was queued for
-  uint32_t gen;    // ...and its generation
+  struct To {
+    uint16_t handle;  // the link it was queued for
+    uint32_t gen;     // ...and its generation
+  };
+  To to[kMaxLinks];
+  uint8_t nTo;       // 0..kMaxLinks: every central subscribed at queue time
   uint8_t chr;
   uint8_t len;
   uint8_t data[32];
@@ -110,7 +163,6 @@ static QueueHandle_t podEvents;
 static uint16_t podCmdHandle, podDataHandle, podO5DataHandle;
 static std::string podAdvData;  // guarded by mu
 static bool podIsO5 = false, podPaired = false;
-static volatile uint32_t podLastTraffic = 0;
 
 // The Medtrum patch's side of the link.
 static QueueHandle_t medtrumEvents;
@@ -121,12 +173,6 @@ static bool medtrumAdvOn = false;
 // Which pump simulator is selected (see radio.h). The default is PUMP_POD, so
 // a board with no saved choice behaves as it did before the selector existed.
 static int pumpSel = PUMP_POD;
-// Whether the current link is a pump's: its GATT service was written or
-// subscribed, or (with the CGM off) it connected while that pump was selected.
-// A link the CGM alone touched is not a pump's, so switching the pump selection
-// must not drop it; the flags are cleared on every disconnect.
-static volatile bool podUsed = false;
-static volatile bool medtrumUsed = false;
 
 static std::string addrString(const uint8_t* val) {
   char b[18];
@@ -153,6 +199,200 @@ static void medtrumPush(uint8_t type, const uint8_t* data, size_t n) {
     logf("medtrum: event queue full: a packet from the phone was dropped");
 }
 
+// MARK: - The links (every reader and writer holds mu)
+
+static int slotLocked(uint16_t h) {
+  for (int i = 0; i < kMaxLinks; i++) {
+    if (links[i].used && links[i].handle == h) return i;
+  }
+  return -1;
+}
+
+static Link* linkLocked(uint16_t h) {
+  int i = slotLocked(h);
+  return i < 0 ? nullptr : &links[i];
+}
+
+static Link* freeLinkLocked() {
+  for (int i = 0; i < kMaxLinks; i++) {
+    if (!links[i].used) return &links[i];
+  }
+  return nullptr;
+}
+
+// "The" link for the single-link pump code. The pump's own callbacks use
+// podLinkLocked()/medtrumLinkLocked() below; there is no first-live fallback on
+// purpose: guessing a link can terminate the CGM's or the other pump's phone.
+static Link* podLinkLocked() {
+  for (int i = 0; i < kMaxLinks; i++) {
+    if (links[i].used && links[i].podUsed) return &links[i];
+  }
+  return nullptr;
+}
+
+static Link* medtrumLinkLocked() {
+  for (int i = 0; i < kMaxLinks; i++) {
+    if (links[i].used && links[i].medtrumUsed) return &links[i];
+  }
+  return nullptr;
+}
+
+static int liveCountLocked() {
+  int n = 0;
+  for (int i = 0; i < kMaxLinks; i++) n += links[i].used ? 1 : 0;
+  return n;
+}
+
+static int cgmCountLocked() {
+  int n = 0;
+  for (int i = 0; i < kMaxLinks; i++) n += (links[i].used && links[i].cgmUsed) ? 1 : 0;
+  return n;
+}
+
+static bool isLive(uint16_t h) {
+  std::lock_guard<std::mutex> l(mu);
+  return slotLocked(h) >= 0;
+}
+
+// A GATT event without a descriptor cannot name its link: skip it rather than
+// guess (with two links a guess can act on the wrong central).
+static uint16_t eventHandle(const ble_gap_conn_desc* desc) {
+  return desc ? desc->conn_handle : BLE_HS_CONN_HANDLE_NONE;
+}
+
+// A connect decision taken when the advertised sets cannot name the device is
+// deferred to the link's first GATT event, which does name it: drop/refuse are
+// per device, so a pending pod drop must not consume the CGM's first link (or
+// the other way round). Returns false when the link was refused (it has been
+// closed) and the caller must stop.
+static bool acceptCheck(uint16_t h, FailDevice device, const char* who) {
+  bool decide = false;
+  {
+    std::lock_guard<std::mutex> l(mu);
+    Link* lk = linkLocked(h);
+    if (!lk) return false;
+    uint8_t bit = (uint8_t)(1u << (int)device);
+    if ((lk->acceptMask & bit) == 0) {
+      lk->acceptMask |= bit;
+      decide = true;
+    }
+  }
+  if (decide && !fail_decide(device, FAIL_ACCEPT, 0)) {
+    logf("%s: injected failure: %s connection dropped", who, fail_device_name(device));
+    // This runs inside a NimBLE GATT callback: use the server's disconnect.
+    if (server) server->disconnect(h);
+    return false;
+  }
+  return true;
+}
+
+// Marks the link as the selected pump's. Returns true the first time, so the
+// caller pushes CONNECTED exactly once, at the point the link became a pump's
+// (at connect with the CGM off, otherwise on its first pump GATT event).
+static bool markPump(uint16_t h, bool podSide) {
+  bool fresh = false;
+  std::lock_guard<std::mutex> l(mu);
+  Link* lk = linkLocked(h);
+  if (!lk) return false;
+  lk->lastTraffic = (uint32_t)monoMs();
+  if (podSide ? !lk->podUsed : !lk->medtrumUsed) {
+    if (podSide) lk->podUsed = true;
+    else lk->medtrumUsed = true;
+    fresh = true;
+  }
+  return fresh;
+}
+
+// The CGM's first GATT event on a link: the core is told once per link (the
+// glue maps that to its one session), and the link is marked the CGM's. The
+// first CGM event of a session drops the previous session's cached reading.
+static bool markCgmUsed(uint16_t h) {
+  std::lock_guard<std::mutex> l(mu);
+  Link* lk = linkLocked(h);
+  if (!lk) return false;
+  lk->lastTraffic = (uint32_t)monoMs();
+  if (lk->cgmUsed) return false;
+  if (cgmCountLocked() == 0) {
+    cgmLastReadingValid = false;
+    cgmLastReadingLen = 0;
+    ++cgmReadingSerial;  // a subscription in flight must not replay the old one
+  }
+  lk->cgmUsed = true;
+  return true;
+}
+
+static void setCgmSub(uint16_t h, cgm_chr_t chr, uint16_t subValue) {
+  std::lock_guard<std::mutex> l(mu);
+  int i = slotLocked(h);
+  if (i < 0) return;
+  cgmSubs[i][chr] = subValue;
+  // "Subscribed" for the hang-up means subscribed to something that carries a
+  // reading: CONTROL (the glucose notifications) or BACKFILL (the records a
+  // receiver catches up on). Auth and COMM alone are not a reading collector.
+  links[i].cgmSubscribed = cgmSubs[i][CGM_CHR_CONTROL] != 0 || cgmSubs[i][CGM_CHR_BACKFILL] != 0;
+}
+
+// Whether this notification carries a reading, so the link that receives it has
+// collected. CONTROL is the glucose message (G6 0x31/0x4f, G7 0x4e); BACKFILL
+// carries the missed records. Other CONTROL replies (session status, version)
+// are not the reading.
+static bool cgmCarriesReading(uint8_t chr, const uint8_t* d, size_t n) {
+  if (chr == CGM_CHR_BACKFILL) return n >= 2;
+  if (chr != CGM_CHR_CONTROL || n < 1) return false;
+  return d[0] == 0x31 || d[0] == 0x4f || d[0] == 0x4e;
+}
+
+// Whether another live link already holds this pump. A pump is one phone's, so
+// a second pod/Medtrum phone is refused instead of being merged into the same
+// event queue.
+static bool pumpOwnedByOther(uint16_t h, bool podSide) {
+  std::lock_guard<std::mutex> l(mu);
+  for (int i = 0; i < kMaxLinks; i++) {
+    if (!links[i].used || links[i].handle == h) continue;
+    if (podSide ? links[i].podUsed : links[i].medtrumUsed) return true;
+  }
+  return false;
+}
+
+// Queue one CGM frame to one link (used to replay the current reading to a
+// late CONTROL subscriber). The send task re-checks the link's generation and
+// subscription before it calls the stack.
+static void cgmQueueTo(uint16_t h, cgm_chr_t chr, const uint8_t* p, size_t n) {
+  if (!cgmOut || n > sizeof(CgmOut::data)) return;
+  CgmOut m = {};
+  m.chr = (uint8_t)chr;
+  m.len = (uint8_t)n;
+  if (n) memcpy(m.data, p, n);
+  {
+    std::lock_guard<std::mutex> l(mu);
+    int i = slotLocked(h);
+    if (i < 0 || !links[i].cgmUsed || cgmSubs[i][chr] == 0) return;
+    m.to[0].handle = links[i].handle;
+    m.to[0].gen = links[i].gen;
+    m.nTo = 1;
+    links[i].cgmReadingQueued = cgmReadingSerial;
+  }
+  if (xQueueSend(cgmOut, &m, 0) != pdTRUE) logf("cgm: notification queue full: a replay was dropped");
+}
+
+static size_t cgmLastReadingSnapshot(uint8_t* out, size_t cap) {
+  std::lock_guard<std::mutex> l(mu);
+  if (!cgmLastReadingValid || cgmLastReadingLen > cap) return 0;
+  memcpy(out, cgmLastReading, cgmLastReadingLen);
+  return cgmLastReadingLen;
+}
+
+// Ends one link, but only the same connection: the handle may have been reused
+// while tick() or setPump() was deciding. The check and the terminate are under
+// one lock, so a disconnect+reuse cannot slip in between (GAP events are
+// queued, not dispatched from the call).
+static void terminateLink(uint16_t h, uint32_t gen) {
+  std::lock_guard<std::mutex> l(mu);
+  Link* lk = linkLocked(h);
+  if (!lk || lk->gen != gen) return;
+  ble_gap_terminate(h, BLE_ERR_REM_USER_CONN_TERM);
+}
+
 // The pump the selector chose. The unselected pump's service stays in the GATT
 // table (nothing invites a phone to it: its advertisement is not in the set),
 // but a phone with a cached address can still reach it. Such an access must not
@@ -169,100 +409,164 @@ static void pumpRefuse(uint16_t c, const char* who) {
   if (server) server->disconnect(c);
 }
 
+// Refuse a link for a reason other than the selector (a second phone for the
+// same single-link pump). Called from a GATT callback, so it uses the server's
+// disconnect rather than the host's GAP API.
+static void closeLink(uint16_t c, const char* who, const char* why) {
+  logf("%s: %s; closing the link", who, why);
+  if (server) server->disconnect(c);
+}
+
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
+    uint16_t h = desc->conn_handle;
     std::string addr = addrString(desc->peer_ota_addr);
-    if (conn != BLE_HS_CONN_HANDLE_NONE) {
-      logf("%s: a second phone; one at a time, closing it", addr.c_str());
-      s->disconnect(desc->conn_handle);
+    bool full = false;
+    {
+      std::lock_guard<std::mutex> l(mu);
+      full = freeLinkLocked() == nullptr;
+    }
+    if (full) {
+      logf("%s: a third central; two links at a time, closing it", addr.c_str());
+      s->disconnect(h);
       return;
     }
     // With no pump selected and the CGM off, nothing on the board invites a
     // phone: accept the connection (the BLE stack already has) and drop it at
-    // once, so no phone can sit on the one link. With the CGM on the link is
-    // the CGM's to use; a pump that reaches for its service anyway is dropped
-    // by the pump callbacks below.
-    if (pump() == PUMP_OFF && sensor::kind() == CGM_OFF) {
+    // once. With the CGM on the link is the CGM's to use; a pump that reaches
+    // for its service anyway is dropped by the pump callbacks below.
+    int sel = pump();
+    bool cgmOff = sensor::kind() == CGM_OFF;
+    if (sel == PUMP_OFF && cgmOff) {
       logf("%s: no simulator is selected; closing it", addr.c_str());
-      s->disconnect(desc->conn_handle);
+      s->disconnect(h);
       return;
     }
-    // A refused connect is still accepted by the BLE stack, then dropped at
-    // once. One set of decisions for the one shared link; the first device
-    // with a pending drop or refusal names it in the log.
-    int64_t acceptNow = monoMs();
-    for (int i = 0; i < FAIL_DEVICE_COUNT; i++) {
-      FailDevice d = (FailDevice)i;
-      if (!fail_decide(d, FAIL_ACCEPT, acceptNow)) {
-        logf("%s: injected failure: %s connection dropped", addr.c_str(), fail_device_name(d));
-        s->disconnect(desc->conn_handle);
-        return;
-      }
+    // With the CGM off the selected pump is the only device that can connect,
+    // and it stays on one link. Refuse a second pump phone here, before it can
+    // consume an injected drop/refusal.
+    if (cgmOff && sel != PUMP_OFF && pumpOwnedByOther(h, sel == PUMP_POD)) {
+      logf("%s: a second %s phone; the pump stays on one link, closing it", addr.c_str(),
+           sel == PUMP_POD ? "pod" : "Medtrum");
+      s->disconnect(h);
+      return;
     }
-    logf("%s connected", addr.c_str());
-    conn = desc->conn_handle;
-    ++linkGen;  // anything queued for the old link is stale now
+    // An injected drop/refusal is per device. If the advertisements name the
+    // only device that could be connecting, decide now; with both sets on the
+    // air the answer comes with the link's first GATT event (acceptCheck),
+    // which knows which service the phone reached for.
+    int device = -1;
+    if (sel == PUMP_OFF) device = FAIL_CGM;  // only the CGM can be connecting
+    else if (cgmOff) device = sel == PUMP_POD ? FAIL_POD : FAIL_MEDTRUM;
+    if (device >= 0 && !fail_decide((FailDevice)device, FAIL_ACCEPT, monoMs())) {
+      logf("%s: injected failure: %s connection dropped", addr.c_str(), fail_device_name((FailDevice)device));
+      s->disconnect(h);
+      return;
+    }
+
+    bool podFresh = false, medFresh = false;
+    int n = 0;
+    {
+      std::lock_guard<std::mutex> l(mu);
+      Link* lk = freeLinkLocked();
+      if (!lk) return;  // the other task took it; the stack will call onDisconnect
+      *lk = Link{};
+      lk->handle = h;
+      lk->used = true;
+      lk->lastTraffic = (uint32_t)monoMs();
+      lk->gen = ++linkGenCounter;
+      lk->acceptMask = device >= 0 ? (uint8_t)(1u << device) : 0;
+      // With the CGM off the link can only be a pump's, so mark the selected
+      // one now: a pump phone that connects but has not yet subscribed or
+      // written must still release its link when the selection changes (see
+      // setPump). With the CGM on the link could be the CGM's, so the pump's
+      // first GATT event marks it instead.
+      if (cgmOff) {
+        if (sel == PUMP_POD) {
+          lk->podUsed = true;
+          podFresh = true;
+        } else if (sel == PUMP_MEDTRUM) {
+          lk->medtrumUsed = true;
+          medFresh = true;
+        }
+      }
+      n = liveCountLocked();
+    }
+    logf("%s connected (handle 0x%04x, %d of %d links)", addr.c_str(), h, n, kMaxLinks);
     // The CGM is told about the link on its first GATT event, not here (see
     // cgmLinkUp()): a link it never touches is the pod's or the patch's, and
     // the core's CONN_MAX timer must not end it.
-    cgmUsed = false;
-    // With the CGM off the link can only be a pump's, so mark the selected one
-    // now: a pump phone that connects but has not yet subscribed or written must
-    // still release the one link when the selection changes (see setPump). With
-    // the CGM on the link could be the CGM's, so the pump's first GATT event
-    // marks it instead.
-    if (sensor::kind() == CGM_OFF) {
-      int sel = pump();
-      if (sel == PUMP_POD) podUsed = true;
-      else if (sel == PUMP_MEDTRUM) medtrumUsed = true;
-    }
-    podPush(DASH_EV_CONNECTED, nullptr, 0);
-    medtrumPush(MEDTRUM_EV_CONNECTED, nullptr, 0);
+    if (podFresh) podPush(DASH_EV_CONNECTED, nullptr, 0);
+    if (medFresh) medtrumPush(MEDTRUM_EV_CONNECTED, nullptr, 0);
   }
 
   void onDisconnect(NimBLEServer*, ble_gap_conn_desc* desc) override {
-    if (desc->conn_handle != conn) return;
-    conn = BLE_HS_CONN_HANDLE_NONE;
-    cgmDrop = false;
-    cgmDropTimed = false;
-    bool hadCgm = cgmUsed;
-    cgmUsed = false;
-    podUsed = false;
-    medtrumUsed = false;
-    // No stale CCCD: a notification that was queued for this link is dropped
-    // (the generation check), and a new phone has to subscribe afresh.
-    for (int i = 0; i < CGM_CHR_COUNT; i++) cgmSubs[i] = 0;
+    uint16_t h = desc->conn_handle;
+    bool hadCgm = false, hadPod = false, hadMed = false, anyCgmLeft = false;
+    {
+      std::lock_guard<std::mutex> l(mu);
+      int i = slotLocked(h);
+      if (i < 0) return;
+      hadCgm = links[i].cgmUsed;
+      hadPod = links[i].podUsed;
+      hadMed = links[i].medtrumUsed;
+      // No stale CCCD: a notification queued for this link is dropped (the
+      // generation check), and a new central has to subscribe afresh.
+      for (int c = 0; c < CGM_CHR_COUNT; c++) cgmSubs[i][c] = 0;
+      links[i] = Link{};
+      anyCgmLeft = cgmCountLocked() > 0;
+      // Mirror the core's silent advertising-off after a connection. The core
+      // set c->advertising = false in cgm_on_connect without calling
+      // advertise(false); onDisconnect only clears c->connected, so a window
+      // the core considers closed is never announced. With no CGM link left,
+      // the radio's copy can only follow that false; if the core opens a new
+      // window it calls advertise(true) again.
+      if (!anyCgmLeft) cgmAdvOn = false;
+      // Drop the cached reading too: it belongs to the session that just ended.
+      if (!anyCgmLeft) {
+        cgmLastReadingValid = false;
+        cgmLastReadingLen = 0;
+        ++cgmReadingSerial;
+        cgmHeldBy = 0;
+      }
+    }
+    // The hang-up belongs to the CGM session; it survives one central leaving
+    // while another is still on the air.
+    if (!anyCgmLeft) {
+      cgmDrop = false;
+      cgmDropTimed = false;
+    }
     std::string addr = addrString(desc->peer_ota_addr);
-    logf("%s disconnected", addr.c_str());
-    // Only a link the CGM knew about is the CGM's to close; the core logs a
-    // disconnect for every call.
+    logf("%s disconnected (handle 0x%04x; %s%s%s)", addr.c_str(), h, hadCgm ? "cgm " : "",
+         hadPod ? "pod " : "", hadMed ? "medtrum" : "");
+    // The core is told once per link; the glue maps that to its one session
+    // (the first connect opens it, the last disconnect closes it).
     if (hadCgm) sensor::onDisconnect();
-    medtrumStatusNotify = false;
-    podPush(DASH_EV_DISCONNECTED, nullptr, 0);
-    medtrumPush(MEDTRUM_EV_DISCONNECTED, nullptr, 0);
+    if (hadMed) {
+      medtrumStatusNotify = false;
+      medtrumPush(MEDTRUM_EV_DISCONNECTED, nullptr, 0);
+    }
+    if (hadPod) podPush(DASH_EV_DISCONNECTED, nullptr, 0);
   }
 };
 
 // One GATT event each way for the core: the core's own protocol runs inside
 // sensor::, so the radio only maps UUID to cgm_chr_t and hands the bytes over.
 
-// The CGM's first event on a link: tell the core, then mirror its
-// advertising-off. cgm_on_connect() sets the core's c->advertising = false
-// without calling advertise(false), so the radio's copy is cleared here to
-// match; otherwise the CGM set would keep advertising the CGM outside the
-// core's 60-second window, and signal loss could not stop it.
+// The CGM's first event on a link: tell the core, and mark the link the CGM's.
+// The core is told once per link; sensor_app maps the first connect to its one
+// session and the last disconnect out of it.
 //
-// The clear comes AFTER sensor::onConnect() returns, and that order is what
-// makes it race-safe: a sensor task already inside cgm_tick -> advertise(true)
-// holds the core's mutex, so it finishes its cgmAdvertise() before onConnect
-// can return, and once the core is connected cgm_tick makes no further
-// advertise(true) call. So both orders end with radio false / core false.
-static void cgmLinkUp() {
-  if (cgmUsed) return;
-  cgmUsed = true;
+// The CGM advertising set is deliberately NOT cleared here. cgm_on_connect()
+// sets the core's c->advertising = false without calling advertise(false), and
+// with two links the set must stay on while a slot remains: otherwise a watch
+// that scans after the phone connected could never find the sensor. tick()
+// stops the set once both links are the CGM's. When the last CGM link leaves,
+// onDisconnect() clears the radio's copy to match that silent false; the core
+// calls advertise(true) again if it opens a new window.
+static void cgmLinkUp(uint16_t h) {
+  if (!markCgmUsed(h)) return;
   sensor::onConnect();
-  std::lock_guard<std::mutex> l(mu);
-  cgmAdvOn = false;
 }
 
 class CgmCallbacks : public NimBLECharacteristicCallbacks {
@@ -270,8 +574,10 @@ class CgmCallbacks : public NimBLECharacteristicCallbacks {
   explicit CgmCallbacks(cgm_chr_t chr) : chr(chr) {}
 
   void onWrite(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
-    if (desc->conn_handle != conn) return;
-    cgmLinkUp();
+    uint16_t h = eventHandle(desc);
+    if (h == BLE_HS_CONN_HANDLE_NONE || !isLive(h)) return;
+    if (!acceptCheck(h, FAIL_CGM, "cgm")) return;
+    cgmLinkUp(h);
     if (fail_decide(FAIL_CGM, FAIL_CONSUME_MESSAGE, 0)) {
       logf("cgm: injected failure: message ignored");
       return;
@@ -281,17 +587,39 @@ class CgmCallbacks : public NimBLECharacteristicCallbacks {
   }
 
   void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc* desc, uint16_t subValue) override {
-    if (desc && desc->conn_handle != conn) return;
-    cgmLinkUp();
+    uint16_t h = eventHandle(desc);
+    if (h == BLE_HS_CONN_HANDLE_NONE || !isLive(h)) return;
+    if (!acceptCheck(h, FAIL_CGM, "cgm")) return;
+    cgmLinkUp(h);
     // The core answers a subscription at once (the auth status, the reading), so
     // the CCCD value is recorded first: cgmNotify sends only to a subscriber.
-    cgmSubs[chr] = subValue;
+    setCgmSub(h, chr, subValue);
     sensor::onSubscribe(chr, subValue != 0);
+    // A central that subscribes CONTROL after the phone already collected would
+    // otherwise never get a glucose message: replay the session's last reading
+    // to it, unless this link was already a recipient of the latest one (the
+    // core answered the subscription itself).
+    if (chr == CGM_CHR_CONTROL && subValue != 0) {
+      uint8_t cached[32];
+      size_t cachedLen = cgmLastReadingSnapshot(cached, sizeof cached);
+      bool covered = false;
+      {
+        std::lock_guard<std::mutex> l(mu);
+        Link* lk = linkLocked(h);
+        covered = lk && lk->cgmReadingQueued == cgmReadingSerial;
+      }
+      if (cachedLen && !covered) {
+        cgmQueueTo(h, chr, cached, cachedLen);
+        logf("cgm: replayed the current reading to handle 0x%04x", h);
+      }
+    }
   }
 
   void onRead(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
-    if (desc && desc->conn_handle != conn) return;
-    cgmLinkUp();
+    uint16_t h = eventHandle(desc);
+    if (h == BLE_HS_CONN_HANDLE_NONE || !isLive(h)) return;
+    if (!acceptCheck(h, FAIL_CGM, "cgm")) return;
+    cgmLinkUp(h);
     uint8_t buf[64];
     size_t n = sensor::onRead(chr, buf, sizeof buf);
     if (n) ch->setValue(buf, n);
@@ -313,19 +641,26 @@ class PodCallbacks : public NimBLECharacteristicCallbacks {
   explicit PodCallbacks(bool cmd) : cmd(cmd) {}
 
   void onWrite(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
-    if (desc->conn_handle != conn) return;
+    uint16_t h = eventHandle(desc);
+    if (h == BLE_HS_CONN_HANDLE_NONE || !isLive(h)) return;
     if (!pumpSelected(true)) {
-      pumpRefuse(desc->conn_handle, "pod");
+      pumpRefuse(h, "pod");
       return;
     }
+    if (pumpOwnedByOther(h, true)) {
+      closeLink(h, "pod", "a second pod phone; the pump stays on one link");
+      return;
+    }
+    if (!acceptCheck(h, FAIL_POD, "pod")) return;
+    // The pump is one phone's: its first GATT event on a link is what makes
+    // that link the pod's when both advertised sets could have invited it.
+    if (markPump(h, true)) podPush(DASH_EV_CONNECTED, nullptr, 0);
     NimBLEAttValue v = ch->getValue();
     if (v.length() > DASH_PKT_MAX) return;
     if (fail_decide(FAIL_POD, FAIL_CONSUME_MESSAGE, 0)) {
       logf("pod: injected failure: message ignored");
       return;
     }
-    podUsed = true;
-    podLastTraffic = (uint32_t)monoMs();
     podPush(cmd ? DASH_EV_CMD : DASH_EV_DATA, v.data(), v.length());
   }
 
@@ -333,12 +668,18 @@ class PodCallbacks : public NimBLECharacteristicCallbacks {
   // its first write; mark the link as the pod's then too (as the Medtrum read
   // callback does), so a switch releases it even before any write.
   void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc* desc, uint16_t) override {
-    if (desc && desc->conn_handle != conn) return;
+    uint16_t h = eventHandle(desc);
+    if (h == BLE_HS_CONN_HANDLE_NONE || !isLive(h)) return;
     if (!pumpSelected(true)) {
-      if (desc) pumpRefuse(desc->conn_handle, "pod");
+      pumpRefuse(h, "pod");
       return;
     }
-    podUsed = true;
+    if (pumpOwnedByOther(h, true)) {
+      closeLink(h, "pod", "a second pod phone; the pump stays on one link");
+      return;
+    }
+    if (!acceptCheck(h, FAIL_POD, "pod")) return;
+    if (markPump(h, true)) podPush(DASH_EV_CONNECTED, nullptr, 0);
   }
 
  private:
@@ -347,30 +688,42 @@ class PodCallbacks : public NimBLECharacteristicCallbacks {
 
 class MedtrumWriteCallbacks : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* ch, ble_gap_conn_desc* desc) override {
-    if (desc->conn_handle != conn) return;
+    uint16_t h = eventHandle(desc);
+    if (h == BLE_HS_CONN_HANDLE_NONE || !isLive(h)) return;
     if (!pumpSelected(false)) {
-      pumpRefuse(desc->conn_handle, "medtrum");
+      pumpRefuse(h, "medtrum");
       return;
     }
+    if (pumpOwnedByOther(h, false)) {
+      closeLink(h, "medtrum", "a second Medtrum phone; the base stays on one link");
+      return;
+    }
+    if (!acceptCheck(h, FAIL_MEDTRUM, "medtrum")) return;
+    if (markPump(h, false)) medtrumPush(MEDTRUM_EV_CONNECTED, nullptr, 0);
     NimBLEAttValue v = ch->getValue();
     if (v.length() > MEDTRUM_FRAME_MAX) return;
     if (fail_decide(FAIL_MEDTRUM, FAIL_CONSUME_MESSAGE, 0)) {
       logf("medtrum: injected failure: message ignored");
       return;
     }
-    medtrumUsed = true;
     medtrumPush(MEDTRUM_EV_WRITE, v.data(), v.length());
   }
 };
 
 class MedtrumReadCallbacks : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic*, ble_gap_conn_desc* desc, uint16_t subValue) override {
-    if (desc && desc->conn_handle != conn) return;
+    uint16_t h = eventHandle(desc);
+    if (h == BLE_HS_CONN_HANDLE_NONE || !isLive(h)) return;
     if (!pumpSelected(false)) {
-      if (desc) pumpRefuse(desc->conn_handle, "medtrum");
+      pumpRefuse(h, "medtrum");
       return;
     }
-    medtrumUsed = true;
+    if (pumpOwnedByOther(h, false)) {
+      closeLink(h, "medtrum", "a second Medtrum phone; the base stays on one link");
+      return;
+    }
+    if (!acceptCheck(h, FAIL_MEDTRUM, "medtrum")) return;
+    if (markPump(h, false)) medtrumPush(MEDTRUM_EV_CONNECTED, nullptr, 0);
     medtrumStatusNotify = subValue != 0;
   }
 };
@@ -442,7 +795,7 @@ void begin() {
   med->start();
   server->start();
   for (int i = 0; i < CGM_CHR_COUNT; i++) {
-    cgmSubs[i] = 0;
+    for (int l = 0; l < kMaxLinks; l++) cgmSubs[l][i] = 0;
     cgmHandles[i] = cgmChars[i]->getHandle();
   }
   podCmdHandle = pc->getHandle();
@@ -574,16 +927,51 @@ void cgmAdvertise(bool on, const char* name, const uint8_t addr[6], uint16_t ser
 void tick() {
   // A hang-up the core asked for: carried out here, never from inside the
   // call that asked (the core holds its mutex there, and the NimBLE disconnect
-  // callback calls back into the core). The one link is the pod's as well, so
-  // the CGM's hang-up waits for the pod's traffic to pause first, as it always
-  // did, and gives up waiting after 20 s.
+  // callback calls back into the core). With two CGM links it must end only
+  // when every subscribed central has collected (or the 20 s deadline fires).
+  // The CGM links no longer share a link with the pump, so there is no pump
+  // traffic pause to wait for.
   int64_t now = monoMs();
   uint32_t now32 = (uint32_t)now;  // the cross-task timestamps are 32-bit
   if (cgmDrop) {
-    uint16_t c = conn;
-    uint32_t gen = linkGen;
-    if (c == BLE_HS_CONN_HANDLE_NONE || !cgmUsed) {
-      // The link is gone, or the CGM never used it: nothing to end here.
+    uint16_t victims[kMaxLinks];
+    uint32_t gens[kMaxLinks];
+    int nVictims = 0;
+    uint16_t heldBy = 0;
+    bool heldChanged = false;
+    int cgmCount = 0;
+    {
+      std::lock_guard<std::mutex> l(mu);
+      for (int i = 0; i < kMaxLinks; i++) {
+        Link& lk = links[i];
+        if (!lk.used || !lk.cgmUsed) continue;
+        cgmCount++;
+        victims[nVictims] = lk.handle;
+        gens[nVictims] = lk.gen;
+        nVictims++;
+        // A subscribed central that has not been sent a reading yet is still
+        // collecting. Its handle is the one that holds the hang-up: every CGM
+        // link stays up until all of them have collected.
+        if (lk.cgmSubscribed && !lk.cgmCollected && heldBy == 0) heldBy = lk.handle;
+      }
+      // Only for one log line, but every read and write is under mu.
+      if (cgmCount == 0) {
+        cgmHeldBy = 0;
+      } else if (heldBy) {
+        if (cgmHeldBy != heldBy) {
+          cgmHeldBy = heldBy;
+          heldChanged = true;
+        }
+      } else {
+        cgmHeldBy = 0;
+      }
+    }
+    if (heldChanged) {
+      logf("cgm: hang-up held open by handle 0x%04x: it is subscribed to the reading but has not collected yet",
+           heldBy);
+    }
+    if (!cgmCount) {
+      // The links are gone, or the CGM never used them: nothing to end here.
       cgmDrop = false;
       cgmDropTimed = false;
     } else {
@@ -591,19 +979,20 @@ void tick() {
         cgmDropTimed = true;
         cgmDropAt = now32;
       }
-      // Signed elapsed: podNotify/PodCallbacks may stamp podLastTraffic from
-      // another task after now32 was taken, which must read as "just now" (a
-      // small negative), not as a huge unsigned idle. Horizon: 2^31 ms, i.e.
-      // about 24 days of uptime per link, far beyond the 20 s deadline.
-      int32_t sincePod = (int32_t)(now32 - podLastTraffic);
       int32_t sinceDrop = (int32_t)(now32 - cgmDropAt);
-      // The link may have been replaced while this tick was deciding (the
-      // handle could be reused): only end the same link.
-      if ((sincePod >= 1500 || sinceDrop >= 20000) && conn == c && linkGen == gen) {
+      bool overdue = sinceDrop >= 20000;
+      // All subscribed centrals have collected, or the 20 s deadline fired.
+      // Only the same connections are ended: the handle may have been reused
+      // while this tick decided (terminateLink checks under mu).
+      if (!heldBy || overdue) {
+        {
+          std::lock_guard<std::mutex> l(mu);
+          cgmHeldBy = 0;
+        }
         cgmDrop = false;
         cgmDropTimed = false;
-        logf("cgm: hanging up so the phone collects the reading");
-        ble_gap_terminate(c, BLE_ERR_REM_USER_CONN_TERM);
+        logf("cgm: hanging up so the centrals collect the reading");
+        for (int i = 0; i < nVictims; i++) terminateLink(victims[i], gens[i]);
       }
     }
   }
@@ -618,21 +1007,25 @@ void tick() {
   bool paired = podPaired;
   std::string medData = medtrumAdvData;
   bool medOn = medtrumAdvOn;
+  bool podUp = podLinkLocked() != nullptr;
+  bool medUp = medtrumLinkLocked() != nullptr;
+  int live = liveCountLocked();
   l.unlock();
 
-  // Who wants to be found? Two sets now: instance 0 is the pump's (the pod, or
-  // the Medtrum base when the selector says so; never both, never the CGM),
-  // instance 1 is the CGM's. The pump set is chosen by the selector; the CGM
-  // set follows the core's schedule (it opens a window per reading and closes
-  // it when the phone has collected). An injected quiet window only clears that
-  // device's want flag; its payload string is untouched.
-  bool connected = conn != BLE_HS_CONN_HANDLE_NONE;
+  // Who wants to be found? Two sets: instance 0 is the pump's (the pod, or the
+  // Medtrum base when the selector says so; never both, never the CGM),
+  // instance 1 is the CGM's. The pump set stops once its own phone is on the
+  // link; another link (a CGM central) does not stop it. The CGM set stays on
+  // while a link is free, so a watch can find the sensor after the phone
+  // connected, and closes when both links are in use, when the core's window
+  // closes, or while a hang-up is pending. An injected quiet window only clears
+  // that device's want flag; its payload string is untouched.
   // The pod and the Medtrum base are mutually exclusive: exactly one of the two
   // may use the pump set, and PUMP_OFF lets neither.
   int sel = pump();
-  bool podWants = sel == PUMP_POD && !podData.empty() && (!connected || !paired);
-  bool medWants = sel == PUMP_MEDTRUM && medOn && !medData.empty() && !connected;
-  bool cgmWants = (int)sensor::kind() != 0 && cgmOn && !connected;
+  bool podWants = sel == PUMP_POD && !podData.empty() && (!podUp || !paired);
+  bool medWants = sel == PUMP_MEDTRUM && medOn && !medData.empty() && !medUp;
+  bool cgmWants = (int)sensor::kind() != 0 && cgmOn && live < kMaxLinks && !cgmDrop;
   cgmWants = cgmWants && fail_decide(FAIL_CGM, FAIL_ADVERTISE, now);
   podWants = podWants && fail_decide(FAIL_POD, FAIL_ADVERTISE, now);
   medWants = medWants && fail_decide(FAIL_MEDTRUM, FAIL_ADVERTISE, now);
@@ -706,62 +1099,117 @@ void tick() {
   }
 }
 
-int openLinks() { return conn != BLE_HS_CONN_HANDLE_NONE ? 1 : 0; }
+int openLinks() {
+  std::lock_guard<std::mutex> l(mu);
+  return liveCountLocked();
+}
 
 // MARK: - The CGM's radio
 
-// Sends the queued notifications, one at a time, after the injected delay.
+// Sends every queued notification to each central that was subscribed to the
+// characteristic when it was queued, after the injected delay. "Every" is the
+// difference from the old single-link code: a phone and a watch subscribed to
+// CONTROL both receive the reading.
 static void cgmSendTask(void*) {
   CgmOut m = {};
   for (;;) {
     if (xQueueReceive(cgmOut, &m, portMAX_DELAY) != pdTRUE) continue;
     unsigned delay = (unsigned)fail_decide(FAIL_CGM, FAIL_NOTIFY_DELAY_MS, 0);
     if (delay) vTaskDelay(pdMS_TO_TICKS(delay));
-    uint16_t c = conn;
-    // The phone may have left, or a new one taken the same handle, while we
-    // waited: a queued message belongs to the link it was queued for.
-    if (c == BLE_HS_CONN_HANDLE_NONE || c != m.conn || linkGen != m.gen) continue;
-    uint16_t sub = cgmSubs[m.chr];
-    if (!sub) {
-      logf("cgm: %s -> %s dropped: not subscribed", cgmCharNames[m.chr], hexstr(m.data, m.len).c_str());
-      continue;
+    for (int r = 0; r < m.nTo; r++) {
+      uint16_t c = m.to[r].handle;
+      bool notSub = false, noBuf = false;
+      int failRc = 0;
+      {
+        // The liveness/generation/subscription check and the stack call are
+        // under one lock: a disconnect + handle reuse cannot slip in between.
+        // GATT/GAP events are queued, so the call does not dispatch into us.
+        std::lock_guard<std::mutex> l(mu);
+        int i = slotLocked(c);
+        if (i < 0 || links[i].gen != m.to[r].gen || !links[i].cgmUsed) continue;
+        uint16_t sub = cgmSubs[i][m.chr];
+        if (!sub) {
+          notSub = true;
+        } else {
+          os_mbuf* om = ble_hs_mbuf_from_flat(m.data, m.len);
+          if (!om) {
+            noBuf = true;
+          } else {
+            // A central subscribes to notify, or (the auth characteristic) to
+            // indicate.
+            failRc = (sub & 1) ? ble_gattc_notify_custom(c, cgmHandles[m.chr], om)
+                               : ble_gattc_indicate_custom(c, cgmHandles[m.chr], om);
+            if (failRc == 0) {
+              // Delivered: if it carries the reading, this central has
+              // collected, so it no longer holds a hang-up.
+              if (cgmCarriesReading(m.chr, m.data, m.len)) links[i].cgmCollected = true;
+              links[i].lastTraffic = (uint32_t)monoMs();
+            }
+          }
+        }
+      }
+      if (notSub) {
+        logf("cgm: %s -> %s dropped: handle 0x%04x is no longer subscribed", cgmCharNames[m.chr],
+             hexstr(m.data, m.len).c_str(), c);
+      } else if (noBuf) {
+        logf("cgm: notification dropped: no buffers");
+      } else if (failRc != 0) {
+        logf("cgm: notification to handle 0x%04x failed: %d", c, failRc);
+      }
     }
-    os_mbuf* om = ble_hs_mbuf_from_flat(m.data, m.len);
-    if (!om) {
-      logf("cgm: notification dropped: no buffers");
-      continue;
-    }
-    // A phone subscribes to notify, or (the auth characteristic) to indicate.
-    int rc = (sub & 1) ? ble_gattc_notify_custom(c, cgmHandles[m.chr], om)
-                       : ble_gattc_indicate_custom(c, cgmHandles[m.chr], om);
-    if (rc != 0) logf("cgm: notification failed: %d", rc);
   }
 }
 
-// Called by the core from inside its own mutex: queue the message and return.
-// The task above sends it once, as the reference's ble_cgm_send does (no
-// ENOMEM retry loop), and applies that device's injected delay.
+// Called by the core from inside its own mutex: queue the message for every
+// central subscribed to its characteristic and return. The task above sends
+// it once per central, as the reference's ble_cgm_send does (no ENOMEM retry
+// loop), and applies that device's injected delay once.
 void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n) {
-  if (conn == BLE_HS_CONN_HANDLE_NONE || !cgmOut) return;
+  if (!cgmOut) return;
   if (n > sizeof(CgmOut::data)) {
     logf("cgm: a %u-byte notification does not fit the queue; dropped", (unsigned)n);
     return;
   }
   CgmOut m = {};
-  m.conn = conn;
-  m.gen = linkGen;
   m.chr = (uint8_t)chr;
   m.len = (uint8_t)n;
   if (n) memcpy(m.data, p, n);
+  {
+    std::lock_guard<std::mutex> l(mu);
+    // Keep the session's last CONTROL reading for a late CONTROL subscriber.
+    bool reading = chr == CGM_CHR_CONTROL && cgmCarriesReading((uint8_t)chr, p, n);
+    if (reading) {
+      memcpy(cgmLastReading, p, n);
+      cgmLastReadingLen = n;
+      cgmLastReadingValid = true;
+      ++cgmReadingSerial;
+    }
+    for (int i = 0; i < kMaxLinks; i++) {
+      if (!links[i].used || !links[i].cgmUsed || cgmSubs[i][chr] == 0) continue;
+      if (reading) links[i].cgmReadingQueued = cgmReadingSerial;
+      m.to[m.nTo].handle = links[i].handle;
+      m.to[m.nTo].gen = links[i].gen;
+      m.nTo++;
+    }
+  }
+  if (m.nTo == 0) {
+    logf("cgm: %s -> no subscribed central", cgmCharNames[chr]);
+    return;
+  }
   if (xQueueSend(cgmOut, &m, 0) != pdTRUE) logf("cgm: notification queue full: a message was dropped");
 }
 
 // The core calls this from inside its own mutex, possibly on the NimBLE
-// callback thread: only mark the hang-up. tick() terminates the link (if the
-// CGM ever used it), and the NimBLE disconnect callback then calls
-// sensor::onDisconnect.
+// callback thread: only mark the hang-up. tick() terminates the CGM's links
+// (if the CGM ever used them), and the NimBLE disconnect callback then calls
+// sensor::onDisconnect for each.
 void cgmDisconnect() {
-  if (conn == BLE_HS_CONN_HANDLE_NONE) return;
+  bool any;
+  {
+    std::lock_guard<std::mutex> l(mu);
+    any = cgmCountLocked() > 0;
+  }
+  if (!any) return;
   // A request that arrives while none is pending starts a fresh 20 s deadline;
   // the core asks again every second while it is pending, which must not
   // restart it.
@@ -769,11 +1217,26 @@ void cgmDisconnect() {
   cgmDrop = true;
 }
 
-bool cgmConnected() { return conn != BLE_HS_CONN_HANDLE_NONE; }
+bool cgmConnected() {
+  std::lock_guard<std::mutex> l(mu);
+  return cgmCountLocked() > 0;
+}
+
+int cgmCollectedCentrals() {
+  std::lock_guard<std::mutex> l(mu);
+  int n = 0;
+  for (int i = 0; i < kMaxLinks; i++) {
+    if (links[i].used && links[i].cgmUsed && links[i].cgmSubscribed && links[i].cgmCollected) n++;
+  }
+  return n;
+}
 
 // MARK: - The pod's radio
 
-bool podConnected() { return conn != BLE_HS_CONN_HANDLE_NONE; }
+bool podConnected() {
+  std::lock_guard<std::mutex> l(mu);
+  return podLinkLocked() != nullptr;
+}
 
 bool podNextEvent(dash_ev_t* ev, uint32_t timeoutMs) {
   TickType_t t = timeoutMs == DASH_WAIT_FOREVER ? portMAX_DELAY : pdMS_TO_TICKS(timeoutMs);
@@ -782,26 +1245,43 @@ bool podNextEvent(dash_ev_t* ev, uint32_t timeoutMs) {
 }
 
 static void podNotify(uint16_t handle, const uint8_t* p, size_t n) {
-  uint16_t c = conn;
-  if (c == BLE_HS_CONN_HANDLE_NONE) return;
-  uint32_t gen = linkGen;
+  uint16_t c;
+  uint32_t gen;
+  {
+    std::lock_guard<std::mutex> l(mu);
+    Link* lk = podLinkLocked();
+    if (!lk) return;  // no pod phone on the air
+    c = lk->handle;
+    gen = lk->gen;
+  }
   unsigned delay = (unsigned)fail_decide(FAIL_POD, FAIL_NOTIFY_DELAY_MS, 0);
   if (delay) vTaskDelay(pdMS_TO_TICKS(delay));
-  // The link may have gone (or been replaced) while we waited: do not send
-  // the old device's message to a new phone that reused the handle.
-  if (conn != c || linkGen != gen) return;
-  podLastTraffic = (uint32_t)monoMs();
   // With a dozen fragments queued, NimBLE can run short of buffers for a
-  // moment: wait for them rather than lose a fragment.
+  // moment: wait for them rather than lose a fragment. The check and the call
+  // share the lock, so a disconnect + handle reuse cannot slip between them.
   for (int tries = 0; tries < 100; tries++) {
-    os_mbuf* om = ble_hs_mbuf_from_flat(p, (uint16_t)n);
-    if (om) {
-      int rc = ble_gattc_notify_custom(c, handle, om);
-      if (rc == 0) return;
-      if (rc != BLE_HS_ENOMEM) {
-        logf("pod: notification failed: %d", rc);
-        return;
+    bool gone = false;
+    int rc = 0;
+    {
+      std::lock_guard<std::mutex> l(mu);
+      Link* lk = linkLocked(c);
+      if (!lk || lk->gen != gen || !lk->podUsed) {
+        gone = true;
+      } else {
+        lk->lastTraffic = (uint32_t)monoMs();
+        os_mbuf* om = ble_hs_mbuf_from_flat(p, (uint16_t)n);
+        if (!om) {
+          rc = BLE_HS_ENOMEM;
+        } else {
+          rc = ble_gattc_notify_custom(c, handle, om);
+        }
       }
+    }
+    if (gone) return;
+    if (rc == 0) return;
+    if (rc != BLE_HS_ENOMEM) {
+      logf("pod: notification failed: %d", rc);
+      return;
     }
     vTaskDelay(pdMS_TO_TICKS(5));
   }
@@ -810,11 +1290,26 @@ static void podNotify(uint16_t handle, const uint8_t* p, size_t n) {
 
 void podNotifyCmd(const uint8_t* p, size_t n) { podNotify(podCmdHandle, p, n); }
 
-void podNotifyData(const uint8_t* p, size_t n) { podNotify(podIsO5 ? podO5DataHandle : podDataHandle, p, n); }
+void podNotifyData(const uint8_t* p, size_t n) {
+  bool o5;
+  {
+    std::lock_guard<std::mutex> l(mu);
+    o5 = podIsO5;
+  }
+  podNotify(o5 ? podO5DataHandle : podDataHandle, p, n);
+}
 
 void podDisconnect() {
-  uint16_t c = conn;
-  if (c != BLE_HS_CONN_HANDLE_NONE) ble_gap_terminate(c, BLE_ERR_REM_USER_CONN_TERM);
+  uint16_t c = BLE_HS_CONN_HANDLE_NONE;
+  uint32_t gen = 0;
+  {
+    std::lock_guard<std::mutex> l(mu);
+    Link* lk = podLinkLocked();
+    if (!lk) return;  // no link is the pod's; never guess another device's
+    c = lk->handle;
+    gen = lk->gen;
+  }
+  terminateLink(c, gen);
 }
 
 // These two are REQUESTS. The pump selector (radio::pump()) decides whose payload
@@ -851,7 +1346,10 @@ void podAdvertise(const dash_adv_t* adv) {
 
 // MARK: - The Medtrum patch's radio
 
-bool medtrumConnected() { return conn != BLE_HS_CONN_HANDLE_NONE; }
+bool medtrumConnected() {
+  std::lock_guard<std::mutex> l(mu);
+  return medtrumLinkLocked() != nullptr;
+}
 
 bool medtrumNextEvent(medtrum_ev_t* ev, uint32_t timeoutMs) {
   TickType_t t = timeoutMs == MEDTRUM_WAIT_FOREVER ? portMAX_DELAY : pdMS_TO_TICKS(timeoutMs);
@@ -860,24 +1358,42 @@ bool medtrumNextEvent(medtrum_ev_t* ev, uint32_t timeoutMs) {
 }
 
 static void medtrumNotifyRaw(uint16_t handle, const uint8_t* p, size_t n) {
-  uint16_t c = conn;
-  if (c == BLE_HS_CONN_HANDLE_NONE) return;
-  uint32_t gen = linkGen;
+  uint16_t c;
+  uint32_t gen;
+  {
+    std::lock_guard<std::mutex> l(mu);
+    Link* lk = medtrumLinkLocked();
+    if (!lk) return;  // no base phone on the air
+    c = lk->handle;
+    gen = lk->gen;
+  }
   unsigned delay = (unsigned)fail_decide(FAIL_MEDTRUM, FAIL_NOTIFY_DELAY_MS, 0);
   if (delay) vTaskDelay(pdMS_TO_TICKS(delay));
-  // The link may have gone (or been replaced) while we waited.
-  if (conn != c || linkGen != gen) return;
-  // With a dozen fragments queued, NimBLE can run short of buffers for a
-  // moment: wait for them rather than lose a fragment.
+  // Same retry shape as the pod's: the check and the call share the lock, so a
+  // disconnect + handle reuse cannot slip between them.
   for (int tries = 0; tries < 100; tries++) {
-    os_mbuf* om = ble_hs_mbuf_from_flat(p, (uint16_t)n);
-    if (om) {
-      int rc = ble_gattc_notify_custom(c, handle, om);
-      if (rc == 0) return;
-      if (rc != BLE_HS_ENOMEM) {
-        logf("medtrum: notification failed: %d", rc);
-        return;
+    bool gone = false;
+    int rc = 0;
+    {
+      std::lock_guard<std::mutex> l(mu);
+      Link* lk = linkLocked(c);
+      if (!lk || lk->gen != gen || !lk->medtrumUsed) {
+        gone = true;
+      } else {
+        lk->lastTraffic = (uint32_t)monoMs();
+        os_mbuf* om = ble_hs_mbuf_from_flat(p, (uint16_t)n);
+        if (!om) {
+          rc = BLE_HS_ENOMEM;
+        } else {
+          rc = ble_gattc_notify_custom(c, handle, om);
+        }
       }
+    }
+    if (gone) return;
+    if (rc == 0) return;
+    if (rc != BLE_HS_ENOMEM) {
+      logf("medtrum: notification failed: %d", rc);
+      return;
     }
     vTaskDelay(pdMS_TO_TICKS(5));
   }
@@ -893,24 +1409,42 @@ void medtrumNotifyStatus(const uint8_t* p, size_t n) {
 }
 
 void medtrumDisconnect() {
-  uint16_t c = conn;
-  if (c != BLE_HS_CONN_HANDLE_NONE) ble_gap_terminate(c, BLE_ERR_REM_USER_CONN_TERM);
+  uint16_t c = BLE_HS_CONN_HANDLE_NONE;
+  uint32_t gen = 0;
+  {
+    std::lock_guard<std::mutex> l(mu);
+    Link* lk = medtrumLinkLocked();
+    if (!lk) return;  // no link is the base's; never guess another device's
+    c = lk->handle;
+    gen = lk->gen;
+  }
+  terminateLink(c, gen);
 }
 
 void setPump(int p) {
   if (p != PUMP_OFF && p != PUMP_POD && p != PUMP_MEDTRUM) return;
+  uint16_t drop[kMaxLinks];
+  uint32_t gens[kMaxLinks];
+  int n = 0;
   {
     std::lock_guard<std::mutex> l(mu);
     pumpSel = p;
+    // The pump that is no longer selected must not keep its link. A link the
+    // CGM alone touched is not a pump's, so it is left alone.
+    for (int i = 0; i < kMaxLinks; i++) {
+      Link& lk = links[i];
+      if (!lk.used) continue;
+      bool heldByOther = (p == PUMP_OFF && (lk.podUsed || lk.medtrumUsed)) ||
+                         (p == PUMP_POD && lk.medtrumUsed) || (p == PUMP_MEDTRUM && lk.podUsed);
+      if (!heldByOther) continue;
+      drop[n] = lk.handle;
+      gens[n] = lk.gen;
+      n++;
+    }
   }
-  // The pump that is no longer selected must not keep the one link. A link the
-  // CGM alone touched is not a pump's, so it is left alone.
-  uint16_t c = conn;
-  bool heldByOther = (p == PUMP_OFF && (podUsed || medtrumUsed)) || (p == PUMP_POD && medtrumUsed) ||
-                     (p == PUMP_MEDTRUM && podUsed);
-  if (c != BLE_HS_CONN_HANDLE_NONE && heldByOther) {
+  if (n) {
     logf("pump simulators: dropping the link the unselected pump held");
-    ble_gap_terminate(c, BLE_ERR_REM_USER_CONN_TERM);
+    for (int i = 0; i < n; i++) terminateLink(drop[i], gens[i]);
   }
 }
 

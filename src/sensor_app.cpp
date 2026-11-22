@@ -26,8 +26,8 @@
 #include "radio.h"
 #include "util.h"
 
-// The radio side of the core lives in src/radio.{h,cpp}: cgmNotify sends on
-// the characteristic the phone subscribed to (once, as the reference does),
+// The radio side of the core lives in src/radio.{h,cpp}: cgmNotify fans a
+// notification out to every central subscribed to that characteristic,
 // cgmDisconnect only marks a hang-up for the radio's tick() to carry out (the
 // core calls it from inside this file's mutex), and cgmAdvertise builds the
 // FEBC advertisement under sensor::name(). Every CGM GATT event calls back in
@@ -45,6 +45,11 @@ static bool dirty;
 static uint32_t saveGen;
 // The highest generation handed to flash; guarded by saveMu.
 static uint32_t savedGen;
+// The CGM session's central count, guarded by mu like the core itself. The core
+// models one session: the first CGM link opens it and the last closes it. The
+// per-link subscription/collected state stays in the radio, which owns it; the
+// glue only counts links so the session can be opened/closed once.
+static int centrals;
 
 #define LOCKED(stmt)                   \
   do {                                 \
@@ -452,6 +457,7 @@ void begin() {
   saveMu = xSemaphoreCreateMutex();
   dirty = false;
   saveGen = savedGen = 0;
+  centrals = 0;
 
   cgm_state_t st;
   int64_t savedAt = 0;
@@ -513,9 +519,44 @@ void start() {
 
 // MARK: - The radio's calls
 
-void onConnect() { LOCKED({ cgm_on_connect(&c); }); }
-void onDisconnect() { LOCKED({ cgm_on_disconnect(&c); }); }
+void onConnect() {
+  int n = 0;
+  bool opened = false;
+  LOCKED({
+    // The core's own connected flag is the session state: normally it is false
+    // exactly when no central is on the link, but "forget" closes it while the
+    // radio is still dropping the old links, and a new central is a new session.
+    if (!c.connected) {
+      cgm_on_connect(&c);  // the core's one session opens with the first link
+      opened = true;
+    }
+    centrals++;
+    n = centrals;
+  });
+  logf("sensor: CGM central connected (%d on the link; %s)", n, opened ? "session opened" : "joining the session");
+}
+
+void onDisconnect() {
+  int n = 0;
+  bool closed = false;
+  LOCKED({
+    if (centrals > 0) centrals--;
+    n = centrals;
+    if (n == 0) {
+      // Only the last central closes the core's session; a watch leaving while
+      // the phone reads must not reset the state machine.
+      if (c.connected) cgm_on_disconnect(&c);
+      closed = true;
+    }
+  });
+  if (closed)
+    logf("sensor: last CGM central left; session closed");
+  else
+    logf("sensor: CGM central left (%d still connected)", n);
+}
+
 void onSubscribe(cgm_chr_t chr, bool on) { LOCKED({ cgm_on_subscribe(&c, chr, on); }); }
+
 void onWrite(cgm_chr_t chr, const uint8_t* p, size_t n) { LOCKED({ cgm_on_write(&c, chr, p, n); }); }
 
 size_t onRead(cgm_chr_t chr, uint8_t* out, size_t cap) {
@@ -523,6 +564,8 @@ size_t onRead(cgm_chr_t chr, uint8_t* out, size_t cap) {
   LOCKED({ n = cgm_on_read(&c, chr, out, cap); });
   return n;
 }
+
+int cgmCollectedCentrals() { return radio::cgmCollectedCentrals(); }
 
 // MARK: - The panel
 
@@ -567,12 +610,15 @@ std::string statusJson() {
   char json[1024];
   size_t n = 0;
   int64_t now = 0, activated = 0, warmupDone = 0;
+  int centralsNow = 0, collectedNow = 0;
   LOCKED({
     n = cgm_status_json(&c, json, sizeof json);
     now = nowSeconds(nullptr);
     activated = c.st.activated;
     warmupDone = c.st.warmup_done;
+    centralsNow = centrals;
   });
+  collectedNow = cgmCollectedCentrals();
   if (n == 0 || n >= sizeof json) return "{}";
   std::string s(json, n);
   if (!s.empty() && s.back() == '}') s.pop_back();
@@ -580,9 +626,13 @@ std::string statusJson() {
   s += radioUp ? "true" : "false";
   // The core reports clock times (Unix seconds); the panel shows the age, so
   // it does not have to trust the browser's clock against an NTP-less board.
-  char extra[128];
-  snprintf(extra, sizeof extra, ",\"now\":%lld,\"ageSeconds\":%lld,\"warmupLeftSeconds\":%lld}", (long long)now,
-           (long long)(now - activated), (long long)(warmupDone > now ? warmupDone - now : 0));
+  // centrals/collectedCentrals make a two-phone test readable; the core's own
+  // "connected" is the one session, true while any central holds it.
+  char extra[192];
+  snprintf(extra, sizeof extra,
+           ",\"now\":%lld,\"ageSeconds\":%lld,\"warmupLeftSeconds\":%lld,\"centrals\":%d,\"collectedCentrals\":%d}",
+           (long long)now, (long long)(now - activated), (long long)(warmupDone > now ? warmupDone - now : 0),
+           centralsNow, collectedNow);
   s += extra;
   return s;
 }
@@ -729,7 +779,7 @@ const char* command(const std::string& json) {
     });
   } else if (strcmp(cmd, "cgmForget") == 0) {
     // The core has no pairing slots: it is authenticated-and-bonded for every
-    // phone. "Forget" can only drop the current link (outside the glue's
+    // phone. "Forget" can only drop the CGM's links (outside the glue's
     // mutex, since the radio's disconnect may call sensor::onDisconnect).
     bool linked = false;
     LOCKED({
@@ -737,7 +787,7 @@ const char* command(const std::string& json) {
       if (linked) cgm_on_disconnect(&c);
     });
     if (linked) radio::cgmDisconnect();
-    logf("sensor: forget: dropped the link; the CGM core keeps no pairing to forget");
+    logf("sensor: forget: dropped the link(s); the CGM core keeps no pairing to forget");
   } else {
     return "unknown CGM command";
   }

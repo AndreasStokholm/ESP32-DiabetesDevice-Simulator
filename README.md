@@ -3,10 +3,12 @@
 One ESP32-S3 that simulates **one CGM and one pump at a time**, each chosen on its own page.
 The CGM page (`/g7`) picks Off, a **Dexcom G6** transmitter or a **Dexcom G7** sensor; the
 pump page (`/pump`) picks Off, an **Omnipod DASH** pod, an **Omnipod 5** pod or a **Medtrum
-patch**. Everything not chosen is off: it does not advertise and does not hold the board's
-single Bluetooth link. On a test phone, add the chosen CGM in the app and the chosen pump
-(from Loop or Trio, or a MedtrumKit-capable app): the app has a CGM and a pump, with no real
-hardware. A new board starts as a Dexcom G7 and an Omnipod 5.
+patch**. Everything not chosen is off: it does not advertise and does not hold one of the
+board's two Bluetooth links. The CGM can serve **two centrals at once** (a phone and a
+watch), as a real transmitter serves several receivers; the pump stays on one link. On a
+test phone, add the chosen CGM in the app and the chosen pump (from Loop or Trio, or a
+MedtrumKit-capable app): the app has a CGM and a pump, with no real hardware. A new board
+starts as a Dexcom G7 and an Omnipod 5.
 
 > **Test equipment only.** Not a Dexcom, Insulet or Medtrum product, and not a medical
 > device. It delivers no insulin and every value it reports is made up. Never use it, or an
@@ -25,11 +27,13 @@ It builds on two projects:
 
 ## How one board is a CGM and a pump
 
-A phone can't hold several Bluetooth connections to the same radio, so the board can't give
-it two independent links. Instead the board advertises as **two peripherals** at once,
-and whichever one an app connects to shares the single connection underneath: one GATT
-table carries both the selected CGM's service and the selected pump's service. The app's
-CGM code and its pump code each connect to "their" device and share that one link.
+The board is **one peripheral** (one GATT table) that advertises as **two devices** at
+once: the selected CGM on the sensor's address, and the selected pump on the board's. The
+app's CGM code and its pump code each connect to "their" device. The board holds up to
+**two Bluetooth links** at a time. The CGM may be held by **two centrals at once** (a phone
+and a watch), which is what a real transmitter does; the selected pump (or the Medtrum
+base) stays on one link, because it is one phone's pump. A third connection is refused and
+logged.
 
 - **Two advertising identities, using the addresses a real CGM and pump use.** The CGM
   peripheral advertises on the sensor's own **random static address**; the pump peripheral
@@ -44,12 +48,20 @@ CGM code and its pump code each connect to "their" device and share that one lin
   Off lets neither. Each keeps its own bytes exactly; they cannot be merged into one
   payload.
 - **The CGM advertises around each reading**, as a real sensor does: a 60-second window
-  after a reading, and only while that reading has not been collected.
-- **The board hangs up when the reading is out**, about 3 seconds after the phone has had
-  it (and never while the pod is talking, or after 20 seconds of waiting). The app's CGM
-  code only asks for a reading after connecting, so this is what makes it collect the next
-  one; both sides reconnect within a second or two.
-- **One phone at a time.**
+  after a reading while no central has collected it. While one CGM central is connected the
+  window stays open as long as the second link is free, so a watch that scans after the
+  phone connected can still find the sensor; it closes once both links are the CGM's, when
+  the core's window ends, or when the hang-up starts.
+- **The board hangs up when the reading is out**, once **every** CGM central subscribed to
+  it has collected (a phone and a watch can take it at their own pace), and never later
+  than 20 seconds. A central that subscribes after the phone collected is sent the current
+  reading at once. The app's CGM code only asks for a reading after connecting, so this is
+  what makes it collect the next one; the centrals reconnect within a second or two. The
+  CGM core still models **one session**: the first central opens it and the last one leaving
+  closes it, so a watch hanging up does not reset the phone's session.
+- **Two centrals at once, a third refused.** The CGM may use both links (a phone and a
+  watch); a pump phone and its CGM use one each. With two CGM centrals connected, a pump
+  cannot also connect.
 
 ## Flashing the firmware
 
@@ -141,8 +153,8 @@ Write them separately. A single merged image pads the gaps between the parts, an
 padding overwrites the board's stored pod state and Wi‑Fi settings.
 
 Tested on an ESP32-S3 with 8 MB flash, with Trio on a test iPhone: a DASH pod and an
-Omnipod 5 pod each paired, primed and ran, with a G7 sensor paired on the same connection
-and its readings collected every 5 minutes. Switching the pod type from the USB panel and
+Omnipod 5 pod each paired, primed and ran, with a G7 sensor paired on the CGM link and its
+readings collected every 5 minutes. Switching the pod type from the USB panel and
 pairing the new pod was tested both ways. That test ran the g7sim-era sensor; the G6/G7
 core (and the G6 mode in particular) has not been on hardware yet.
 
@@ -220,10 +232,10 @@ All pages share one nav: **Home, CGM, Pump, Settings**.
 - `/setup` is the captive-portal Wi‑Fi sheet (also at `http://192.168.4.1/setup`).
 
 The pod and the Medtrum base are **mutually exclusive**: a phone runs one pump app, and the
-board has one BLE link, so only one pump can hold it. They share the pump advertising
+pump uses one BLE link, so only one pump can hold it. They share the pump advertising
 identity: selecting a pump stops the other one advertising and drops any link it held;
 selecting Off leaves no pump advertising and no pump connection accepted. The CGM's
-avertising identity and its side of the shared link are unaffected either way.
+advertising identity and its own links are unaffected either way.
 
 The JSON APIs are the originals': g7sim's four stay at the root (`/status`, `/glucose`,
 `/forget`, `/new`), and the CGM's own core has `/g7/status` and `/g7/command`; loopkit/pod's
@@ -286,7 +298,7 @@ what they do is what the core can do: one next reading and a trend, not g7sim's 
 | `algo 18` | (shorthand) | Change only the reported state; `algo 0` lets the core derive it |
 | `kind g6` / `kind g7` / `kind off` | (none) | Become a G6 transmitter, a G7 sensor, or neither. A new kind starts a new sensor |
 | `id 81ABC2` | (none) | A G6's 6-character transmitter id (2 characters for a G7) |
-| `forget` | `POST /forget` | Drop the current link. The core keeps no pairing to forget |
+| `forget` | `POST /forget` | Drop all CGM links. The core keeps no pairing to forget |
 | `new {"model":"g7","ageMinutes":0}` | `POST /new` | Start a new sensor. The board restarts |
 
 The same requests work over Wi‑Fi, for example
@@ -313,18 +325,18 @@ The panel and `/g7/command` take the core's own commands:
 |---|---|
 | `{"command":"cgmSetGlucose","glucose":120,"trend":-10}` | The next reading and its trend (tenths of mg/dL per minute) |
 | `{"command":"cgmSetState","state":18}` | Force the reported state (0 derives it from the session's age) |
-| `{"command":"cgmSetSignalLoss","on":true}` | Signal loss: stop advertising and drop the link; the readings are still made, so the app backfills them when it ends |
+| `{"command":"cgmSetSignalLoss","on":true}` | Signal loss: stop advertising and drop the CGM's links; the readings are still made, so the app backfills them when it ends |
 | `{"command":"cgmSkipWarmup"}` | End the warm-up now, keeping the sensor and its id |
 | `{"command":"cgmSetCalibration","glucose":120}` | G6 calibration (the last calibration and the next reading) |
 | `{"command":"cgmSetKind","kind":6}` | 0 off, 6 G6, 7 G7; a new kind starts a new sensor |
 | `{"command":"cgmSetId","id":"81ABC2"}` | A G6's transmitter id (2 characters for a G7) |
 | `{"command":"cgmNewSensor","kind":7,"ageMinutes":120}` | A new sensor of that kind, that many minutes old |
-| `{"command":"cgmForget"}` | Drop the current link |
+| `{"command":"cgmForget"}` | Drop all CGM links |
 
 `GET /g7/status` returns the core's own state (kind, name, id, glucose, trend, state,
 `signalLoss`, the reading history's last entry, `advertising`/`connected`, plus
-`radioConnected`, `now`, `ageSeconds` and `warmupLeftSeconds`), and the panel polls it
-every 2 seconds.
+`radioConnected`, `now`, `ageSeconds` and `warmupLeftSeconds`), and `centrals` /
+`collectedCentrals` make a two-central test readable. The panel polls it every 2 seconds.
 
 Glucose changes take effect at the next 5-minute reading. After `new`, `kind` or `id`, the
 app has to find the sensor again (a new sensor has a new id).
@@ -338,7 +350,7 @@ has; g7sim's `window`, `activation` and `lockedForSeconds` are not reported eith
 core has no per-reading window view, no wall-clock activation and no rejection lockout).
 Not carried over either: `POST /force-quit` and the `-transport`, `-socket`,
 `-simulator`, `-relaunch`, `-suspend` and `-dylib` flags, which only apply to g7sim's iOS
-Simulator transport, and `-max-connections`, since the board serves one phone at a time.
+Simulator transport, and `-max-connections`, since the board has its own two-link limit.
 `/status` reports times as seconds of sensor age (`ageSeconds`) where g7sim gives clock
 times, because the board has no clock without Wi‑Fi (the CGM keeps its own clock anyway).
 
@@ -414,8 +426,9 @@ venv/bin/pip install bleak cryptography
 | `venv/bin/python tools/podcheck.py` | Find the pod and check that it answers |
 | ~~`G7NAME=DXCMab venv/bin/python tools/g7client.py 1234`~~ | **Retired**: it speaks g7sim's J-PAKE pairing, which this firmware no longer has. Use the app instead. |
 
-`g7client.py` also took the sensor's phone slot, so the app had to pair again afterwards.
-Both need the board free: one phone or computer can be connected at a time.
+`g7client.py` also took the sensor's link (the old firmware had only one), so the app had
+to pair again afterwards. Both need a link the app is not using: the board has two, and the
+app may already hold one or both.
 
 ## Tests
 
@@ -480,16 +493,19 @@ fail pod ignore 2
 fail all clear
 ```
 
-There is one BLE link for all three simulators, so `drop` and `refuse` apply to the next
-connection attempt whichever device asked; a refused connection is accepted and then
-disconnected immediately. `drop` is per device: `device:"all"` with `drop:true` arms one
-drop for each, so the next three connections are dropped. `quiet` only clears that
-device's advertising want flag: the pod's and Medtrum's advertisement bytes do not change.
-`ignore` drops the message at the BLE write, for all three devices.
+The board has two BLE links for all three simulators. `drop` and `refuse` are per device:
+when only one device could be connecting (the other set is off) the decision is taken at
+the connection; when both advertise it is taken at the connection's first GATT event, which
+names the device, so a pending pod drop does not consume the CGM's connection. A refused
+connection is accepted and then disconnected immediately. `device:"all"` with `drop:true`
+arms one drop for each device. `quiet` only clears that device's advertising want flag: the
+pod's and Medtrum's advertisement bytes do not change. `ignore` drops the message at the
+BLE write, for all three devices.
 
 The CGM's notifications are sent from a task of its own, so `delay` holds them without
-blocking the CGM core. A delayed message is sent to the link it was queued for: if the
-phone has hung up by then, it is dropped rather than delivered to the next one.
+blocking the CGM core. A delayed message is sent to every central that was subscribed when
+it was queued: if one has hung up by then, that copy is dropped rather than delivered to a
+new connection that reused the handle.
 
 ## Good to know
 
@@ -500,7 +516,8 @@ phone has hung up by then, it is dropped rather than delivered to the next one.
 - In the app the pod may briefly show as reconnecting after each CGM reading. That's the
   hang-up described above.
 - Unlike a real CGM, the board serves a phone that has already collected the current
-  reading, and it does not serve a second display (a watch or a second phone).
+  reading. It does serve a second display (a watch or another phone), up to two CGM
+  centrals at once; a third is refused.
 - The simulators don't appear in iOS Settings → Bluetooth. That's expected.
 - Not yet tested on hardware: the captive Wi-Fi sheet on iOS and Android; long runs; what
   the app does after `crashNextCommand` and `ignoreNextMessages` (the board accepts them);
@@ -564,8 +581,8 @@ Devices we want to add:
 - **The honest costs of the swap**:
   - **Multi-display key slots are gone.** The core presents itself as already
     authenticated and bonded and keeps no per-display keys, so there is no slot table, no
-    last-seen or miss count, and `/forget` can only drop the current link. **One phone at a
-    time**; a second display (a watch, another phone) is not served.
+    last-seen or miss count, and `/forget` drops all of the CGM's links. **Two centrals at a
+    time** (a phone and a watch) are served, without per-display keys; a third is refused.
   - **No pairing code.** g7sim's 4-digit code and J-PAKE handshake are gone; a G7 is found
     as `DXCMxx` and a G6 needs its transmitter id, as the real apps expect.
   - **No sine or random-walk waveform.** The core holds **one next glucose and a trend**, so
