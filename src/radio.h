@@ -42,7 +42,9 @@ int openLinks();
 // inside its own mutex, so the link is terminated from tick() instead.
 void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n);
 void cgmDisconnect();
-void cgmAdvertise(bool on, const char* name, const uint8_t addr[6]);
+// serialCrc is CRC-16/XModem of the CGM id, computed by the glue under the
+// core lock: computing it here would take that lock again and deadlock.
+void cgmAdvertise(bool on, const char* name, const uint8_t addr[6], uint16_t serialCrc);
 bool cgmConnected();
 
 // The pod's radio (the radio half of ESP-Sim's dash_io_t).

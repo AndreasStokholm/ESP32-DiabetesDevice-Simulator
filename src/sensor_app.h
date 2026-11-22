@@ -53,8 +53,6 @@ const char* command(const std::string& json);
 // What the panel and the radio ask about.
 cgm_kind_t kind();
 std::string name();
-// CRC-16/XModem of the CGM id, as the advertisement carries it.
-uint16_t serialChecksum();
 // The simulated clock's Unix seconds (the readings' and activation's time).
 int64_t now();
 // What the panel set: the next reading's glucose and trend (tenths of mg/dL

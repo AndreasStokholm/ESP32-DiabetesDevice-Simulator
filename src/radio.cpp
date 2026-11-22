@@ -499,7 +499,7 @@ static bool advertiseSet(uint8_t instance, std::string& current, const std::stri
   return true;
 }
 
-void cgmAdvertise(bool on, const char* name, const uint8_t addr[6]) {
+void cgmAdvertise(bool on, const char* name, const uint8_t addr[6], uint16_t serialCrc) {
   // The CGM's own advertising set, on the chip's own address: the core's
   // per-sensor random static address is not applied here (the apps find the
   // device by name and service).
@@ -513,8 +513,7 @@ void cgmAdvertise(bool on, const char* name, const uint8_t addr[6]) {
   // The advertisement a real sensor sends carries Dexcom's company id, the
   // CRC-16 of the serial and the display types collecting readings; the apps
   // read the serial out of it (and g7sim's build sent exactly this).
-  uint16_t crc = sensor::serialChecksum();
-  size_t pn = on ? adv_cgm(nm.c_str(), crc, 0x04, buf, sizeof buf) : 0;
+  size_t pn = on ? adv_cgm(nm.c_str(), serialCrc, 0x04, buf, sizeof buf) : 0;
   if (on && !pn) logf("cgm: \"%s\" does not fit one advertisement; without one it cannot be found", nm.c_str());
   std::string p(pn ? (const char*)buf : "", pn);
   {

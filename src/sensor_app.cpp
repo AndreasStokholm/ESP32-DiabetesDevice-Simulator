@@ -79,7 +79,13 @@ static const cgm_io_t io = {
     .ctx = nullptr,
     .send = [](void*, cgm_chr_t chr, const uint8_t* p, size_t n) { radio::cgmNotify(chr, p, n); },
     .disconnect = [](void*) { radio::cgmDisconnect(); },
-    .advertise = [](void*, bool on, const char* name, const uint8_t addr[6]) { radio::cgmAdvertise(on, name, addr); },
+    // Runs under the core's lock (cgm_tick calls it), so the id can be read here and
+    // the checksum computed here; a call back into sensor::* for the crc would take
+    // the same mutex again and deadlock the sensor task and every radio tick.
+    .advertise = [](void*, bool on, const char* name, const uint8_t addr[6]) {
+      uint16_t crc = cgm_crc16((const uint8_t*)c.st.id, strnlen(c.st.id, sizeof c.st.id));
+      radio::cgmAdvertise(on, name, addr, crc);
+    },
     .now = nowSeconds,
     .save = [](void*, const cgm_state_t*) {
       // Called by the core under mu, possibly on the NimBLE callback thread.
@@ -524,12 +530,6 @@ cgm_kind_t kind() {
   cgm_kind_t k = CGM_OFF;
   LOCKED({ k = (cgm_kind_t)c.st.kind; });
   return k;
-}
-
-uint16_t serialChecksum() {
-  uint16_t crc = 0;
-  LOCKED({ crc = cgm_crc16((const uint8_t*)c.st.id, strnlen(c.st.id, sizeof c.st.id)); });
-  return crc;
 }
 
 std::string name() {
