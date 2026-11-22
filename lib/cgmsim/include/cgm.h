@@ -78,11 +78,12 @@ typedef struct {
     cgm_reading_t hist[CGM_HISTORY]; /* oldest first */
 } cgm_state_t;
 
-/* A session is one central (a phone or a watch). CGM_MAX_SESSIONS mirrors the
- * board's two Bluetooth links; a central's session is its slot number, 0 or 1.
- * The sensor's state and reading history above are shared, but what is per
- * central -- its login, what it has been sent, and its backfill cursor -- is
- * not. */
+/* A session is one central's Bluetooth connection. CGM_MAX_SESSIONS mirrors
+ * the board's two Bluetooth links; a session token is its slot number, 0 or 1.
+ * The sensor's state and reading history above are shared, but everything that
+ * describes one central's conversation is not. A session lives only for its
+ * connection: cgm_on_connect() clears it, so a later central (or the same one,
+ * whose privacy address may have rotated) always starts fresh. */
 typedef uint8_t cgm_session_t;
 
 typedef struct {
@@ -94,9 +95,10 @@ typedef struct {
     uint8_t auth_value[17];   /* what a read of the auth characteristic returns */
     uint8_t auth_len;
     int64_t connected_at, last_activity;
-    /* This central's own delivery history: the last reading seq it was sent,
-     * kept across reconnects so a returning central resumes where it left off
-     * and a new one starts from the oldest reading still in the history. */
+    /* This connection's delivery history: the last reading seq it was sent.
+     * cgm_on_connect() clears it, so the next connection starts from nothing
+     * and its backfill asks for the whole history the app has not received in
+     * that connection. */
     uint32_t delivered;
     /* The backfill cursor: `delivered` when this connection began. Backfill
      * sends the history readings after it; another central's deliveries do not
@@ -144,7 +146,8 @@ void cgm_tick(cgm_t *c);
 /* From the radio. session is the central's slot, 0 .. CGM_MAX_SESSIONS-1; an
  * out-of-range token is ignored. Every callback names the central it is about,
  * and the reply (send) and hang-up (disconnect) name it back. read returns the
- * value's length. */
+ * value's length. A connect always starts a new session: cgm_on_connect()
+ * clears every field that describes the previous connection. */
 void cgm_on_connect(cgm_t *c, cgm_session_t session);
 void cgm_on_disconnect(cgm_t *c, cgm_session_t session);
 void cgm_on_subscribe(cgm_t *c, cgm_session_t session, cgm_chr_t chr, bool on);

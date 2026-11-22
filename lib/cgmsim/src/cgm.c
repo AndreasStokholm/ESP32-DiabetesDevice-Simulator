@@ -384,14 +384,13 @@ void cgm_on_connect(cgm_t *c, cgm_session_t session)
         return;
     }
     int64_t now = c->io->now(c->io->ctx);
+    /* A session is one connection, never one slot: a reconnect may be the same
+     * central with a rotated privacy address, so nothing may be inferred. The
+     * new connection starts with no conversation and no delivery history. */
+    memset(s, 0, sizeof *s);
     s->connected = true;
     c->advertising = false; /* a connection ends the advertising */
-    s->sent_glucose = false;
-    s->authed = false;
-    s->control_on = false;
-    s->auth_len = 0;
     s->connected_at = s->last_activity = now;
-    s->prev_delivered = s->delivered;
     logf_(c, "phone connected");
 }
 

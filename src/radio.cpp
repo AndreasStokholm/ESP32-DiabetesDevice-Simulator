@@ -64,8 +64,7 @@ struct Link {
   bool used;
   bool podUsed;
   bool medtrumUsed;
-  uint32_t lastTraffic;
-  // The CGM's session for this link (a core session token, 0..CGM_MAX_SESSIONS-1)
+  // The CGM's session for this link (a core session token, the link's slot)
   // and whether the CGM touched the link at all. The core owns each central's
   // login, deliveries and backfill cursor; the radio only maps token -> link.
   bool cgmUsed;
@@ -288,7 +287,6 @@ static bool markPump(uint16_t h, bool podSide) {
   std::lock_guard<std::mutex> l(mu);
   Link* lk = linkLocked(h);
   if (!lk) return false;
-  lk->lastTraffic = (uint32_t)monoMs();
   if (podSide ? !lk->podUsed : !lk->medtrumUsed) {
     if (podSide) lk->podUsed = true;
     else lk->medtrumUsed = true;
@@ -304,7 +302,6 @@ static bool markCgmUsed(uint16_t h, cgm_session_t* session, bool* fresh) {
   std::lock_guard<std::mutex> l(mu);
   Link* lk = linkLocked(h);
   if (!lk) return false;
-  lk->lastTraffic = (uint32_t)monoMs();
   if (!lk->cgmUsed) {
     lk->cgmSession = (cgm_session_t)slotLocked(h);
     lk->cgmUsed = true;
@@ -434,7 +431,6 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       *lk = Link{};
       lk->handle = h;
       lk->used = true;
-      lk->lastTraffic = (uint32_t)monoMs();
       lk->gen = ++linkGenCounter;
       lk->acceptMask = device >= 0 ? (uint8_t)(1u << device) : 0;
       // With the CGM off the link can only be a pump's, so mark the selected
@@ -463,7 +459,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
   void onDisconnect(NimBLEServer*, ble_gap_conn_desc* desc) override {
     uint16_t h = desc->conn_handle;
-    bool hadCgm = false, hadPod = false, hadMed = false, anyCgmLeft = false;
+    bool hadCgm = false, hadPod = false, hadMed = false;
     cgm_session_t cgmSession = 0;
     {
       std::lock_guard<std::mutex> l(mu);
@@ -473,26 +469,34 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       cgmSession = links[i].cgmSession;
       hadPod = links[i].podUsed;
       hadMed = links[i].medtrumUsed;
-      // No stale CCCD: a notification queued for this link is dropped (the
-      // generation check), and a new central has to subscribe afresh.
-      for (int c = 0; c < CGM_CHR_COUNT; c++) cgmSubs[i][c] = 0;
-      cgmDrops[i] = CgmDrop{};
-      links[i] = Link{};
-      anyCgmLeft = cgmCountLocked() > 0;
-      // Mirror the core's silent advertising-off after a connection. The core
-      // set c->advertising = false in cgm_on_connect without calling
-      // advertise(false); onDisconnect only clears that session, so a window
-      // the core considers closed is never announced. With no CGM link left,
-      // the radio's copy can only follow that false; if the core opens a new
-      // window it calls advertise(true) again.
-      if (!anyCgmLeft) cgmAdvOn = false;
+    }
+    // Close the core session before the radio link goes. cgm_tick's send only
+    // checks the core session, so once it is closed nothing new can be marked
+    // delivered for a link cgmNotify can no longer reach. The link stays used
+    // until it is cleared below, keeping this slot from being reused between
+    // the two locks.
+    if (hadCgm) sensor::onDisconnect(cgmSession);
+    {
+      std::lock_guard<std::mutex> l(mu);
+      int i = slotLocked(h);
+      if (i >= 0) {
+        // No stale CCCD: a notification queued for this link is dropped (the
+        // generation check), and a new central has to subscribe afresh.
+        for (int c = 0; c < CGM_CHR_COUNT; c++) cgmSubs[i][c] = 0;
+        cgmDrops[i] = CgmDrop{};
+        links[i] = Link{};
+        // Mirror the core's silent advertising-off after a connection. The core
+        // set c->advertising = false in cgm_on_connect without calling
+        // advertise(false); onDisconnect only clears that session, so a window
+        // the core considers closed is never announced. With no CGM link left,
+        // the radio's copy can only follow that false; if the core opens a new
+        // window it calls advertise(true) again.
+        if (cgmCountLocked() == 0) cgmAdvOn = false;
+      }
     }
     std::string addr = addrString(desc->peer_ota_addr);
     logf("%s disconnected (handle 0x%04x; %s%s%s)", addr.c_str(), h, hadCgm ? "cgm " : "",
          hadPod ? "pod " : "", hadMed ? "medtrum" : "");
-    // Close exactly the core session this link held. A watch leaving does not
-    // touch the phone's session.
-    if (hadCgm) sensor::onDisconnect(cgmSession);
     if (hadMed) {
       medtrumStatusNotify = false;
       medtrumPush(MEDTRUM_EV_DISCONNECTED, nullptr, 0);
@@ -507,7 +511,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 // The CGM's first event on a link: give the link a core session and tell the
 // core, once. The session token is the link's slot, so every later send and
 // hang-up names exactly one central; cgmNotify and cgmDisconnect map it back
-// through linkForSessionLocked().
+// through linkForSessionLocked(). cgm_on_connect() starts a fresh session for
+// that connection, so no state from an earlier connection is needed or used.
 //
 // The CGM advertising set is deliberately NOT cleared here. cgm_on_connect()
 // sets the core's own advertising flag false without calling advertise(false),
@@ -1047,7 +1052,6 @@ static void cgmSendTask(void*) {
             failRc = (sub & 1) ? ble_gattc_notify_custom(c, cgmHandles[m.chr], om)
                                : ble_gattc_indicate_custom(c, cgmHandles[m.chr], om);
             if (failRc == 0) {
-              links[i].lastTraffic = (uint32_t)monoMs();
               if (cgmCarriesReading(m.chr, m.data, m.len)) links[i].cgmCollected = true;
             }
           }
@@ -1178,7 +1182,6 @@ static void podNotify(uint16_t handle, const uint8_t* p, size_t n) {
       if (!lk || lk->gen != gen || !lk->podUsed) {
         gone = true;
       } else {
-        lk->lastTraffic = (uint32_t)monoMs();
         os_mbuf* om = ble_hs_mbuf_from_flat(p, (uint16_t)n);
         if (!om) {
           rc = BLE_HS_ENOMEM;
@@ -1290,7 +1293,6 @@ static void medtrumNotifyRaw(uint16_t handle, const uint8_t* p, size_t n) {
       if (!lk || lk->gen != gen || !lk->medtrumUsed) {
         gone = true;
       } else {
-        lk->lastTraffic = (uint32_t)monoMs();
         os_mbuf* om = ble_hs_mbuf_from_flat(p, (uint16_t)n);
         if (!om) {
           rc = BLE_HS_ENOMEM;
