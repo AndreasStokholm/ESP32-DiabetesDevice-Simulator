@@ -4,10 +4,14 @@
 //
 // A phone cannot hold two connections to one radio, so the board cannot be
 // two Bluetooth devices to the same phone. It is one peripheral (one GATT
-// table, one link) that advertises under two addresses, as ESP-Sim does: the
+// table) that advertises under two addresses, as ESP-Sim does: the
 // pump set uses the chip's own (device) address, the CGM set the sensor's
 // random static address. The app's CGM code and its pod code each connect to
-// "their" device and share the one link underneath.
+// "their" device and share the GATT table underneath.
+//
+// The CGM may be held by two centrals at once (a phone and a watch), as a real
+// transmitter serves several receivers. The pump stays single-link: the pod
+// and the Medtrum base are one phone's pump.
 //
 // - Advertising: two sets, as ESP-Sim numbers them. Instance 0 is the pump's:
 //   the pod's advertisement, or the Medtrum base's, whichever the selector
@@ -16,10 +20,12 @@
 //   open, on the per-sensor random static address the core supplies. The pod's
 //   and the base's advertisements each carry exactly their own service list, so
 //   they cannot share a set; the two sets advertise at the same time.
-// - The link: a real CGM ends the session when the phone has its reading, and
-//   the app's code only asks for a reading after connecting. So the core ends
-//   the link by itself (cgmDisconnect, done from tick()), and both sides
-//   reconnect at once.
+// - The link: up to two concurrent links (kMaxLinks). A real CGM ends its
+//   session when a phone has its reading, and the app's code only asks for a
+//   reading after connecting. So the core ends the session by itself
+//   (cgmDisconnect, done from tick()), and the centrals reconnect at once. With
+//   two centrals the hang-up waits for EVERY subscribed central to collect (or
+//   the 20 s deadline fires).
 
 // cgm.h is the verbatim portable core and has no extern "C" guard (upstream
 // includes it from C only); this header is included from C++, so the guard goes
@@ -37,11 +43,14 @@ void begin();
 // Call every ~50 ms: applies a hang-up the CGM asked for, and keeps the pump
 // set (instance 0) and the CGM set (instance 1) advertising what they should.
 void tick();
+// How many centrals the radio currently holds (0..kMaxLinks: a CGM central
+// and/or a pump phone).
 int openLinks();
 
 // The CGM core's radio (the radio half of cgm_io_t, and the glue's own view of
 // the link). cgmDisconnect only marks the hang-up: the core calls it from
-// inside its own mutex, so the link is terminated from tick() instead.
+// inside its own mutex, so the link is terminated from tick() instead. The
+// core still models one session; sensor_app maps its per-link calls to it.
 void cgmNotify(cgm_chr_t chr, const uint8_t* p, size_t n);
 void cgmDisconnect();
 // serialCrc is CRC-16/XModem of the CGM id, computed by the glue under the
@@ -49,7 +58,7 @@ void cgmDisconnect();
 // addr is the sensor's random static address: the CGM set advertises from it;
 // the pump set keeps the device address.
 void cgmAdvertise(bool on, const char* name, const uint8_t addr[6], uint16_t serialCrc);
-bool cgmConnected();
+bool cgmConnected();  // true while any CGM central is on a link
 
 // The pod's radio (the radio half of ESP-Sim's dash_io_t).
 bool podNextEvent(dash_ev_t* ev, uint32_t timeoutMs);
@@ -68,10 +77,10 @@ void medtrumAdvertise(bool on, const uint8_t sn[4]);
 bool medtrumConnected();
 
 // Which pump simulator is selected: PUMP_OFF (neither advertises, and a pump
-// phone cannot hold the link), PUMP_POD or PUMP_MEDTRUM (only that one). A phone
+// phone cannot hold a link), PUMP_POD or PUMP_MEDTRUM (only that one). A phone
 // runs one pump app, so the pod and the Medtrum base are mutually exclusive:
 // there is no configuration in which both advertise. The CGM is a separate
-// pane and shares the one link.
+// pane and may hold the other link.
 enum { PUMP_OFF = 0, PUMP_POD = 1, PUMP_MEDTRUM = 2 };
 void setPump(int pump);
 int pump();
