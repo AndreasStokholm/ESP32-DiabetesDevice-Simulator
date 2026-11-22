@@ -25,19 +25,24 @@ It builds on two projects:
 
 ## How one board is a CGM and a pump
 
-A phone can't hold several Bluetooth connections to the same radio, so the board can't be
-several separate devices to one phone. Instead it is **one Bluetooth device** that carries
-the selected CGM's service and the selected pump's service. The app's CGM code and its pump
-code each connect to "their" device and share the single connection underneath.
+A phone can't hold several Bluetooth connections to the same radio, so the board can't give
+it two independent links. Instead the board advertises as **two peripherals** at once,
+and whichever one an app connects to shares the single connection underneath: one GATT
+table carries both the selected CGM's service and the selected pump's service. The app's
+CGM code and its pump code each connect to "their" device and share that one link.
 
-- **Advertising** runs on two Bluetooth 5 advertising sets at once, as ESP-Sim does it:
-  the pump set carries the selected pump's advertisement, and the CGM set carries the
-  CGM's (the `0xFEBC` service plus its name, `Dexcomxx` for a G6 or `DXCMxx` for a G7).
-  The two sets advertise at the same time, so the phone sees the CGM and the pump
-  simultaneously. The pod's (` :: Fake POD ::`) and the Medtrum base's (`MT` plus its
-  serial) are **mutually exclusive** on the pump set: exactly one of the two may use it,
-  and the pump page's Off lets neither. Each keeps its own bytes exactly; they cannot be
-  merged into one payload.
+- **Two advertising identities, using the addresses a real CGM and pump use.** The CGM
+  peripheral advertises on the sensor's own **random static address**; the pump peripheral
+  advertises on the board's device address. That is what a real sensor and a real pump look
+  like, and it keeps the two advertisements apart: one address carrying both payloads
+  garbles the service and manufacturer fields for the apps. The pump identity carries the
+  selected pump's advertisement, and the CGM identity carries the CGM's (the `0xFEBC`
+  service plus its name, `Dexcomxx` for a G6 or `DXCMxx` for a G7). Both advertise at the
+  same time, so the phone sees the CGM and the pump as two devices simultaneously. The
+  pod's (` :: Fake POD ::`) and the Medtrum base's (`MT` plus its serial) are **mutually
+  exclusive** on the pump identity: exactly one of the two may use it, and the pump page's
+  Off lets neither. Each keeps its own bytes exactly; they cannot be merged into one
+  payload.
 - **The CGM advertises around each reading**, as a real sensor does: a 60-second window
   after a reading, and only while that reading has not been collected.
 - **The board hangs up when the reading is out**, about 3 seconds after the phone has had
@@ -215,9 +220,10 @@ All pages share one nav: **Home, CGM, Pump, Settings**.
 - `/setup` is the captive-portal Wi‑Fi sheet (also at `http://192.168.4.1/setup`).
 
 The pod and the Medtrum base are **mutually exclusive**: a phone runs one pump app, and the
-board has one BLE link, so exactly one of the two may advertise and hold it. Selecting a
-pump stops the other one advertising and drops any link it held; selecting Off leaves no
-pump advertising and no pump connection accepted. The CGM keeps its own link either way.
+board has one BLE link, so only one pump can hold it. They share the pump advertising
+identity: selecting a pump stops the other one advertising and drops any link it held;
+selecting Off leaves no pump advertising and no pump connection accepted. The CGM's
+avertising identity and its side of the shared link are unaffected either way.
 
 The JSON APIs are the originals': g7sim's four stay at the root (`/status`, `/glucose`,
 `/forget`, `/new`), and the CGM's own core has `/g7/status` and `/g7/command`; loopkit/pod's
@@ -531,9 +537,10 @@ Devices we want to add:
 - **ESP-Sim's Medtrum patch** is ported here as a third device. Its portable patch core
   (`lib/medtrumpatch`, plain C with no ESP-IDF or mbedTLS) runs under Arduino/PlatformIO
   with new board glue (`src/medtrum_app.cpp`, and the patch's side of `src/radio.cpp`).
-  The radio advertises on two sets at once: the CGM's advertisement and the selected pump's
-  (the pod's, or the Medtrum base's). The pod and the Medtrum base are mutually exclusive,
-  so at most one of them is ever in the pump set. One field is deliberately NOT ESP-Sim's:
+  The radio advertises as two devices at once: the CGM peripheral on the sensor's random
+  static address, and the selected pump's on the board's device address (the pod's, or the
+  Medtrum base's). The pod and the Medtrum base are mutually exclusive, so at most one of
+  them is ever in the pump identity. One field is deliberately NOT ESP-Sim's:
   the base's manufacturer **company id is 0x4781 (18305)**, where ESP-Sim sends `0x0000`. A
   real base sends Medtrum's own id, an app that gates on it (Rockit) rejects a placeholder,
   and the point of the thing is to be the real device. Trio matches on the name `MT` alone.
@@ -591,7 +598,7 @@ Devices we want to add:
 | `src/pod.cpp` | The pod's clock, storage and task |
 | `src/sensor_app.cpp` | The CGM's clock, storage and task |
 | `src/medtrum_app.cpp` | The Medtrum pump base's clock, storage and task |
-| `src/radio.cpp` | One Bluetooth device for the pod, the CGM and the patch |
+| `src/radio.cpp` | The CGM and pump advertising identities and their one GATT server/link |
 | `src/sensor.cpp`, `handler.cpp`, `crypto.cpp`, `link.h` | The retired g7sim port (kept for reference, left out of the build) |
 | `src/main.cpp` | Boot, Wi‑Fi, captive-portal routes, web pages, failure API, console |
 | `src/portal.h`, `src/portal.cpp` | The pure captive-probe and AP-mode redirect decision |
