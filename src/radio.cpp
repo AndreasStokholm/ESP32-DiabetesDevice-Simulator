@@ -61,10 +61,14 @@ static const int kMaxLinks = 2;
 static_assert(kMaxLinks == CGM_MAX_SESSIONS, "one core session per Bluetooth link");
 struct Link {
   uint16_t handle;
+  // The peer's Bluetooth address, from the connect callback. The CGM identity
+  // of the slot is kept across disconnects (CgmSeat below) and compared with
+  // this to tell a returning central from a different one.
+  uint8_t peer[6];
   bool used;
   bool podUsed;
   bool medtrumUsed;
-  // The CGM's session for this link (a core session token, 0..CGM_MAX_SESSIONS-1)
+  // The CGM's session for this link (a core session token, the link's slot)
   // and whether the CGM touched the link at all. The core owns each central's
   // login, deliveries and backfill cursor; the radio only maps token -> link.
   bool cgmUsed;
@@ -84,6 +88,15 @@ struct Link {
   uint32_t gen;
 };
 static Link links[kMaxLinks];
+// The CGM peer last seen on each link slot, kept across disconnects. A central
+// connecting into a slot it did not leave gets a closing cgm_on_disconnect for
+// that slot first, which clears the previous occupant's core session; a
+// returning central keeps it and resumes. Guarded by mu.
+struct CgmSeat {
+  bool known;
+  uint8_t peer[6];
+};
+static CgmSeat cgmSeats[kMaxLinks];
 // Unique per connection, never reset: a queued CGM notification or a pending
 // termination must not match a later link that reused the handle.
 static uint32_t linkGenCounter = 0;
@@ -296,14 +309,22 @@ static bool markPump(uint16_t h, bool podSide) {
 }
 
 // The CGM's first GATT event on a link: the link is marked the CGM's and gets a
-// core session token (the link's slot). The caller tells the core once, outside
-// this lock. A link that is already the CGM's keeps its session.
-static bool markCgmUsed(uint16_t h, cgm_session_t* session, bool* fresh) {
+// core session token (the link's slot). reset says the slot's previous CGM
+// peer was a different central, so the caller must clear that closed session
+// before connecting this one. The caller tells the core once, outside this
+// lock. A link that is already the CGM's keeps its session.
+static bool markCgmUsed(uint16_t h, cgm_session_t* session, bool* fresh, bool* reset) {
   std::lock_guard<std::mutex> l(mu);
   Link* lk = linkLocked(h);
   if (!lk) return false;
   if (!lk->cgmUsed) {
-    lk->cgmSession = (cgm_session_t)slotLocked(h);
+    int slot = slotLocked(h);
+    if (slot < 0) return false;
+    CgmSeat& seat = cgmSeats[slot];
+    *reset = !seat.known || memcmp(seat.peer, lk->peer, sizeof seat.peer) != 0;
+    seat.known = true;
+    memcpy(seat.peer, lk->peer, sizeof seat.peer);
+    lk->cgmSession = (cgm_session_t)slot;
     lk->cgmUsed = true;
     *fresh = true;
   } else {
@@ -431,6 +452,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       *lk = Link{};
       lk->handle = h;
       lk->used = true;
+      memcpy(lk->peer, desc->peer_ota_addr.val, sizeof lk->peer);
       lk->gen = ++linkGenCounter;
       lk->acceptMask = device >= 0 ? (uint8_t)(1u << device) : 0;
       // With the CGM off the link can only be a pump's, so mark the selected
@@ -459,7 +481,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
   void onDisconnect(NimBLEServer*, ble_gap_conn_desc* desc) override {
     uint16_t h = desc->conn_handle;
-    bool hadCgm = false, hadPod = false, hadMed = false, anyCgmLeft = false;
+    bool hadCgm = false, hadPod = false, hadMed = false;
     cgm_session_t cgmSession = 0;
     {
       std::lock_guard<std::mutex> l(mu);
@@ -469,26 +491,34 @@ class ServerCallbacks : public NimBLEServerCallbacks {
       cgmSession = links[i].cgmSession;
       hadPod = links[i].podUsed;
       hadMed = links[i].medtrumUsed;
-      // No stale CCCD: a notification queued for this link is dropped (the
-      // generation check), and a new central has to subscribe afresh.
-      for (int c = 0; c < CGM_CHR_COUNT; c++) cgmSubs[i][c] = 0;
-      cgmDrops[i] = CgmDrop{};
-      links[i] = Link{};
-      anyCgmLeft = cgmCountLocked() > 0;
-      // Mirror the core's silent advertising-off after a connection. The core
-      // set c->advertising = false in cgm_on_connect without calling
-      // advertise(false); onDisconnect only clears that session, so a window
-      // the core considers closed is never announced. With no CGM link left,
-      // the radio's copy can only follow that false; if the core opens a new
-      // window it calls advertise(true) again.
-      if (!anyCgmLeft) cgmAdvOn = false;
+    }
+    // Close the core session before the radio link goes. cgm_tick's send only
+    // checks the core session, so once it is closed nothing new can be marked
+    // delivered for a link cgmNotify can no longer reach. The link stays used
+    // until it is cleared below, keeping this slot from being reused between
+    // the two locks.
+    if (hadCgm) sensor::onDisconnect(cgmSession);
+    {
+      std::lock_guard<std::mutex> l(mu);
+      int i = slotLocked(h);
+      if (i >= 0) {
+        // No stale CCCD: a notification queued for this link is dropped (the
+        // generation check), and a new central has to subscribe afresh.
+        for (int c = 0; c < CGM_CHR_COUNT; c++) cgmSubs[i][c] = 0;
+        cgmDrops[i] = CgmDrop{};
+        links[i] = Link{};
+        // Mirror the core's silent advertising-off after a connection. The core
+        // set c->advertising = false in cgm_on_connect without calling
+        // advertise(false); onDisconnect only clears that session, so a window
+        // the core considers closed is never announced. With no CGM link left,
+        // the radio's copy can only follow that false; if the core opens a new
+        // window it calls advertise(true) again.
+        if (cgmCountLocked() == 0) cgmAdvOn = false;
+      }
     }
     std::string addr = addrString(desc->peer_ota_addr);
     logf("%s disconnected (handle 0x%04x; %s%s%s)", addr.c_str(), h, hadCgm ? "cgm " : "",
          hadPod ? "pod " : "", hadMed ? "medtrum" : "");
-    // Close exactly the core session this link held. A watch leaving does not
-    // touch the phone's session.
-    if (hadCgm) sensor::onDisconnect(cgmSession);
     if (hadMed) {
       medtrumStatusNotify = false;
       medtrumPush(MEDTRUM_EV_DISCONNECTED, nullptr, 0);
@@ -503,7 +533,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 // The CGM's first event on a link: give the link a core session and tell the
 // core, once. The session token is the link's slot, so every later send and
 // hang-up names exactly one central; cgmNotify and cgmDisconnect map it back
-// through linkForSessionLocked().
+// through linkForSessionLocked(). If a different central has taken the slot,
+// a closing disconnect clears the old session before the new connect: same
+// slot, but no state from the central before it.
 //
 // The CGM advertising set is deliberately NOT cleared here. cgm_on_connect()
 // sets the core's own advertising flag false without calling advertise(false),
@@ -513,8 +545,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 // onDisconnect() clears the radio's copy to match that silent false; the core
 // calls advertise(true) again if it opens a new window.
 static bool cgmLinkUp(uint16_t h, cgm_session_t* session) {
-  bool fresh = false;
-  if (!markCgmUsed(h, session, &fresh)) return false;
+  bool fresh = false, reset = false;
+  if (!markCgmUsed(h, session, &fresh, &reset)) return false;
+  if (fresh && reset) sensor::onDisconnect(*session);
   if (fresh) sensor::onConnect(*session);
   return true;
 }

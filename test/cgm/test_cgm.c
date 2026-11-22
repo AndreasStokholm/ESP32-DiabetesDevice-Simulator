@@ -634,6 +634,153 @@ static void test_tick_delivery(void)
     cgm_on_disconnect(&c, 1);
 }
 
+/* A different central that takes a slot someone else used must start fresh; a
+ * central reconnecting into a slot it left itself resumes. The radio signals
+ * the difference with a closing cgm_on_disconnect for the already closed slot
+ * before the new central's connect. */
+static void test_slot_reuse(void)
+{
+    static cgm_t c;
+    cgm_state_t st;
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_skip_warmup(&c);
+    cgm_set_glucose(&c, 120, 0);
+    cgm_tick(&c);                      /* one reading */
+    run(&c, CGM_READING_INTERVAL);     /* a second */
+    run(&c, CGM_READING_INTERVAL);     /* a third */
+    CHECK(c.st.n_hist == 3);
+    uint32_t last_seq = c.st.hist[c.st.n_hist - 1].seq;
+
+    /* The phone owns slot 0, collects the latest and backfills the two older
+     * readings, then leaves with its cursor at the latest. */
+    connect_n(&c, 0);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    cgm_on_subscribe(&c, 0, CGM_CHR_BACKFILL, true);
+    CHECK(c.sessions[0].delivered == last_seq && c.sessions[0].prev_delivered == 0);
+    CHECK(count_session(CGM_CHR_BACKFILL, 0) == 2);
+    cgm_on_disconnect(&c, 0);
+
+    /* Dirty every field the old central left, so a leak is visible. */
+    c.sessions[0].authed = true;
+    memset(c.sessions[0].challenge, 0xaa, sizeof c.sessions[0].challenge);
+    memset(c.sessions[0].auth_value, 0xbb, sizeof c.sessions[0].auth_value);
+    c.sessions[0].auth_len = 3;
+    c.sessions[0].control_on = true;
+    c.sessions[0].sent_glucose = true;
+    c.sessions[0].prev_delivered = 42;
+    c.sessions[0].connected_at = fk.now - 10;
+    c.sessions[0].last_activity = fk.now - 10;
+
+    /* A different central reuses slot 0. The radio tells the core: a
+     * disconnect for the already closed slot, which clears all of it. */
+    cgm_on_disconnect(&c, 0);
+    CHECK(!c.sessions[0].connected);
+    CHECK(c.sessions[0].delivered == 0 && c.sessions[0].prev_delivered == 0);
+    CHECK(!c.sessions[0].sent_glucose && !c.sessions[0].authed && !c.sessions[0].control_on);
+    CHECK(c.sessions[0].auth_len == 0);
+    CHECK(c.sessions[0].challenge[0] == 0 && c.sessions[0].auth_value[0] == 0);
+
+    connect_n(&c, 0);
+    CHECK(c.sessions[0].connected);
+    CHECK(c.sessions[0].connected_at == fk.now && c.sessions[0].last_activity == fk.now);
+    CHECK(c.sessions[0].delivered == 0 && c.sessions[0].prev_delivered == 0);
+
+    /* It receives the latest reading and a full backfill from the fresh cursor. */
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    cgm_on_subscribe(&c, 0, CGM_CHR_BACKFILL, true);
+    CHECK(c.sessions[0].delivered == last_seq && c.sessions[0].prev_delivered == 0);
+    CHECK(count_session(CGM_CHR_BACKFILL, 0) == 2);
+    CHECK(find_session(CGM_CHR_CONTROL, 0x4e, 0, 0) >= 0);
+    cgm_on_disconnect(&c, 0);
+
+    /* The same central reconnects (no closing disconnect): it resumes, so
+     * there is nothing old to backfill again. */
+    connect_n(&c, 0);
+    CHECK(c.sessions[0].delivered == last_seq && c.sessions[0].prev_delivered == last_seq);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    cgm_on_subscribe(&c, 0, CGM_CHR_BACKFILL, true);
+    CHECK(count_session(CGM_CHR_BACKFILL, 0) == 0);
+    CHECK(find_session(CGM_CHR_CONTROL, 0x4e, 0, 0) >= 0);
+    cgm_on_disconnect(&c, 0);
+}
+
+/* A lone central's reading-boundary delivery and hang-up, as README documents:
+ * the tick that makes a new reading sends it before the idle hang-up, and the
+ * reconnect still gets the latest reading again (the same seq may be seen
+ * twice). This is what the old single session sent nothing for. */
+static void test_single_boundary(void)
+{
+    static cgm_t c;
+    cgm_state_t st;
+
+    /* G7: one CONTROL message, no time-then-glucose pair. */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_skip_warmup(&c);
+    cgm_set_glucose(&c, 130, 0);
+    cgm_tick(&c);
+    uint32_t first_seq = c.st.hist[c.st.n_hist - 1].seq;
+    connect_n(&c, 0);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    CHECK(find_session(CGM_CHR_CONTROL, 0x4e, 0, 0) >= 0);
+
+    clear_sent();
+    fk.now += CGM_READING_INTERVAL;
+    cgm_tick(&c);
+    uint32_t next_seq = c.st.hist[c.st.n_hist - 1].seq;
+    CHECK(next_seq == first_seq + 1);
+    CHECK(fk.n_sent == 1);
+    CHECK(fk.sent[0].session == 0 && fk.sent[0].chr == CGM_CHR_CONTROL && fk.sent[0].p[0] == 0x4e);
+    CHECK(le16(fk.sent[0].p + 6) == next_seq);
+    CHECK(c.sessions[0].delivered == next_seq);
+    CHECK(fk.disconnects_for[0] == 1); /* the same tick hangs it up */
+    cgm_on_disconnect(&c, 0);
+
+    /* The reconnect gets the latest once more, as before. */
+    connect_n(&c, 0);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    int g = find_session(CGM_CHR_CONTROL, 0x4e, 0, 0);
+    CHECK(g >= 0 && le16(fk.sent[g].p + 6) == next_seq);
+    cgm_on_disconnect(&c, 0);
+
+    /* G6: time (0x25) then glucose (0x4f) to the one central. */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G6, "81AB7Q", fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_skip_warmup(&c);
+    cgm_set_glucose(&c, 100, 0);
+    cgm_tick(&c);
+    first_seq = c.st.hist[c.st.n_hist - 1].seq;
+    connect_n(&c, 0);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    CHECK(find_session(CGM_CHR_CONTROL, 0x25, 0, 0) >= 0);
+    CHECK(find_session(CGM_CHR_CONTROL, 0x4f, 0, 0) >= 0);
+
+    clear_sent();
+    fk.now += CGM_READING_INTERVAL;
+    cgm_tick(&c);
+    next_seq = c.st.hist[c.st.n_hist - 1].seq;
+    CHECK(next_seq == first_seq + 1);
+    CHECK(fk.n_sent == 2);
+    CHECK(fk.sent[0].session == 0 && fk.sent[0].chr == CGM_CHR_CONTROL && fk.sent[0].p[0] == 0x25);
+    CHECK(fk.sent[1].session == 0 && fk.sent[1].chr == CGM_CHR_CONTROL && fk.sent[1].p[0] == 0x4f);
+    CHECK(c.sessions[0].delivered == next_seq);
+    CHECK(fk.disconnects_for[0] == 1);
+    cgm_on_disconnect(&c, 0);
+}
+
 static void test_bad_session(void)
 {
     static cgm_t c;
@@ -717,6 +864,8 @@ void test_cgm_all(void)
     test_g6_active();
     test_two_sessions();
     test_tick_delivery();
+    test_slot_reuse();
+    test_single_boundary();
     test_bad_session();
     test_drop_all_sessions();
     test_status();

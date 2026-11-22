@@ -82,7 +82,9 @@ typedef struct {
  * board's two Bluetooth links; a central's session is its slot number, 0 or 1.
  * The sensor's state and reading history above are shared, but what is per
  * central -- its login, what it has been sent, and its backfill cursor -- is
- * not. */
+ * not. A session kept across a reconnect belongs to that central; before the
+ * radio hands the slot to a different central it calls cgm_on_disconnect on
+ * the closed session, which clears every field below. */
 typedef uint8_t cgm_session_t;
 
 typedef struct {
@@ -95,8 +97,9 @@ typedef struct {
     uint8_t auth_len;
     int64_t connected_at, last_activity;
     /* This central's own delivery history: the last reading seq it was sent,
-     * kept across reconnects so a returning central resumes where it left off
-     * and a new one starts from the oldest reading still in the history. */
+     * kept across that central's reconnects so it resumes where it left off.
+     * A different central is given the slot only after a closing
+     * cgm_on_disconnect clears this, so it starts from the oldest reading. */
     uint32_t delivered;
     /* The backfill cursor: `delivered` when this connection began. Backfill
      * sends the history readings after it; another central's deliveries do not
@@ -144,7 +147,9 @@ void cgm_tick(cgm_t *c);
 /* From the radio. session is the central's slot, 0 .. CGM_MAX_SESSIONS-1; an
  * out-of-range token is ignored. Every callback names the central it is about,
  * and the reply (send) and hang-up (disconnect) name it back. read returns the
- * value's length. */
+ * value's length. A disconnect for a session that is already closed clears it:
+ * the radio calls that before a different central takes the slot, so the new
+ * central inherits no login, delivery history or backfill cursor. */
 void cgm_on_connect(cgm_t *c, cgm_session_t session);
 void cgm_on_disconnect(cgm_t *c, cgm_session_t session);
 void cgm_on_subscribe(cgm_t *c, cgm_session_t session, cgm_chr_t chr, bool on);

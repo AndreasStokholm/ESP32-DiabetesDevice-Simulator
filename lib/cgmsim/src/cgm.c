@@ -389,6 +389,8 @@ void cgm_on_connect(cgm_t *c, cgm_session_t session)
     s->sent_glucose = false;
     s->authed = false;
     s->control_on = false;
+    memset(s->challenge, 0, sizeof s->challenge);
+    memset(s->auth_value, 0, sizeof s->auth_value);
     s->auth_len = 0;
     s->connected_at = s->last_activity = now;
     s->prev_delivered = s->delivered;
@@ -400,6 +402,15 @@ void cgm_on_disconnect(cgm_t *c, cgm_session_t session)
     cgm_session_state_t *s = session_at(c, session);
     if (!s) {
         logf_(c, "ignoring disconnect for unknown session %u", (unsigned)session);
+        return;
+    }
+    if (!s->connected) {
+        /* A disconnect for an already closed session clears the slot. The radio
+         * calls it before a different central takes the slot, so nothing the
+         * previous occupant left -- login, sent reading, delivery history,
+         * backfill cursor, timers -- can reach the new one. */
+        memset(s, 0, sizeof *s);
+        logf_(c, "phone slot cleared");
         return;
     }
     s->connected = false;
