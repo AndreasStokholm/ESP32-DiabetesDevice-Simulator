@@ -89,12 +89,18 @@ typedef struct {
     bool connected;
     bool sent_glucose;        /* this central was sent the current reading */
     bool authed;              /* G6 active mode: this central passed the challenge */
+    bool control_on;          /* this central subscribed to the CONTROL notifications */
     uint8_t challenge[8];
     uint8_t auth_value[17];   /* what a read of the auth characteristic returns */
     uint8_t auth_len;
     int64_t connected_at, last_activity;
-    /* The backfill cursor: st.delivered when this session began. Backfill sends
-     * the history readings after it; another central's deliveries do not move it. */
+    /* This central's own delivery history: the last reading seq it was sent,
+     * kept across reconnects so a returning central resumes where it left off
+     * and a new one starts from the oldest reading still in the history. */
+    uint32_t delivered;
+    /* The backfill cursor: `delivered` when this connection began. Backfill
+     * sends the history readings after it; another central's deliveries do not
+     * move it. */
     uint32_t prev_delivered;
 } cgm_session_state_t;
 
@@ -131,8 +137,8 @@ bool cgm_valid_g6_id(const char *id);
 
 void cgm_init(cgm_t *c, const cgm_state_t *st, const cgm_io_t *io);
 /* Call about once a second: makes readings, opens and closes the advertising
- * window, and ends each idle session on its own (the sensor may have more than
- * one central at a time). */
+ * window, delivers a new reading to each connected central that subscribed to
+ * CONTROL and has not had it, and ends each idle session on its own. */
 void cgm_tick(cgm_t *c);
 
 /* From the radio. session is the central's slot, 0 .. CGM_MAX_SESSIONS-1; an

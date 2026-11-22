@@ -57,12 +57,13 @@ logged.
   when the core's window ends. A central hanging up does not close it while the other
   session or a free slot still needs it.
 - **Each CGM central has its own session.** One reading is made every five minutes, and
-  each central is sent it on its own schedule; the app's CGM code only asks for a reading
-  after connecting. A central that subscribes after the phone collected is sent the current
-  reading at once. Once a central has its reading and has gone quiet the board hangs up
-  **that** central, so the phone and the watch reconnect independently, within a second or
-  two. One central collecting, idle or leaving does not hold open or reset the other's
-  session.
+  each central is sent it on its own schedule; a central already subscribed to CONTROL
+  is sent a new reading as soon as it is made, and one that connects later gets the cached
+  reading at once. The app's CGM code only asks for a reading after connecting. Once a
+  central has its reading and has gone quiet the board hangs up **that** central, so the
+  phone and the watch reconnect independently, within a second or two. One central
+  collecting, idle or leaving does not hold open or reset the other's session; a central
+  that was away while the other read backfills its own missed history when it returns.
 - **Two centrals at once, a third refused.** The CGM may use both links (a phone and a
   watch); a pump phone and its CGM use one each. With two CGM centrals connected, a pump
   cannot also connect.
@@ -508,9 +509,11 @@ BLE write, for all three devices.
 
 The CGM's notifications are sent from a task of its own, so `delay` holds them without
 blocking the CGM core. The core queues one frame per session: a delayed frame goes to the
-central whose session asked for it, and if that link has hung up by then the generation
-check drops it rather than delivering it to a new connection that reused the handle. The
-next session to subscribe is served the cached reading by the core itself.
+central whose session asked for it, and that session's hang-up waits until its queue has
+drained, so the delay does not lose the reading. If the link closes for another reason in
+the meantime, the generation check drops the frame rather than delivering it to a new
+connection that reused the handle; the next session to subscribe is served the cached
+reading by the core itself.
 
 ## Good to know
 
@@ -576,11 +579,16 @@ Devices we want to add:
   portable G6/G7 protocol with one deliberate change: ESP-Sim keeps **one session** (one
   `connected`, one login, one delivery cursor), which cannot give a phone and a watch each
   their own reading. Here the core keeps up to two sessions, one per central, each with its
-  own login, sent-reading flag and backfill cursor, while the sensor state, reading history,
-  signal loss, forced state and advertising window stay shared. That deviation is what lets
-  the phone and the watch read at the same time, and why a silent watch no longer makes the
-  phone's readings wait or go irregular; a single central's frames and reconnect cadence are
-  unchanged. `src/sensor_app.cpp` supplies the clock, flash and task and the CGM's side of
+  own login, sent-reading flag and per-central backfill cursor (the last reading that
+  central was sent, kept across its reconnects; a new central starts from the oldest reading
+  still in the history), while the sensor state, reading history, signal loss, forced state
+  and advertising window stay shared. That deviation is what lets the phone and the watch
+  read at the same time, and why a silent watch no longer makes the phone's readings wait or
+  go irregular; a single central's normal frames and reconnect cadence are unchanged, and
+  a connected, subscribed central now receives a newly made reading instead of waiting for
+  its reconnect. The glue also holds a session's hang-up until that session's queued
+  notification has actually been sent, so an injected `delay` cannot lose the reading.
+  `src/sensor_app.cpp` supplies the clock, flash and task and the CGM's side of
   `src/radio.cpp` maps each Bluetooth link to its session. The g7sim port that used to run
   the G7 (`src/sensor.cpp`, `handler.cpp`, `crypto.cpp`, `link.h`) is still in the tree but
   **retired**: nothing starts it. In exchange for g7sim's extras, the board gains a real

@@ -61,13 +61,6 @@ static int sessionCountLocked() {
   return n;
 }
 
-static int collectedCountLocked() {
-  int n = 0;
-  for (int i = 0; i < CGM_MAX_SESSIONS; i++)
-    n += (c.sessions[i].connected && c.sessions[i].sent_glucose) ? 1 : 0;
-  return n;
-}
-
 // MARK: - The platform, as the core sees it
 
 static int64_t clockBase; // Unix seconds that monoMs()==0 corresponds to
@@ -570,6 +563,8 @@ size_t onRead(cgm_session_t session, cgm_chr_t chr, uint8_t* out, size_t cap) {
   return n;
 }
 
+int cgmCollectedCentrals() { return radio::cgmCollectedCentrals(); }
+
 // MARK: - The panel
 
 cgm_kind_t kind() {
@@ -620,8 +615,8 @@ std::string statusJson() {
     activated = c.st.activated;
     warmupDone = c.st.warmup_done;
     centralsNow = sessionCountLocked();
-    collectedNow = collectedCountLocked();
   });
+  collectedNow = cgmCollectedCentrals();
   if (n == 0 || n >= sizeof json) return "{}";
   std::string s(json, n);
   if (!s.empty() && s.back() == '}') s.pop_back();
@@ -782,21 +777,22 @@ const char* command(const std::string& json) {
     });
   } else if (strcmp(cmd, "cgmForget") == 0) {
     // The core has no pairing slots: it is authenticated-and-bonded for every
-    // phone. "Forget" can only drop the CGM's links: ask the radio to end every
-    // connected session's link (outside the glue's mutex, since the radio's
-    // disconnect may call sensor::onDisconnect), and close those core sessions
-    // now so the state machine is not left holding a link that is going away.
+    // phone. "Forget" can only drop the CGM's links. Close the core sessions
+    // under the same lock that read them (before asking the radio), so the
+    // token cannot be reused by a new central while the sensor lock is dropped;
+    // then ask the radio to end those links. Its disconnect callback will find
+    // the sessions already closed.
     cgm_session_t drop[CGM_MAX_SESSIONS];
     int n = 0;
     LOCKED({
       for (int i = 0; i < CGM_MAX_SESSIONS; i++) {
-        if (c.sessions[i].connected) drop[n++] = (cgm_session_t)i;
+        if (c.sessions[i].connected) {
+          drop[n++] = (cgm_session_t)i;
+          cgm_on_disconnect(&c, (cgm_session_t)i);
+        }
       }
     });
     for (int i = 0; i < n; i++) radio::cgmDisconnect(drop[i]);
-    LOCKED({
-      for (int i = 0; i < n; i++) cgm_on_disconnect(&c, drop[i]);
-    });
     logf("sensor: forget: dropped %d CGM link%s; the CGM core keeps no pairing to forget", n, n == 1 ? "" : "s");
   } else {
     return "unknown CGM command";

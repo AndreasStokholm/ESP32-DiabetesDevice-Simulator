@@ -70,6 +70,13 @@ struct Link {
   // login, deliveries and backfill cursor; the radio only maps token -> link.
   bool cgmUsed;
   cgm_session_t cgmSession;
+  // Frames queued by the core for this session but not yet sent. A hang-up the
+  // core asked for waits until this reaches zero, so an injected notification
+  // delay cannot close the link before its reading has left the queue.
+  int cgmPending;
+  // Whether a reading-carrying notification was actually delivered on this
+  // link. The panel's collected count only; the core owns the hang-up state.
+  bool cgmCollected;
   // One bit per FailDevice whose injected accept decision was taken on this
   // link. Deferred decisions are per (link, device): a link that first touched
   // the CGM service can still exercise a pending pod drop on its first pod
@@ -314,6 +321,14 @@ static void setCgmSub(uint16_t h, cgm_chr_t chr, uint16_t subValue) {
   int i = slotLocked(h);
   if (i < 0) return;
   cgmSubs[i][chr] = subValue;
+}
+
+// Whether a notification carries the reading, for the panel's collected count:
+// CONTROL's glucose message (G6 0x31/0x4f, G7 0x4e) or a BACKFILL record.
+static bool cgmCarriesReading(uint8_t chr, const uint8_t* d, size_t n) {
+  if (chr == CGM_CHR_BACKFILL) return n >= 2;
+  if (chr != CGM_CHR_CONTROL || n < 1) return false;
+  return d[0] == 0x31 || d[0] == 0x4f || d[0] == 0x4e;
 }
 
 // Whether another live link already holds this pump. A pump is one phone's, so
@@ -854,6 +869,8 @@ void tick() {
   // never from inside the call that asked (the core holds its mutex there, and
   // the NimBLE disconnect callback calls back into it). Each entry names the
   // link and generation the session was on, so a reused handle is left alone.
+  // A session whose frame is still queued (an injected notification delay) is
+  // held until the queue has drained, then terminated.
   int64_t now = monoMs();
   {
     uint16_t victims[kMaxLinks];
@@ -863,6 +880,9 @@ void tick() {
       std::lock_guard<std::mutex> l(mu);
       for (int i = 0; i < kMaxLinks; i++) {
         if (!cgmDrops[i].on) continue;
+        Link* lk = linkLocked(cgmDrops[i].handle);
+        if (lk && lk->gen == cgmDrops[i].gen && lk->cgmPending > 0) continue; // wait for the queue
+        // The link is gone or its frame is out: terminate the same connection only.
         victims[nVictims] = cgmDrops[i].handle;
         gens[nVictims] = cgmDrops[i].gen;
         nVictims++;
@@ -985,6 +1005,14 @@ int openLinks() {
 
 // MARK: - The CGM's radio
 
+// Marks one queued frame as done. It decrements only the same connection it
+// was queued for: a link reuse must not consume the new link's count.
+static void cgmReleasePending(uint16_t c, uint32_t gen) {
+  std::lock_guard<std::mutex> l(mu);
+  Link* lk = linkLocked(c);
+  if (lk && lk->gen == gen && lk->cgmPending > 0) lk->cgmPending--;
+}
+
 // Sends one queued notification to the one session's link, after the injected
 // delay. The core emits one send per session, so a phone and a watch each get
 // their own frame; this task only delivers it.
@@ -995,7 +1023,7 @@ static void cgmSendTask(void*) {
     unsigned delay = (unsigned)fail_decide(FAIL_CGM, FAIL_NOTIFY_DELAY_MS, 0);
     if (delay) vTaskDelay(pdMS_TO_TICKS(delay));
     uint16_t c = m.handle;
-    bool notSub = false, noBuf = false;
+    bool gone = false, notSub = false, noBuf = false;
     int failRc = 0;
     {
       // The liveness/generation/subscription check and the stack call are
@@ -1003,23 +1031,31 @@ static void cgmSendTask(void*) {
       // GATT/GAP events are queued, so the call does not dispatch into us.
       std::lock_guard<std::mutex> l(mu);
       int i = slotLocked(c);
-      if (i < 0 || links[i].gen != m.gen || !links[i].cgmUsed) continue;
-      uint16_t sub = cgmSubs[i][m.chr];
-      if (!sub) {
-        notSub = true;
+      if (i < 0 || links[i].gen != m.gen || !links[i].cgmUsed) {
+        gone = true;
       } else {
-        os_mbuf* om = ble_hs_mbuf_from_flat(m.data, m.len);
-        if (!om) {
-          noBuf = true;
+        uint16_t sub = cgmSubs[i][m.chr];
+        if (!sub) {
+          notSub = true;
         } else {
-          // A central subscribes to notify, or (the auth characteristic) to
-          // indicate.
-          failRc = (sub & 1) ? ble_gattc_notify_custom(c, cgmHandles[m.chr], om)
-                             : ble_gattc_indicate_custom(c, cgmHandles[m.chr], om);
-          if (failRc == 0) links[i].lastTraffic = (uint32_t)monoMs();
+          os_mbuf* om = ble_hs_mbuf_from_flat(m.data, m.len);
+          if (!om) {
+            noBuf = true;
+          } else {
+            // A central subscribes to notify, or (the auth characteristic) to
+            // indicate.
+            failRc = (sub & 1) ? ble_gattc_notify_custom(c, cgmHandles[m.chr], om)
+                               : ble_gattc_indicate_custom(c, cgmHandles[m.chr], om);
+            if (failRc == 0) {
+              links[i].lastTraffic = (uint32_t)monoMs();
+              if (cgmCarriesReading(m.chr, m.data, m.len)) links[i].cgmCollected = true;
+            }
+          }
         }
       }
     }
+    cgmReleasePending(c, m.gen);
+    if (gone) continue;
     if (notSub) {
       logf("cgm: %s -> %s dropped: handle 0x%04x is no longer subscribed", cgmCharNames[m.chr],
            hexstr(m.data, m.len).c_str(), c);
@@ -1035,7 +1071,8 @@ static void cgmSendTask(void*) {
 // this send: queue it for that session's link and return. The task above sends
 // it (no ENOMEM retry loop), applying the injected delay once. If the session's
 // link has gone, or never subscribed to the characteristic, there is nobody to
-// send to.
+// send to. A queued frame counts against the session's hang-up until it has
+// actually been sent or dropped.
 void cgmNotify(cgm_session_t session, cgm_chr_t chr, const uint8_t* p, size_t n) {
   if (!cgmOut) return;
   if (n > sizeof(CgmOut::data)) {
@@ -1060,8 +1097,12 @@ void cgmNotify(cgm_session_t session, cgm_chr_t chr, const uint8_t* p, size_t n)
     }
     m.handle = lk->handle;
     m.gen = lk->gen;
+    lk->cgmPending++;
   }
-  if (xQueueSend(cgmOut, &m, 0) != pdTRUE) logf("cgm: notification queue full: a message was dropped");
+  if (xQueueSend(cgmOut, &m, 0) != pdTRUE) {
+    cgmReleasePending(m.handle, m.gen);
+    logf("cgm: notification queue full: a message was dropped");
+  }
 }
 
 // The core calls this from inside its own mutex, possibly on the NimBLE
@@ -1084,6 +1125,20 @@ void cgmDisconnect(cgm_session_t session) {
 bool cgmConnected() {
   std::lock_guard<std::mutex> l(mu);
   return cgmCountLocked() > 0;
+}
+
+// Panel-only: links that actually received a reading-carrying notification and
+// are still subscribed to a reading characteristic. The core owns the hang-up;
+// this is the old radio-side count, kept because only the send task knows a
+// notification really left the stack.
+int cgmCollectedCentrals() {
+  std::lock_guard<std::mutex> l(mu);
+  int n = 0;
+  for (int i = 0; i < kMaxLinks; i++) {
+    bool subs = cgmSubs[i][CGM_CHR_CONTROL] != 0 || cgmSubs[i][CGM_CHR_BACKFILL] != 0;
+    if (links[i].used && links[i].cgmUsed && links[i].cgmCollected && subs) n++;
+  }
+  return n;
 }
 
 // MARK: - The pod's radio

@@ -59,6 +59,9 @@ void cgmDisconnect(cgm_session_t session);
 // the pump set keeps the device address.
 void cgmAdvertise(bool on, const char* name, const uint8_t addr[6], uint16_t serialCrc);
 bool cgmConnected();  // true while any CGM central is on a link
+// Panel-only: how many CGM links actually received a reading notification and
+// are still subscribed to a reading characteristic. Takes mu.
+int cgmCollectedCentrals();
 
 // The pod's radio (the radio half of ESP-Sim's dash_io_t).
 bool podNextEvent(dash_ev_t* ev, uint32_t timeoutMs);

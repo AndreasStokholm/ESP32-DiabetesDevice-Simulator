@@ -263,6 +263,16 @@ static bool any_connected(const cgm_t *c)
     return false;
 }
 
+/* Forget every session's delivery history: a new sensor or a transmitter reset
+ * starts a fresh reading history, so no cursor can point into the old one. */
+static void clear_delivery_history(cgm_t *c)
+{
+    for (int i = 0; i < CGM_MAX_SESSIONS; i++) {
+        c->sessions[i].delivered = 0;
+        c->sessions[i].prev_delivered = 0;
+    }
+}
+
 static void send(cgm_t *c, cgm_session_t session, cgm_chr_t chr, const uint8_t *p, size_t n)
 {
     cgm_session_state_t *s = session_at(c, session);
@@ -286,6 +296,8 @@ static const cgm_reading_t *latest(const cgm_t *c)
 {
     return c->st.n_hist ? &c->st.hist[c->st.n_hist - 1] : NULL;
 }
+
+static void push_glucose(cgm_t *c, cgm_session_t session);
 
 static void make_reading(cgm_t *c, uint32_t n, int64_t now)
 {
@@ -338,6 +350,15 @@ void cgm_tick(cgm_t *c)
     }
     const cgm_reading_t *r = latest(c);
     bool undelivered = r && r->seq != st->delivered;
+    /* A connected central that asked for CONTROL notifications gets a reading it
+     * has not had, whether it was made this tick or it only subscribed after
+     * the reading was made. Active mode asks for each message itself. */
+    for (int i = 0; i < CGM_MAX_SESSIONS; i++) {
+        const cgm_session_state_t *s = &c->sessions[i];
+        if (s->connected && s->control_on && !s->authed) {
+            push_glucose(c, (cgm_session_t)i);
+        }
+    }
     if (!any_connected(c)) {
         advertise(c, undelivered && !st->signal_loss && now < c->window_end);
     }
@@ -367,9 +388,10 @@ void cgm_on_connect(cgm_t *c, cgm_session_t session)
     c->advertising = false; /* a connection ends the advertising */
     s->sent_glucose = false;
     s->authed = false;
+    s->control_on = false;
     s->auth_len = 0;
     s->connected_at = s->last_activity = now;
-    s->prev_delivered = c->st.delivered;
+    s->prev_delivered = s->delivered;
     logf_(c, "phone connected");
 }
 
@@ -381,6 +403,7 @@ void cgm_on_disconnect(cgm_t *c, cgm_session_t session)
         return;
     }
     s->connected = false;
+    s->control_on = false;
     logf_(c, "phone disconnected");
 }
 
@@ -391,6 +414,7 @@ static void delivered(cgm_t *c, cgm_session_t session, const cgm_reading_t *r)
         return;
     }
     s->sent_glucose = true;
+    s->delivered = r->seq;
     if (c->st.delivered != r->seq) {
         c->st.delivered = r->seq;
         save(c);
@@ -402,8 +426,11 @@ static void push_glucose(cgm_t *c, cgm_session_t session)
 {
     const cgm_reading_t *r = latest(c);
     cgm_session_state_t *s = session_at(c, session);
-    if (!s || !r || s->sent_glucose) {
+    if (!s || !s->connected || !r) {
         return;
+    }
+    if (s->sent_glucose && s->delivered == r->seq) {
+        return; /* this connection already has the current reading */
     }
     int64_t now = c->io->now(c->io->ctx);
     uint8_t m[19];
@@ -488,6 +515,9 @@ void cgm_on_subscribe(cgm_t *c, cgm_session_t session, cgm_chr_t chr, bool on)
         return;
     }
     s->last_activity = c->io->now(c->io->ctx);
+    if (chr == CGM_CHR_CONTROL) {
+        s->control_on = on;
+    }
     if (!on) {
         return;
     }
@@ -585,6 +615,7 @@ static void g6_control(cgm_t *c, cgm_session_t session, const uint8_t *p, size_t
         st->next_n = 0;
         st->n_hist = 0;
         st->delivered = 0;
+        clear_delivery_history(c);
         save(c);
         logf_(c, "transmitter reset");
         m[0] = 0x43;
@@ -733,6 +764,7 @@ void cgm_new_sensor(cgm_t *c, cgm_kind_t kind, const char *id)
     fresh.glucose = c->st.glucose ? c->st.glucose : 120;
     fresh.trend = c->st.trend;
     c->st = fresh;
+    clear_delivery_history(c);
     save(c);
     char name[16];
     cgm_name(&c->st, name);
