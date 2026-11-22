@@ -76,12 +76,9 @@ void onWrite(cgm_chr_t chr, const uint8_t* p, size_t n);
 // Fills out with the auth characteristic's value; returns its length.
 size_t onRead(cgm_chr_t chr, uint8_t* out, size_t cap);
 
-// How many of the currently connected CGM centrals have been sent the reading
-// this session: the number connected and subscribed to CONTROL when a reading
-// was last broadcast (a later join, or a central that subscribed afterwards, is
-// not counted until the next reading). The radio's per-link
-// subscription/collection flags remain the exact hang-up test; this is the
-// glue's session view. It reads an atomic counter and takes no lock, so the
-// radio's tick may call it even while holding its own mutex.
+// How many live CGM links are subscribed to a reading characteristic and have
+// been sent a reading this session. The radio owns this per-link count; this
+// wrapper exists for the status panel and delegates to it (taking the radio's
+// mutex), so it must not be called while the radio's lock is held.
 int cgmCollectedCentrals();
 }  // namespace sensor

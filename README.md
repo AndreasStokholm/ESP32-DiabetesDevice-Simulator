@@ -53,12 +53,12 @@ logged.
   phone connected can still find the sensor; it closes once both links are the CGM's, when
   the core's window ends, or when the hang-up starts.
 - **The board hangs up when the reading is out**, once **every** CGM central subscribed to
-  it has collected (a phone and a watch can take it at their own pace), never while the
-  pump is talking, and never later than 20 seconds. The app's CGM code only asks for a
-  reading after connecting, so this is what makes it collect the next one; the centrals
-  reconnect within a second or two. The CGM core still models **one session**: the first
-  central opens it and the last one leaving closes it, so a watch hanging up does not reset
-  the phone's session.
+  it has collected (a phone and a watch can take it at their own pace), and never later
+  than 20 seconds. A central that subscribes after the phone collected is sent the current
+  reading at once. The app's CGM code only asks for a reading after connecting, so this is
+  what makes it collect the next one; the centrals reconnect within a second or two. The
+  CGM core still models **one session**: the first central opens it and the last one leaving
+  closes it, so a watch hanging up does not reset the phone's session.
 - **Two centrals at once, a third refused.** The CGM may use both links (a phone and a
   watch); a pump phone and its CGM use one each. With two CGM centrals connected, a pump
   cannot also connect.

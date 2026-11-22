@@ -380,7 +380,7 @@ static void startWeb() {
   });
   // Which pump simulator advertises. A phone runs one pump app, and the pod and
   // the Medtrum base are mutually exclusive: exactly one may advertise and hold
-  // the one link. The old `pod`/`both` names are still accepted, so a saved
+  // the pump's one link. The old `pod`/`both` names are still accepted, so a saved
   // board (and the old settings page) keeps working.
   web.on("/settings/pump", HTTP_POST, [] {
     JsonDocument j;

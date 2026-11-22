@@ -14,8 +14,11 @@
 //            the CGM core's mutex)
 //   ignore   the next N messages from the phone are dropped, then it resumes
 //
-// One BLE link is shared by all three simulators, so a refused connection is
-// refused for the link: the server accepts it, then disconnects immediately.
+// The board has two BLE links for all three simulators. `drop` and `refuse` are
+// per device: when the advertised sets name the only device that could be
+// connecting the decision is made at the connection; otherwise at the link's
+// first GATT event, which names the device. A refused connection is accepted
+// and then disconnected immediately.
 
 #include <stdint.h>
 
