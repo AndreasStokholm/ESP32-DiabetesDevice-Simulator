@@ -22,9 +22,11 @@ It builds on two projects:
   `lib/medtrumpatch` with one deliberate change — it now consumes its reservoir as it
   delivers, bolus and basal (see [Differences](#differences-from-the-originals)) — each
   with small Arduino/PlatformIO glue;
-- the CGM is ESP-Sim's portable G6/G7 core, `lib/cgmsim`, with one deliberate change: it
-  keeps a **session per central** so a phone and a watch can read at the same time, which
-  ESP-Sim's single-session core cannot (see
+- the CGM is ESP-Sim's portable G6/G7 core, `lib/cgmsim`, with two deliberate changes: it
+  keeps a **session per central** so a phone and a watch can read at the same time, and it
+  gives each kind its real link behaviour (**a G6 advertises while unconnected and keeps its
+  connection; a G7 advertises in a window per reading and hangs up**), which ESP-Sim's
+  single-session, kind-blind core cannot (see
   [Differences](#differences-from-the-originals)). It is still the only CGM engine on the
   board, not a port of [LoopKit/g7sim](https://github.com/LoopKit/g7sim); g7sim's ideas live
   on in the shape of this board's console and JSON API (see
@@ -52,20 +54,25 @@ logged.
   exclusive** on the pump identity: exactly one of the two may use it, and the pump page's
   Off lets neither. Each keeps its own bytes exactly; they cannot be merged into one
   payload.
-- **The CGM advertises around each reading**, as a real sensor does: a 60-second window
-  after a reading while no central has collected it. While one CGM central is connected the
-  window stays open as long as the second link is free, so a watch that scans after the
-  phone connected can still find the sensor; it closes once both links are the CGM's or
-  when the core's window ends. A central hanging up does not close it while the other
+- **The CGM advertises the way the chosen kind does.** A **G6 transmitter advertises
+  whenever it is unconnected**, so the app can pair or reconnect at any time, not only in
+  the seconds after a reading. A **G7 opens a 60-second window per reading** while no
+  central has collected it and closes it again, because a G7 wakes for a reading and sleeps
+  between them. For both kinds, while one CGM central is connected the advertising set
+  stays on as long as the second link is free, so a watch that scans after the phone
+  connected can still find the sensor; it closes once both links are the CGM's, or, for a
+  G7, when the core's window ends. A central hanging up does not close it while the other
   session or a free slot still needs it.
 - **Each CGM central has its own session.** One reading is made every five minutes, and
   each central is sent it on its own schedule; a central already subscribed to CONTROL
   is sent a new reading as soon as it is made, and one that connects later gets the cached
-  reading at once. The app's CGM code only asks for a reading after connecting. Once a
-  central has its reading and has gone quiet the board hangs up **that** central, so the
-  phone and the watch reconnect independently, within a second or two. One central
-  collecting, idle or leaving does not hold open or reset the other's session; a central
-  that was away while the other read backfills its own missed history when it returns.
+  reading at once. The app's CGM code only asks for a reading after connecting. A **G6
+  keeps its connection** and pushes every new reading to each central subscribed for
+  notifications. A **G7** collects one reading per link: once it has its reading and has
+  gone quiet the board hangs up **that** central, so the phone and the watch reconnect
+  independently, within a second or two. One central collecting, idle or leaving does not
+  hold open or reset the other's session; a central that was away while the other read
+  backfills its own missed history when it returns.
 - **Two centrals at once, a third refused.** The CGM may use both links (a phone and a
   watch); a pump phone and its CGM use one each. With two CGM centrals connected, a pump
   cannot also connect.
@@ -443,7 +450,7 @@ The host suites need only `cc` and `make` (no PlatformIO, no board):
 
 | Command | What it covers |
 |---|---|
-| `make -C test/cgm` | The CGM core: ESP-Sim's checks adapted to the per-session API, plus two-session cases |
+| `make -C test/cgm` | The CGM core: ESP-Sim's checks adapted to the per-session API, plus two-session and kind-specific advertising/hang-up cases |
 | `make -C test/medtrum` | The Medtrum patch core; `test_draw.c` covers the reservoir draw for bolus and basal |
 | `make -C test/fail` | The failure-injection decisions (drop, refuse, quiet, delay, ignore) for each device |
 | `make -C test/portal` | The captive-portal probe and redirect decision |
@@ -601,7 +608,7 @@ Devices we want to add:
   still **byte-identical** to ESP-Sim's; the new cases live in `test/medtrum/test_draw.c`,
   which `make -C test/medtrum` builds and runs alongside the ported suite.
 - **The CGM is ESP-Sim's core, no longer byte-identical.** `lib/cgmsim` is ESP-Sim's
-  portable G6/G7 protocol with one deliberate change: ESP-Sim keeps **one session** (one
+  portable G6/G7 protocol with two deliberate changes. ESP-Sim keeps **one session** (one
   `connected`, one login, one delivery cursor), which cannot give a phone and a watch each
   their own reading. Here the core keeps up to two sessions, one per central, each with its
   own login, sent-reading flag and per-central backfill cursor (the last reading that
@@ -609,10 +616,19 @@ Devices we want to add:
   still in the history), while the sensor state, reading history, signal loss, forced state
   and advertising window stay shared. That deviation is what lets the phone and the watch
   read at the same time, and why a silent watch no longer makes the phone's readings wait or
-  go irregular; a single central's normal frames and reconnect cadence are unchanged, and
-  a connected, subscribed central now receives a newly made reading instead of waiting for
-  its reconnect. The glue also holds a session's hang-up until that session's queued
-  notification has actually been sent, so an injected `delay` cannot lose the reading.
+  go irregular; a connected, subscribed central now receives a newly made reading instead of
+  waiting for its reconnect, and the glue holds a session's hang-up until that session's
+  queued notification has actually been sent, so an injected `delay` cannot lose the reading.
+  The other change is **kind-specific link behaviour**. ESP-Sim's state machine is
+  kind-blind: a G6 and a G7 both open a 60-second advertising window per reading and both
+  ask to be hung up once the reading is out. Here a **G6 advertises while unconnected and
+  keeps its connection**, pushing every reading to every subscribed session, while a **G7 keeps
+  the window and the per-reading hang-up** byte-for-byte. This is deliberate: with the
+  window, a G6 is invisible for four minutes of every five, so an app pairing a G6 in the
+  silent gap never sees the device, and a real G6 transmitter does not drop its link after
+  one reading. A G6's normal frames are unchanged; only when it advertises and when its
+  link ends differ. Signal loss still stops advertising for both kinds and drops their
+  links.
   `src/sensor_app.cpp` supplies the clock, flash and task and the CGM's side of
   `src/radio.cpp` maps each Bluetooth link to its session. The g7sim port that used to run
   the G7 (`src/sensor.cpp`, `handler.cpp`, `crypto.cpp`, `link.h`) is still in the tree but
