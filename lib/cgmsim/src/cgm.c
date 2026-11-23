@@ -32,6 +32,131 @@
 
 static const char ID_CHARS[] = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 
+/* Sine for the pattern generator, scaled by 10000, one degree per entry (361
+ * so 360 repeats 0). Integer-only: the host tests and the firmware link no
+ * libm. */
+static const int16_t SIN_TABLE[361] = {
+        0,   175,   349,   523,   698,   872,  1045,  1219,  1392,  1564,  1736,  1908,
+     2079,  2250,  2419,  2588,  2756,  2924,  3090,  3256,  3420,  3584,  3746,  3907,
+     4067,  4226,  4384,  4540,  4695,  4848,  5000,  5150,  5299,  5446,  5592,  5736,
+     5878,  6018,  6157,  6293,  6428,  6561,  6691,  6820,  6947,  7071,  7193,  7314,
+     7431,  7547,  7660,  7771,  7880,  7986,  8090,  8192,  8290,  8387,  8480,  8572,
+     8660,  8746,  8829,  8910,  8988,  9063,  9135,  9205,  9272,  9336,  9397,  9455,
+     9511,  9563,  9613,  9659,  9703,  9744,  9781,  9816,  9848,  9877,  9903,  9925,
+     9945,  9962,  9976,  9986,  9994,  9998, 10000,  9998,  9994,  9986,  9976,  9962,
+     9945,  9925,  9903,  9877,  9848,  9816,  9781,  9744,  9703,  9659,  9613,  9563,
+     9511,  9455,  9397,  9336,  9272,  9205,  9135,  9063,  8988,  8910,  8829,  8746,
+     8660,  8572,  8480,  8387,  8290,  8192,  8090,  7986,  7880,  7771,  7660,  7547,
+     7431,  7314,  7193,  7071,  6947,  6820,  6691,  6561,  6428,  6293,  6157,  6018,
+     5878,  5736,  5592,  5446,  5299,  5150,  5000,  4848,  4695,  4540,  4384,  4226,
+     4067,  3907,  3746,  3584,  3420,  3256,  3090,  2924,  2756,  2588,  2419,  2250,
+     2079,  1908,  1736,  1564,  1392,  1219,  1045,   872,   698,   523,   349,   175,
+        0,  -175,  -349,  -523,  -698,  -872, -1045, -1219, -1392, -1564, -1736, -1908,
+    -2079, -2250, -2419, -2588, -2756, -2924, -3090, -3256, -3420, -3584, -3746, -3907,
+    -4067, -4226, -4384, -4540, -4695, -4848, -5000, -5150, -5299, -5446, -5592, -5736,
+    -5878, -6018, -6157, -6293, -6428, -6561, -6691, -6820, -6947, -7071, -7193, -7314,
+    -7431, -7547, -7660, -7771, -7880, -7986, -8090, -8192, -8290, -8387, -8480, -8572,
+    -8660, -8746, -8829, -8910, -8988, -9063, -9135, -9205, -9272, -9336, -9397, -9455,
+    -9511, -9563, -9613, -9659, -9703, -9744, -9781, -9816, -9848, -9877, -9903, -9925,
+    -9945, -9962, -9976, -9986, -9994, -9998, -10000, -9998, -9994, -9986, -9976, -9962,
+    -9945, -9925, -9903, -9877, -9848, -9816, -9781, -9744, -9703, -9659, -9613, -9563,
+    -9511, -9455, -9397, -9336, -9272, -9205, -9135, -9063, -8988, -8910, -8829, -8746,
+    -8660, -8572, -8480, -8387, -8290, -8192, -8090, -7986, -7880, -7771, -7660, -7547,
+    -7431, -7314, -7193, -7071, -6947, -6820, -6691, -6561, -6428, -6293, -6157, -6018,
+    -5878, -5736, -5592, -5446, -5299, -5150, -5000, -4848, -4695, -4540, -4384, -4226,
+    -4067, -3907, -3746, -3584, -3420, -3256, -3090, -2924, -2756, -2588, -2419, -2250,
+    -2079, -1908, -1736, -1564, -1392, -1219, -1045,  -872,  -698,  -523,  -349,  -175,
+        0,
+};
+
+static uint16_t clamp_glucose(int32_t g)
+{
+    return (uint16_t)(g < 40 ? 40 : g > 400 ? 400 : g);
+}
+
+static int32_t sin_scaled(uint32_t phase_milli)
+{
+    uint32_t deg = (phase_milli / 1000) % 360;
+    uint32_t frac = phase_milli % 1000;
+    int32_t a = SIN_TABLE[deg], b = SIN_TABLE[deg + 1];
+    return a + (b - a) * (int32_t)frac / 1000;
+}
+
+/* A deterministic 32-bit mix. The walk has no RNG so that the same reading
+ * number always gives the same reading, before and after a reboot. */
+static uint32_t mix32(uint32_t x)
+{
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+const char *cgm_pattern_name(cgm_pattern_kind_t kind)
+{
+    return kind == CGM_PATTERN_SINE ? "sine" : kind == CGM_PATTERN_WALK ? "walk" : "fixed";
+}
+
+bool cgm_pattern_from_name(const char *name, cgm_pattern_kind_t *out)
+{
+    if (!name || !out) {
+        return false;
+    }
+    if (strcmp(name, "fixed") == 0) {
+        *out = CGM_PATTERN_FIXED;
+    } else if (strcmp(name, "sine") == 0) {
+        *out = CGM_PATTERN_SINE;
+    } else if (strcmp(name, "walk") == 0) {
+        *out = CGM_PATTERN_WALK;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+cgm_next_reading_t cgm_pattern_next(const cgm_pattern_t *p, uint16_t previous, uint32_t reading_number)
+{
+    cgm_next_reading_t out = {.glucose = clamp_glucose(p->value), .trend = p->trend};
+    if (p->kind != CGM_PATTERN_SINE && p->kind != CGM_PATTERN_WALK) {
+        if (out.trend > 126) out.trend = 126;
+        if (out.trend < -127) out.trend = -127;
+        return out;
+    }
+    if (p->kind == CGM_PATTERN_SINE) {
+        uint32_t period = p->period_minutes ? p->period_minutes : 240;
+        uint64_t phase = (uint64_t)reading_number * CGM_READING_INTERVAL * 360000U / ((uint64_t)period * 60U);
+        int32_t wave = (int32_t)p->amplitude * sin_scaled((uint32_t)(phase % 360000U)) / 10000;
+        out.glucose = clamp_glucose((int32_t)p->value + wave);
+    } else {
+        uint16_t start = previous ? previous : 120;
+        if (reading_number == 0 || start == p->value) {
+            out.glucose = clamp_glucose(start);
+        } else {
+            int32_t diff = (int32_t)p->value - (int32_t)start;
+            uint32_t frac = 40 + mix32(reading_number * 2654435761U + (uint32_t)p->value * 977U) % 81;
+            int32_t step = (diff < 0 ? -diff : diff) * (int32_t)frac / 100;
+            if (step < 1) step = 1;
+            int32_t next = (int32_t)start + (diff > 0 ? step : -step);
+            if ((diff > 0 && next > p->value) || (diff < 0 && next < p->value)) {
+                next = p->value;
+            }
+            out.glucose = clamp_glucose(next);
+        }
+    }
+    /* The curves report the slope that actually occurred over the 5-minute
+     * reading interval, in tenths of a mg/dL per minute. The first reading has
+     * no previous reading, so it carries no trend. */
+    if (previous) {
+        int32_t tenths = ((int32_t)out.glucose - (int32_t)previous) * 2;
+        out.trend = (int8_t)(tenths > 126 ? 126 : tenths < -127 ? -127 : tenths);
+    } else {
+        out.trend = 0;
+    }
+    return out;
+}
+
 static void put16(uint8_t *p, uint16_t v)
 {
     p[0] = (uint8_t)v;
@@ -151,6 +276,9 @@ void cgm_state_fresh(cgm_state_t *st, cgm_kind_t kind, const char *id, int64_t n
     st->session_start = now;
     st->warmup_done = now + (kind == CGM_G6 ? G6_WARMUP : G7_WARMUP);
     st->glucose = 120;
+    st->pattern = CGM_PATTERN_FIXED;
+    st->amplitude = 50;
+    st->period_minutes = 240;
 }
 
 uint8_t cgm_current_state(const cgm_state_t *st, int64_t now)
@@ -309,9 +437,25 @@ static void make_reading(cgm_t *c, uint32_t n, int64_t now)
         .trend = st->trend,
     };
     if (r.state == CGM_STATE_OK) {
-        r.glucose = st->glucose;
-        int g = st->glucose + (st->trend * 5 + (st->trend >= 0 ? 5 : -5)) / 10;
-        st->glucose = (uint16_t)(g < 40 ? 40 : g > 400 ? 400 : g);
+        const cgm_reading_t *prev_r = latest(c);
+        uint16_t prev = prev_r && prev_r->glucose ? prev_r->glucose : 120;
+        cgm_pattern_t p = {
+            .kind = (cgm_pattern_kind_t)st->pattern,
+            .value = st->glucose,
+            .trend = st->trend,
+            .amplitude = st->amplitude,
+            .period_minutes = st->period_minutes,
+        };
+        cgm_next_reading_t next = cgm_pattern_next(&p, prev, n);
+        r.glucose = next.glucose;
+        r.trend = next.trend;
+        /* A fixed pattern is the manual one: the panel's value is the next
+         * reading, and the reading after it moves by the trend. The curves keep
+         * `glucose` as their mean/target and derive every reading from n. */
+        if (st->pattern == CGM_PATTERN_FIXED) {
+            int g = st->glucose + (st->trend * 5 + (st->trend >= 0 ? 5 : -5)) / 10;
+            st->glucose = (uint16_t)(g < 40 ? 40 : g > 400 ? 400 : g);
+        }
     } else {
         r.trend = NO_TREND;
     }
@@ -713,8 +857,22 @@ size_t cgm_on_read(cgm_t *c, cgm_session_t session, cgm_chr_t chr, uint8_t *out,
 
 void cgm_set_glucose(cgm_t *c, uint16_t glucose, int8_t trend)
 {
+    c->st.pattern = CGM_PATTERN_FIXED;
     c->st.glucose = glucose < 40 ? 40 : glucose > 400 ? 400 : glucose;
     c->st.trend = trend;
+    save(c);
+}
+
+void cgm_set_pattern(cgm_t *c, const cgm_pattern_t *p)
+{
+    cgm_state_t *st = &c->st;
+    st->pattern = p->kind == CGM_PATTERN_SINE ? CGM_PATTERN_SINE
+                  : p->kind == CGM_PATTERN_WALK ? CGM_PATTERN_WALK
+                                                 : CGM_PATTERN_FIXED;
+    st->glucose = p->value < 40 ? 40 : p->value > 400 ? 400 : p->value;
+    st->trend = p->trend;
+    st->amplitude = p->amplitude > 180 ? 180 : p->amplitude;
+    st->period_minutes = p->period_minutes < 10 ? 10 : p->period_minutes > 1440 ? 1440 : p->period_minutes;
     save(c);
 }
 
@@ -773,6 +931,9 @@ void cgm_new_sensor(cgm_t *c, cgm_kind_t kind, const char *id)
     cgm_state_fresh(&fresh, kind, id, c->io->now(c->io->ctx));
     fresh.glucose = c->st.glucose ? c->st.glucose : 120;
     fresh.trend = c->st.trend;
+    fresh.pattern = c->st.pattern;
+    fresh.amplitude = c->st.amplitude;
+    fresh.period_minutes = c->st.period_minutes;
     c->st = fresh;
     clear_delivery_history(c);
     save(c);
@@ -790,11 +951,14 @@ size_t cgm_status_json(cgm_t *c, char *out, size_t cap)
     const cgm_reading_t *r = latest(c);
     int n = snprintf(out, cap,
                      "{\"kind\":%u,\"name\":\"%s\",\"id\":\"%s\",\"glucose\":%u,\"trend\":%d,\"state\":%u,"
+                     "\"pattern\":\"%s\",\"amplitude\":%u,\"periodMinutes\":%u,"
                      "\"forcedState\":%u,\"signalLoss\":%s,\"activated\":%lld,\"sessionStart\":%lld,"
                      "\"warmupDone\":%lld,\"connected\":%s,\"advertising\":%s,\"nextReading\":%lld",
-                     st->kind, name, st->id, st->glucose, st->trend, cgm_current_state(st, now), st->forced_state,
-                     st->signal_loss ? "true" : "false", (long long)st->activated, (long long)st->session_start,
-                     (long long)st->warmup_done, any_connected(c) ? "true" : "false", c->advertising ? "true" : "false",
+                     st->kind, name, st->id, st->glucose, st->trend, cgm_current_state(st, now),
+                     cgm_pattern_name((cgm_pattern_kind_t)st->pattern), st->amplitude, st->period_minutes,
+                     st->forced_state, st->signal_loss ? "true" : "false", (long long)st->activated,
+                     (long long)st->session_start, (long long)st->warmup_done,
+                     any_connected(c) ? "true" : "false", c->advertising ? "true" : "false",
                      (long long)(st->activated + (int64_t)st->next_n * CGM_READING_INTERVAL));
     if (n < 0 || (size_t)n >= cap) {
         return 0;

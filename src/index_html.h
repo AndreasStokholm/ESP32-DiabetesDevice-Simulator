@@ -1,9 +1,9 @@
 #pragma once
 // The CGM's control panel (the board's own page at /cgm). It talks to the
 // portable CGM core through /cgm/status and /cgm/command: the kind (Dexcom G6
-// transmitter, Dexcom G7 sensor, off), a G6 transmitter id, the next reading
-// and its trend, a calibration, the forced algorithm state, and the failure
-// knob the radio applies.
+// transmitter, Dexcom G7 sensor, off), a G6 transmitter id, the glucose pattern
+// (fixed, a sine, or a walk), a calibration, the forced algorithm state, and the
+// failure knob the radio applies.
 static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
 <html lang="en">
 <head>
@@ -46,6 +46,7 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
   button.primary { background:var(--accent); border-color:var(--accent); color:#0b0d10; font-weight:600; }
   button.danger:hover { border-color:var(--bad); }
   .muted { color:var(--mut); font-size:13px; }
+  [hidden] { display:none !important; }
   footer { max-width:760px; margin:0 auto; padding:4px 16px 24px; color:var(--mut); font-size:12px; }
 </style>
 </head>
@@ -103,23 +104,35 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
 
   <div class="card">
     <h2>Glucose</h2>
+    <div class="seg" id="pattern">
+      <button type="button" data-pattern="fixed">Fixed</button>
+      <button type="button" data-pattern="sine">Wave</button>
+      <button type="button" data-pattern="walk">Random walk</button>
+    </div>
     <div class="row">
       <div>
-        <label>Next reading (mg/dL)</label>
+        <label id="valueLabel" for="glucoseIn">Next reading (mg/dL)</label>
         <input type="number" id="glucoseIn" min="40" max="400" step="1" value="120">
         <input type="range" id="glucoseRange" min="40" max="400" step="1" value="120">
       </div>
-      <div>
-        <label>Trend (mg/dL per minute)</label>
+      <div id="trendWrap">
+        <label for="trendIn">Trend (mg/dL per minute)</label>
         <input type="number" id="trendIn" min="-12.7" max="12.6" step="0.1" value="0">
+      </div>
+      <div class="sineOnly" hidden>
+        <label for="amplitudeIn">Wave amplitude (&plusmn; mg/dL)</label>
+        <input type="number" id="amplitudeIn" min="0" max="180" step="1" value="50">
+      </div>
+      <div class="sineOnly" hidden>
+        <label for="periodIn">Wave period (minutes)</label>
+        <input type="number" id="periodIn" min="10" max="1440" step="1" value="240">
       </div>
     </div>
     <div style="margin-top:14px; display:flex; align-items:center; gap:12px">
       <button class="primary" id="applyGlucose">Apply</button>
       <span class="muted" id="glucoseMsg"></span>
     </div>
-    <div class="muted" style="margin-top:10px">The core holds one next reading and a trend: the next reading is set to this glucose and then moves by the trend each 5 minutes. 
-    g7sim's sine and random walk are not in the core.</div>
+    <div class="muted" style="margin-top:10px">Fixed: the next reading is this value, then it moves by the trend every 5 minutes. Wave: a sine around the mean. Random walk: each reading steps toward the target. The pattern is the same for a G6 and a G7.</div>
   </div>
 
   <div class="card">
@@ -189,6 +202,8 @@ const KIND = {0:"off", 6:"Dexcom G6 transmitter", 7:"Dexcom G7 sensor"};
 const STATE = {1:["stopped","bad"],2:["warm-up","warn"],6:["ok","ok"],16:["session failure","bad"],
   18:["temporary issue","warn"],24:["expired","bad"],25:["sensor failed","bad"],26:["session ended","bad"]};
 let s = {};
+let pattern = 'fixed';
+let patternDirty = false;
 
 function ago(sec){ if(sec==null) return "—"; if(sec<0) sec=0;
   if(sec<60) return Math.round(sec)+"s"; if(sec<3600) return Math.round(sec/60)+"m";
@@ -209,13 +224,27 @@ async function cmd(body, msg, done){
 
 function sync(id, val){ const el = document.getElementById(id); if(document.activeElement !== el) el.value = val; }
 
+function showPattern(kind){
+  document.querySelectorAll('#pattern button').forEach(b=>b.classList.toggle('active', b.dataset.pattern===kind));
+  document.querySelectorAll('.sineOnly').forEach(el=>{ el.hidden = kind!=='sine'; });
+  document.getElementById('trendWrap').hidden = kind!=='fixed';
+  document.getElementById('valueLabel').textContent = kind==='sine' ? 'Mean (mg/dL)' : kind==='walk' ? 'Target (mg/dL)' : 'Next reading (mg/dL)';
+}
+
+document.querySelectorAll('#pattern button').forEach(b=>b.onclick=()=>{
+  pattern = b.dataset.pattern; patternDirty = true; showPattern(pattern);
+});
+
 document.querySelectorAll('#kind button').forEach(b=>b.onclick=()=>
   cmd({command:'cgmSetKind', kind:+b.dataset.kind}, 'kindMsg', 'Set'));
 document.getElementById('applyId').onclick = ()=>cmd({command:'cgmSetId', id:document.getElementById('g6id').value.trim()}, 'sensorMsg', 'Id set');
 document.getElementById('newSensor').onclick = ()=>cmd({command:'cgmNewSensor', kind:(s.kind||7)}, 'sensorMsg', 'New sensor started');
-document.getElementById('applyGlucose').onclick = ()=>cmd({command:'cgmSetGlucose',
-  glucose:+document.getElementById('glucoseIn').value,
-  trend:Math.round(+document.getElementById('trendIn').value*10)}, 'glucoseMsg', 'Applied ✓');
+document.getElementById('applyGlucose').onclick = async ()=>{ patternDirty = false; await cmd({command:'cgmSetPattern',
+  pattern: pattern,
+  value:+document.getElementById('glucoseIn').value,
+  trend:Math.round(+document.getElementById('trendIn').value*10),
+  amplitude:+document.getElementById('amplitudeIn').value,
+  periodMinutes:+document.getElementById('periodIn').value}, 'glucoseMsg', 'Applied ✓'); };
 document.getElementById('calApply').onclick = ()=>cmd({command:'cgmSetCalibration',
   glucose:+document.getElementById('calIn').value}, 'glucoseMsg', 'Calibrated ✓');
 document.getElementById('algostate').onchange = ()=>cmd({command:'cgmSetState',
@@ -238,7 +267,8 @@ async function refresh(){
   const last = st.last;
   const g = last && last.glucose ? last.glucose : (st.glucose || null);
   document.getElementById('glucose').textContent = (!st.kind || g==null) ? '—' : g;
-  const tr = (st.trend||0)/10;
+  const shownTrend = last && last.glucose && last.trend != null ? last.trend : st.trend;
+  const tr = (shownTrend||0)/10;
   document.getElementById('trend').textContent = st.kind ? (tr>0?'+':'')+tr.toFixed(1)+'/min' : '';
   const sb = STATE[st.state] || ['state '+(st.state==null?'?':st.state),''];
   const lab = document.getElementById('statelabel');
@@ -261,6 +291,10 @@ async function refresh(){
   sync('glucoseIn', st.glucose||120);
   sync('glucoseRange', st.glucose||120);
   sync('trendIn', ((st.trend||0)/10).toFixed(1));
+  sync('amplitudeIn', st.amplitude ?? 50);
+  sync('periodIn', st.periodMinutes ?? 240);
+  if (!patternDirty) pattern = st.pattern || 'fixed';
+  showPattern(pattern);
   document.getElementById('algostate').value = st.forcedState || 0;
 }
 

@@ -281,11 +281,22 @@ static bool migrateStateFile(cgm_state_t* out, int64_t* clockHint) {
   int g = d["glucose"]["value"] | 120;
   out->glucose = (uint16_t)(g < 40 ? 40 : g > 400 ? 400 : g);
   out->forced_state = (uint8_t)(d["glucose"]["algorithmState"] | 0);
+  // The old g7sim patterns have a home in the core now: carry the wave's
+  // parameters across instead of dropping them to a fixed reading.
   std::string wave = d["glucose"]["kind"] | "sine";
-  if (wave != "fixed") {
-    logf("sensor: the old %s waveform is not in the CGM core; using a fixed next glucose and the recorded trend",
-         wave.c_str());
+  cgm_pattern_kind_t pattern = CGM_PATTERN_FIXED;
+  if (!cgm_pattern_from_name(wave.c_str(), &pattern)) {
+    logf("sensor: old glucose pattern '%s' is unknown; using fixed", wave.c_str());
+    pattern = CGM_PATTERN_FIXED;
   }
+  out->pattern = (uint8_t)pattern;
+  int amplitude = d["glucose"]["amplitude"] | 50;
+  int period = d["glucose"]["periodMinutes"] | 240;
+  out->amplitude = (uint16_t)(amplitude < 0 ? 0 : amplitude > 180 ? 180 : amplitude);
+  out->period_minutes = (uint16_t)(period < 10 ? 10 : period > 1440 ? 1440 : period);
+  out->trend = (int8_t)(d["glucose"]["trend"] | 0);
+  if (out->trend > 126) out->trend = 126;
+  if (out->trend < -127) out->trend = -127;
   if (d["calibration"].is<JsonObject>()) {
     logf("sensor: the old G7 calibration is not in the CGM core; it is dropped");
   }
@@ -328,8 +339,12 @@ static bool migrateStateFile(cgm_state_t* out, int64_t* clockHint) {
   }
   if (out->n_hist) {
     const cgm_reading_t* last = &out->hist[out->n_hist - 1];
-    if (last->glucose) out->glucose = last->glucose;
-    if (last->trend != 0x7f) out->trend = last->trend;
+    // A fixed pattern's next reading continues from the last reading; a sine's
+    // mean and a walk's target stay the values the old mode configured.
+    if (out->pattern == CGM_PATTERN_FIXED) {
+      if (last->glucose) out->glucose = last->glucose;
+      if (last->trend != 0x7f) out->trend = last->trend;
+    }
     out->next_n = lastSeq;
   } else {
     out->next_n = 0;
@@ -703,6 +718,30 @@ const char* command(const std::string& json) {
     LOCKED({
       cgm_set_glucose(&c, (uint16_t)v, (int8_t)trend);
       persistNowLocked();  // the HTTP thread: commit now
+    });
+  } else if (strcmp(cmd, "cgmSetPattern") == 0) {
+    // The panel's pattern selector: fixed keeps the manual value/trend reachable,
+    // sine takes a mean/amplitude/period, and walk takes a target. Both sensor
+    // kinds use the same generator.
+    char patternName[8];
+    if (!jsonStr(body, "pattern", patternName, sizeof patternName)) return "pattern is fixed, sine or walk";
+    cgm_pattern_kind_t pattern;
+    if (!cgm_pattern_from_name(patternName, &pattern)) return "pattern is fixed, sine or walk";
+    long value = 120;
+    if (!jsonNumber(body, "value", &value) && !jsonNumber(body, "glucose", &value)) return "value is 40 to 400";
+    if (value < 40 || value > 400) return "value is 40 to 400";
+    long trend = 0, amplitude = 50, period = 240;
+    if (jsonNumber(body, "trend", &trend) && (trend < -127 || trend > 126)) return "trend is -127 to 126";
+    if (jsonNumber(body, "amplitude", &amplitude) && (amplitude < 0 || amplitude > 180)) {
+      return "amplitude is 0 to 180";
+    }
+    if (jsonNumber(body, "periodMinutes", &period) && (period < 10 || period > 1440)) {
+      return "periodMinutes is 10 to 1440";
+    }
+    LOCKED({
+      cgm_pattern_t p = {pattern, (uint16_t)value, (int8_t)trend, (uint16_t)amplitude, (uint16_t)period};
+      cgm_set_pattern(&c, &p);
+      persistNowLocked();
     });
   } else if (strcmp(cmd, "cgmSetState") == 0) {
     if (!jsonNumber(body, "state", &v) || v < 0 || v > 255) return "state is 0 to 255";

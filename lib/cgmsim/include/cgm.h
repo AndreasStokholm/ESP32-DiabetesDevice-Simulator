@@ -22,6 +22,37 @@ typedef enum {
     CGM_G7 = 7,
 } cgm_kind_t;
 
+/* What the next reading does. The generator below is pure: the same previous
+ * reading, pattern, parameters and reading number always give the same next
+ * reading and trend. Both kinds use it; only the frame around the number
+ * differs. */
+typedef enum {
+    CGM_PATTERN_FIXED = 0, /* constant value, stepped by the trend */
+    CGM_PATTERN_SINE = 1,  /* a wave around a mean */
+    CGM_PATTERN_WALK = 2,  /* a slow random walk seeking a target */
+} cgm_pattern_kind_t;
+
+typedef struct {
+    cgm_pattern_kind_t kind;
+    uint16_t value;          /* fixed: the next reading; sine: the mean; walk: the target */
+    int8_t trend;            /* fixed: tenths of mg/dL per minute; ignored by the curves */
+    uint16_t amplitude;      /* sine: mg/dL either side of the mean */
+    uint16_t period_minutes; /* sine: minutes for one full wave */
+} cgm_pattern_t;
+
+typedef struct {
+    uint16_t glucose; /* mg/dL, within 40..400 */
+    int8_t trend;     /* tenths of mg/dL per minute, -127..126 */
+} cgm_next_reading_t;
+
+/* The pure generator behind both a G6's and a G7's readings. `previous` is the
+ * last reading's glucose (0 when there is none). A fixed pattern returns
+ * `p->value`; a sine's or walk's first reading starts from 120 when `previous`
+ * is 0. No clock, storage or RNG: the reading number carries all the variation. */
+cgm_next_reading_t cgm_pattern_next(const cgm_pattern_t *p, uint16_t previous, uint32_t reading_number);
+const char *cgm_pattern_name(cgm_pattern_kind_t kind);
+bool cgm_pattern_from_name(const char *name, cgm_pattern_kind_t *out);
+
 /* The sensor's GATT characteristics (service F8083532-849E-531C-C594-30F1F86A4EA5). */
 typedef enum {
     CGM_CHR_COMM = 0, /* …3533 */
@@ -33,7 +64,7 @@ typedef enum {
 
 #define CGM_READING_INTERVAL 300 /* seconds */
 #define CGM_HISTORY 36           /* readings kept for backfill: 3 hours */
-#define CGM_STATE_VERSION 1
+#define CGM_STATE_VERSION 2
 #define CGM_MAX_SESSIONS 2 /* one per Bluetooth link the board can hold */
 
 /* Algorithm states, as both G6 and G7 number them. */
@@ -64,9 +95,14 @@ typedef struct {
     int64_t activated;     /* Unix seconds: transmitter (G6) or sensor (G7) start */
     int64_t session_start; /* Unix seconds: G6 sensor session start, 0 if none. G7: = activated */
     int64_t warmup_done;   /* Unix seconds: warm-up ends (the panel can skip it) */
-    /* What the panel set. */
-    uint16_t glucose;      /* the next reading, mg/dL */
-    int8_t trend;          /* tenths of mg/dL per minute, applied every reading */
+    /* What the panel set. `glucose` is the next reading for a fixed pattern,
+     * the mean for a sine and the target for a walk; `trend` is the fixed
+     * pattern's step. The curves derive their trend from the reading itself. */
+    uint16_t glucose;      /* mg/dL */
+    int8_t trend;          /* tenths of mg/dL per minute, fixed only */
+    uint8_t pattern;       /* cgm_pattern_kind_t */
+    uint16_t amplitude;    /* sine: mg/dL */
+    uint16_t period_minutes; /* sine: minutes per wave */
     uint8_t forced_state;  /* 0: from the session's age */
     bool signal_loss;      /* stop advertising: readings are missed, and backfilled later */
     /* Readings. */
@@ -156,8 +192,10 @@ void cgm_on_subscribe(cgm_t *c, cgm_session_t session, cgm_chr_t chr, bool on);
 void cgm_on_write(cgm_t *c, cgm_session_t session, cgm_chr_t chr, const uint8_t *p, size_t n);
 size_t cgm_on_read(cgm_t *c, cgm_session_t session, cgm_chr_t chr, uint8_t *out, size_t cap);
 
-/* The control panel. */
+/* The control panel. cgm_set_glucose() is the manual fixed pattern: the next
+ * reading and so many tenths of a mg/dL per minute from then on. */
 void cgm_set_glucose(cgm_t *c, uint16_t glucose, int8_t trend);
+void cgm_set_pattern(cgm_t *c, const cgm_pattern_t *p);
 void cgm_set_state(cgm_t *c, uint8_t forced_state);
 void cgm_set_signal_loss(cgm_t *c, bool on);
 void cgm_skip_warmup(cgm_t *c);
