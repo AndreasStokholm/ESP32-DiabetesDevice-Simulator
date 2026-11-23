@@ -204,10 +204,36 @@ const STATE = {1:["stopped","bad"],2:["warm-up","warn"],6:["ok","ok"],16:["sessi
 let s = {};
 let pattern = 'fixed';
 let patternDirty = false;
+// The board's /cgm/status carries `now` and `nextReading` as Unix seconds on the
+// core's clock, not the browser's. Keep those two numbers here; performance.now()
+// only interpolates between polls, so neither the browser clock nor NTP skew can
+// move the countdown. Nothing is rounded to whole minutes.
+let countdown = null;
 
 function ago(sec){ if(sec==null) return "—"; if(sec<0) sec=0;
   if(sec<60) return Math.round(sec)+"s"; if(sec<3600) return Math.round(sec/60)+"m";
   if(sec<172800) return Math.round(sec/3600)+"h"; return (sec/86400).toFixed(1)+"d"; }
+
+function countdownText(){
+  if (!countdown) return '—';
+  const left = countdown.next - countdown.now - (performance.now() - countdown.at)/1000;
+  const secs = Math.max(0, Math.ceil(left));
+  const m = Math.floor(secs / 60), s = secs % 60;
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function renderWindow(){
+  const el = document.getElementById('window');
+  if (!s.kind) {
+    el.textContent = 'the CGM is off: it neither advertises nor serves a reading';
+    return;
+  }
+  const when = (s.warmupLeftSeconds||0) > 0 ? 'warm-up ends in '+ago(s.warmupLeftSeconds)
+                                            : 'next reading in '+countdownText();
+  el.textContent = when
+    + ' · ' + (s.signalLoss ? 'signal loss: not advertising' : s.advertising ? 'advertising for a phone' : 'quiet')
+    + ' · ' + (s.connected ? 'a phone has the link' : 'no phone');
+}
 
 async function cmd(body, msg, done){
   const el = document.getElementById(msg);
@@ -274,12 +300,9 @@ async function refresh(){
   const lab = document.getElementById('statelabel');
   lab.textContent = st.kind ? sb[0] : 'off';
   lab.className = 'state ' + (st.kind ? sb[1] : '');
-  const nextIn = st.nextReading ? Math.round((st.nextReading - st.now)/60) : null;
-  document.getElementById('window').textContent = st.kind
-    ? ((st.warmupLeftSeconds>0 ? 'warm-up ends in '+ago(st.warmupLeftSeconds) : 'next reading in '+(nextIn==null?'—':nextIn+' min'))
-       + ' · ' + (st.signalLoss ? 'signal loss: not advertising' : st.advertising ? 'advertising for a phone' : 'quiet')
-       + ' · ' + (st.connected ? 'a phone has the link' : 'no phone'))
-    : 'the CGM is off: it neither advertises nor serves a reading';
+  countdown = st.kind && st.nextReading != null && st.now != null
+    ? { next: st.nextReading, now: st.now, at: performance.now() } : null;
+  renderWindow();
   document.querySelectorAll('#kind button').forEach(b=>b.classList.toggle('active', +b.dataset.kind === st.kind));
   sync('g6id', st.kind===6 ? (st.id||'') : '');
   document.getElementById('g6id').disabled = st.kind!==6;
@@ -316,7 +339,7 @@ document.getElementById('failApply').onclick = ()=>fail({device:'g7',
   delayMs:+document.getElementById('failDelay').value,
   ignore:+document.getElementById('failIgnore').value}, 'Failure set');
 document.getElementById('failClear').onclick = ()=>fail({device:'g7', drop:false, refuse:0, quietMs:0, delayMs:0, ignore:0}, 'Failures cleared');
-refresh(); setInterval(refresh, 2000);
+refresh(); setInterval(refresh, 2000); setInterval(renderWindow, 1000);
 </script>
 </body>
 </html>)HTML";
