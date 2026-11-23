@@ -1,8 +1,9 @@
 # ESP32 Diabetes Device Simulator
 
 One ESP32-S3 that simulates **one CGM and one pump at a time**, each chosen on its own page.
-The CGM page (`/g7`) picks Off, a **Dexcom G6** transmitter or a **Dexcom G7** sensor; the
-pump page (`/pump`) picks Off, an **Omnipod DASH** pod, an **Omnipod 5** pod or a **Medtrum
+The CGM page (`/cgm`, where `/g7` redirects) picks Off, a **Dexcom G6** transmitter
+or a **Dexcom G7** sensor; the pump page (`/pump`) picks Off, an **Omnipod DASH**
+pod, an **Omnipod 5** pod or a **Medtrum
 patch**. Everything not chosen is off: it does not advertise and does not hold one of the
 board's two Bluetooth links. The CGM can serve **two centrals at once** (a phone and a
 watch), as a real transmitter serves several receivers; the pump stays on one link. On a
@@ -22,11 +23,13 @@ It builds on two projects:
   `lib/medtrumpatch` with one deliberate change — it now consumes its reservoir as it
   delivers, bolus and basal (see [Differences](#differences-from-the-originals)) — each
   with small Arduino/PlatformIO glue;
-- the CGM is ESP-Sim's portable G6/G7 core, `lib/cgmsim`, with two deliberate changes: it
-  keeps a **session per central** so a phone and a watch can read at the same time, and it
+- the CGM is ESP-Sim's portable G6/G7 core, `lib/cgmsim`, with three deliberate changes: it
+  keeps a **session per central** so a phone and a watch can read at the same time, it
   gives each kind its real link behaviour (**a G6 advertises while unconnected and keeps its
   connection; a G7 advertises in a window per reading and hangs up**), which ESP-Sim's
-  single-session, kind-blind core cannot (see
+  single-session, kind-blind core cannot, and it adds a **glucose-pattern generator**
+  (fixed, sine and random walk, for either kind) on top of a core that only ever held one
+  next-reading value (see
   [Differences](#differences-from-the-originals)). It is still the only CGM engine on the
   board, not a port of [LoopKit/g7sim](https://github.com/LoopKit/g7sim); g7sim's ideas live
   on in the shape of this board's console and JSON API (see
@@ -199,7 +202,7 @@ Chrome or Edge, press **Connect to the board** and pick its port. Close other se
 monitors first: only one program can use the port. The page reads the board's console and
 sends console commands, so a board whose firmware is older than the page may not know them.
 The page's own sensor buttons were written for the g7sim-era firmware: this build has no
-pairing code, and its glucose controls are the next reading plus a trend (see
+pairing code. The board's own panel has the glucose patterns and the next reading (see
 [the CGM commands](#console-commands-the-cgm)). The page's console box runs any
 [command](#commands); the board's own web panels (below) are the current UI.
 
@@ -229,12 +232,15 @@ use `/settings` or `wifi <name> <password>`.
 All pages share one nav: **Home, CGM, Pump, Settings**.
 
 - `/` is the home page: two cards, **CGM** and **Pump**, each showing the selected device
-  and its live line (the CGM's kind, name, glucose and state from `/g7/status`; the selected
+  and its live line (the CGM's kind, name, glucose and state from `/cgm/status`; the selected
   pump's type, pairing, reservoir and connection), plus a no-clock banner that links to
   `/setup`.
-- `/g7` is the CGM page: a **Simulate** box at the top (Off / Dexcom G6 / Dexcom G7), then
-  a G6 transmitter id, the next reading and its trend, a calibration, the sensor state,
-  signal loss, skip warm-up, a new sensor, and the failure-injection card.
+- `/cgm` is the CGM page (`/g7` redirects here): a **Simulate** box at the top (Off /
+  Dexcom G6 / Dexcom G7), then a G6 transmitter id, a glucose pattern (fixed value and
+  trend, a sine around a mean, or a random walk toward a target), a calibration, the sensor
+  state, signal loss, skip warm-up, a new sensor, and the failure-injection card. The
+  line under the reading counts the next one down in mm:ss (`m:ss`, e.g. `4:07`), ticking
+  once a second.
 - `/pump` is the pump page: a **Simulate** box at the top (Off / Omnipod DASH / Omnipod 5 /
   Medtrum patch), then the selected pump's panel only — the pod's reservoir, pod age,
   alerts, faults, crash and new pod, or the patch's model and serial, reservoir, state,
@@ -252,7 +258,8 @@ selecting Off leaves no pump advertising and no pump connection accepted. The CG
 advertising identity and its own links are unaffected either way.
 
 The JSON APIs are the originals': g7sim's four stay at the root (`/status`, `/glucose`,
-`/forget`, `/new`), and the CGM's own core has `/g7/status` and `/g7/command`; loopkit/pod's
+`/forget`, `/new`), and the CGM's own core has `/cgm/status` and `/cgm/command`
+(`/g7/status` and `/g7/command` behave identically); loopkit/pod's
 are under `/pod` (`/pod/status`, `/pod/command`), the patch's under `/medtrum`
 (`/medtrum/status`, `/medtrum/command`), plus `/settings/status`, `/settings/pump` (the
 selector), `/settings/wifi`, `/settings/forget`, `/settings/reboot` and `/fail` (see
@@ -299,8 +306,9 @@ name and id with the pod and Wi‑Fi details.
 ### Console commands: the CGM
 
 The CGM is ESP-Sim's portable G6/G7 core. The console keeps [LoopKit/g7sim](https://github.com/LoopKit/g7sim)'s
-four requests at the root and the same JSON fields, so the old one-liners still work, but
-what they do is what the core can do: one next reading and a trend, not g7sim's waveforms.
+four requests at the root and the same JSON fields, so the old one-liners still work. The
+g7sim-shaped `glucose` word still drives the core's fixed pattern (one next reading and a
+trend); the sine and walk patterns are driven from the panel or `/cgm/command` (below).
 
 | Console | g7sim | What it does |
 |---|---|---|
@@ -319,12 +327,12 @@ The same requests work over Wi‑Fi, for example
 `curl -XPOST esp-sim.local/glucose -d '{"kind":"fixed","value":65}'`.
 
 `glucose` keeps g7sim's body: a number you leave out is 0, and leaving out
-`algorithmState` returns the sensor to normal. g7sim's `sine` and `walk` are accepted and
-logged as not applicable: the core has no waveform, so the `value` is the next reading and
-`trend` (tenths of mg/dL per minute, applied over the five minutes to the following
-reading) is how it moves. `cal`,
-`kind` and `id` are additions for the G6; the panel's signal loss and skip warm-up are
-`/g7/command` only (below).
+`algorithmState` returns the sensor to normal. g7sim's `sine` and `walk` bodies are accepted
+by this g7sim-shaped path and logged as not applied: it treats `value` as the next reading
+and `trend` (tenths of mg/dL per minute, applied over the five minutes to the following
+reading) as how it moves. The core's real patterns are set with `cgmSetPattern` or the
+panel. `cal`, `kind` and `id` are additions for the G6; the panel's signal loss and skip
+warm-up are `/cgm/command` only (below).
 
 `new` takes g7sim's body too: `model` picks the kind (`g6` is an extension; `g7`, `oneplus`
 and `stelo` are all a G7 sensor here), `ageMinutes` starts an older sensor (0 starts in
@@ -333,10 +341,14 @@ logged as not applicable and not invented. The core's sessions are fixed: a G6 i
 transmitter with a 2-hour warm-up, a G7 a 10.5-day sensor (10 days and the 12-hour grace)
 with a 27-minute warm-up. There is no pairing code to choose.
 
-The panel and `/g7/command` take the core's own commands:
+The panel and `/cgm/command` take the core's own commands; `/g7/command` is an alias that
+behaves identically:
 
-| `/g7/command` | What it does |
+| `/cgm/command` | What it does |
 |---|---|
+| `{"command":"cgmSetPattern","pattern":"fixed","value":120,"trend":-10}` | The fixed pattern: the next reading and its trend (tenths of mg/dL per minute) |
+| `{"command":"cgmSetPattern","pattern":"sine","value":120,"amplitude":50,"periodMinutes":240}` | A sine around the mean `value` (± `amplitude` mg/dL, one wave every `periodMinutes` minutes) |
+| `{"command":"cgmSetPattern","pattern":"walk","value":130}` | A slow random walk seeking the target `value` |
 | `{"command":"cgmSetGlucose","glucose":120,"trend":-10}` | The next reading and its trend (tenths of mg/dL per minute) |
 | `{"command":"cgmSetState","state":18}` | Force the reported state (0 derives it from the session's age) |
 | `{"command":"cgmSetSignalLoss","on":true}` | Signal loss: stop advertising and drop the CGM's links; the readings are still made, so the app backfills them when it ends |
@@ -347,21 +359,27 @@ The panel and `/g7/command` take the core's own commands:
 | `{"command":"cgmNewSensor","kind":7,"ageMinutes":120}` | A new sensor of that kind, that many minutes old |
 | `{"command":"cgmForget"}` | Drop all CGM links |
 
-`GET /g7/status` returns the core's own state (kind, name, id, glucose, trend, state,
-`signalLoss`, the reading history's last entry, `advertising`/`connected`, plus
-`radioConnected`, `now`, `ageSeconds` and `warmupLeftSeconds`), and `centrals` /
-`collectedCentrals` make a two-central test readable. The panel polls it every 2 seconds.
+`GET /cgm/status` returns the core's own state (kind, name, id, glucose, trend, state,
+`pattern`, `amplitude`, `periodMinutes`, `signalLoss`, the reading history's last entry,
+`advertising`/`connected`, plus `radioConnected`, `now`, `ageSeconds` and
+`warmupLeftSeconds`); `/g7/status` behaves identically. `centrals` / `collectedCentrals`
+make a two-central test readable. The panel polls it every 2 seconds and ticks the `m:ss`
+countdown once a second between polls, from the status's `now` and `nextReading` numbers.
 
-Glucose changes take effect at the next 5-minute reading. After `new`, `kind` or `id`, the
-app has to find the sensor again (a new sensor has a new id).
+The pattern is part of the saved state (with the core-state version), so a reboot does not
+drop a sine or a walk a test was relying on. Switching pattern, mean/target, amplitude or
+period takes effect at the next 5-minute reading; a fixed change is the next reading exactly
+as before. After `new`, `kind` or `id`, the app has to find the sensor again (a new sensor has
+a new id).
 
 What g7sim had and this core does not: the 4-digit pairing code and the J-PAKE handshake
 (the core auto-authenticates and reports itself bonded), per-display key slots (see
-[Differences](#differences-from-the-originals)), the ONE+/Stelo advertised names, and the
-sine/random-walk waveforms. `GET /status` keeps g7sim's field names, but `code` is empty,
-`slots` is `{}` and `glucoseMode.kind` is always `"fixed"`, because those are what the core
-has; g7sim's `window`, `activation` and `lockedForSeconds` are not reported either (the
-core has no per-reading window view, no wall-clock activation and no rejection lockout).
+[Differences](#differences-from-the-originals)), and the ONE+/Stelo advertised names. The
+g7sim-shaped `GET /status` keeps g7sim's field names, but `code` is empty, `slots` is `{}`
+and `glucoseMode.kind` is always `"fixed"`, because that view still carries only one next
+reading; the core's own `/cgm/status` reports the real pattern. g7sim's `window`,
+`activation` and `lockedForSeconds` are not reported either (the core has no per-reading
+window view, no wall-clock activation and no rejection lockout).
 Not carried over either: `POST /force-quit` and the `-transport`, `-socket`,
 `-simulator`, `-relaunch`, `-suspend` and `-dylib` flags, which only apply to g7sim's iOS
 Simulator transport, and `-max-connections`, since the board has its own two-link limit.
@@ -466,7 +484,7 @@ cores' host suites above cover the protocol and the delivery model, not the glue
 
 ## Failure injection
 
-The **Failure injection** card on `/g7` and on the selected pump's panel on `/pump`, the
+The **Failure injection** card on `/cgm` and on the selected pump's panel on `/pump`, the
 console's `fail` command and `/fail` put real Bluetooth failures in front of the simulators. All five knobs
 are enforced by the radio; the values live in RAM and reset on reboot.
 
@@ -545,8 +563,8 @@ reading by the core itself.
   and a blank board starting as an Omnipod 5 (boards updated from an earlier build keep the
   pod they had).
 - **Not yet on hardware at all**: the G6/G7 core (`lib/cgmsim`) and the CGM's side of the
-  radio. The panel sets the next glucose, a trend and the state; every reading is made up,
-  and there is no waveform.
+  radio. The panel sets a fixed, sine or walk pattern, its parameters and the state; every
+  reading is made up.
 - The ESP32 is 2.4 GHz only, and can't sign in to captive-portal Wi‑Fi (hotels). Use its
   own access point or a phone hotspot.
 
@@ -608,7 +626,7 @@ Devices we want to add:
   still **byte-identical** to ESP-Sim's; the new cases live in `test/medtrum/test_draw.c`,
   which `make -C test/medtrum` builds and runs alongside the ported suite.
 - **The CGM is ESP-Sim's core, no longer byte-identical.** `lib/cgmsim` is ESP-Sim's
-  portable G6/G7 protocol with two deliberate changes. ESP-Sim keeps **one session** (one
+  portable G6/G7 protocol with three deliberate changes. ESP-Sim keeps **one session** (one
   `connected`, one login, one delivery cursor), which cannot give a phone and a watch each
   their own reading. Here the core keeps up to two sessions, one per central, each with its
   own login, sent-reading flag and per-central backfill cursor (the last reading that
@@ -629,17 +647,28 @@ Devices we want to add:
   one reading. A G6's normal frames are unchanged; only when it advertises and when its
   link ends differ. Signal loss still stops advertising for both kinds and drops their
   links.
+  The third change is the **glucose-pattern generator**. ESP-Sim's core only ever held a
+  single next-reading value and a trend; it had no waveform. Here `lib/cgmsim` has a small
+  pure generator shared by a G6 and a G7: fixed (the value, then the trend every five
+  minutes), sine (a mean, ± amplitude in mg/dL, and a period in minutes) and walk (a slow
+  deterministic random walk seeking a target). The same previous reading, pattern,
+  parameters and reading number always give the same next glucose and trend; nothing in the
+  frame builders changes, only the number inside them. The pattern and its parameters are
+  part of the saved state, so a reboot keeps the sine or walk a test was relying on. The
+  panel shows the next reading as `m:ss`, ticking once a second from the status timestamps.
   `src/sensor_app.cpp` supplies the clock, flash and task and the CGM's side of
   `src/radio.cpp` maps each Bluetooth link to its session. The g7sim port that used to run
   the G7 (`src/sensor.cpp`, `handler.cpp`, `crypto.cpp`, `link.h`) is still in the tree but
   **retired**: nothing starts it. In exchange for g7sim's extras, the board gains a real
   **G6 transmitter mode** (a 6-character id, G6 calibration, a 2-hour warm-up and a 10-day
   session), signal loss with backfill, skip warm-up, and the full sensor-state table.
-- **g7sim's interface is kept where it can be**: the panel is at `/g7`, and `/status`,
+- **g7sim's interface is kept where it can be**: the panel is at `/cgm` (`/g7` redirects
+  there), and `/status`,
   `/glucose`, `/new` and `/forget` stay exactly where g7sim has them, with g7sim's field
-  names and its JSON bodies. `/g7/status` and `/g7/command` are new (the panel uses them).
-  What the core cannot do is not faked: `code` is empty, `slots` is `{}` and
-  `glucoseMode.kind` is always `"fixed"`.
+  names and its JSON bodies. `/cgm/status` and `/cgm/command` are new (the panel uses them);
+  `/g7/status` and `/g7/command` behave identically. What the g7sim-shaped view cannot do is
+  not faked: `code` is empty, `slots` is `{}` and `glucoseMode.kind` is always `"fixed"`,
+  because that view carries one next reading. The core's own view reports the pattern.
 - **The honest costs of the swap**:
   - **Multi-display key slots are gone.** The core presents itself as already
     authenticated and bonded and keeps no per-display keys, so there is no slot table, no
@@ -647,21 +676,22 @@ Devices we want to add:
     time** (a phone and a watch) are served, without per-display keys; a third is refused.
   - **No pairing code.** g7sim's 4-digit code and J-PAKE handshake are gone; a G7 is found
     as `DXCMxx` and a G6 needs its transmitter id, as the real apps expect.
-  - **No sine or random-walk waveform.** The core holds **one next glucose and a trend**, so
-    `/glucose`'s `value` is the next reading and `trend` is how it moves; `sine`/`walk` and
-    their swing parameters are accepted and logged as not applied. The adapter does not
-    synthesize them.
-  - **`ONE+` and `Stelo` names are gone**: a G7 always advertises `DXCM`+id and a G6
+  - **The sine and walk patterns are an addition on top of ESP-Sim's core.** ESP-Sim's
+    core only ever held one next-reading value and a trend, so `/glucose`'s `value` and
+    `trend` remain its fixed path and that adapter still logs `sine`/`walk` as not applied.
+    The patterns themselves are set through the panel or `cgmSetPattern`, for both kinds.
+    `ONE+` and `Stelo` names are gone too: a G7 always advertises `DXCM`+id and a G6
     `Dexcom`+the id's last two characters, as ESP-Sim's reference does.
   - A board updated from the g7sim-era firmware migrates its saved sensor on first boot
-    (the id suffix, age, glucose and up to 3 hours of readings); the pairing code, slots,
-    calibration and waveform are dropped, each with a line on the console.
+    (the id suffix, age, glucose, pattern and up to 3 hours of readings); the pairing code,
+    slots and calibration are dropped, each with a line on the console.
 - **The retired g7sim port** (`src/sensor.cpp`, `handler.cpp`, `crypto.cpp` and their
   headers) is kept in the tree for reference but left out of the build by
   `platformio.ini`'s `build_src_filter`, so it costs no flash and cannot be compiled back
   in by accident.
-- **Pages and the captive portal** are new here: `/` is a home page, `/g7` the CGM page,
-  `/pump` the pump page (`/pod` and `/medtrum` alias it), and `/settings` the board
+- **Pages and the captive portal** are new here: `/` is a home page, `/cgm` the CGM page
+  (`/g7` redirects there), `/pump` the pump page (`/pod` and `/medtrum` alias it),
+  and `/settings` the board
   (network, clock, firmware, reboot). The board's own access point answers as a captive
   portal and serves the Wi-Fi sheet at `/setup`; dismissing it sets a `setup=done` cookie.
   The failure-injection card is on the CGM page and on the selected pump's panel, backed by
@@ -672,7 +702,7 @@ Devices we want to add:
 | Path | What |
 |---|---|
 | `lib/dashpod/` | ESP-Sim's pod core with two commands added (GPL-3.0-or-later) |
-| `lib/cgmsim/` | ESP-Sim's portable Dexcom G6/G7 core, with one session per central (GPL-3.0-or-later) |
+| `lib/cgmsim/` | ESP-Sim's portable Dexcom G6/G7 core, with one session per central and the glucose-pattern generator (GPL-3.0-or-later) |
 | `lib/medtrumpatch/` | ESP-Sim's portable Medtrum patch core (GPL-3.0-or-later) |
 | `src/pod.cpp` | The pod's clock, storage and task |
 | `src/sensor_app.cpp` | The CGM's clock, storage and task |
@@ -689,7 +719,7 @@ Devices we want to add:
 | `src/settings_html.h` | The Settings page (Network, pump read-out, Board) |
 | `src/setup_html.h` | The captive-portal Wi‑Fi sheet |
 | `src/adv_payload.h` | The pure builders for the three advertising payloads and the name field |
-| `test/cgm/` | Host tests for the CGM core |
+| `test/cgm/` | Host tests for the CGM core, including the fixed/sine/walk generator and save/restore |
 | `test/medtrum/` | Host tests for the Medtrum patch core |
 | `test/portal/` | Host tests for the captive-portal decision |
 | `test/fail/` | Host tests for the failure-injection state |
