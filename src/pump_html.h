@@ -62,7 +62,7 @@ static const char pumpHTML[] PROGMEM = R"PUMPHTML(<!doctype html>
 <nav>
   <span class="brand">ESP-Sim</span>
   <a href="/">Home</a>
-  <a href="/g7">CGM</a>
+  <a href="/cgm">CGM</a>
   <a class="active" href="/pump">Pump</a>
   <a href="/settings">Settings</a>
 </nav>

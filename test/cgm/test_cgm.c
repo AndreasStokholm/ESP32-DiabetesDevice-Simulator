@@ -1102,6 +1102,157 @@ static void test_drop_all_sessions(void)
     CHECK(fk.advertising);
 }
 
+/* The glucose pattern generator: pure, deterministic, shared by both kinds. */
+static void test_patterns(void)
+{
+    /* Fixed stays put (and keeps the manual trend when one is set). */
+    cgm_pattern_t fixed = {CGM_PATTERN_FIXED, 123, 0, 0, 0};
+    for (uint32_t n = 0; n < 50; n++) {
+        cgm_next_reading_t r = cgm_pattern_next(&fixed, 123, n);
+        CHECK(r.glucose == 123);
+        CHECK(r.trend == 0);
+    }
+    fixed.trend = -10;
+    CHECK(cgm_pattern_next(&fixed, 123, 7).glucose == 123);
+    CHECK(cgm_pattern_next(&fixed, 123, 7).trend == -10);
+
+    /* Sine: one 60-minute period is 12 readings. The wave stays inside
+     * 150 +/- 50, hits both limits, and comes back to the same value after a
+     * full period. */
+    cgm_pattern_t sine = {CGM_PATTERN_SINE, 150, 0, 50, 60};
+    cgm_next_reading_t seq[13];
+    seq[0] = cgm_pattern_next(&sine, 0, 0);
+    for (uint32_t n = 1; n <= 12; n++) {
+        seq[n] = cgm_pattern_next(&sine, seq[n - 1].glucose, n);
+    }
+    for (uint32_t n = 0; n <= 12; n++) {
+        CHECK(seq[n].glucose >= 100 && seq[n].glucose <= 200);
+    }
+    CHECK(seq[0].glucose == 150); /* the mean at phase 0 */
+    CHECK(seq[3].glucose == 200); /* +amplitude at a quarter period */
+    CHECK(seq[6].glucose == 150); /* back through the mean at half */
+    CHECK(seq[9].glucose == 100); /* -amplitude at three quarters */
+    CHECK(seq[12].glucose == seq[0].glucose); /* a full period repeats */
+    for (uint32_t n = 1; n <= 12; n++) {
+        int delta = (int)seq[n].glucose - (int)seq[n - 1].glucose;
+        CHECK(delta == 0 ? seq[n].trend == 0 : (delta > 0) == (seq[n].trend > 0));
+    }
+    CHECK(seq[1].trend > 0); /* rising away from the mean */
+    CHECK(seq[4].trend < 0); /* falling after the peak */
+    /* The period parameter is honoured: 120 minutes makes the peak at n = 6. */
+    sine.period_minutes = 120;
+    seq[0] = cgm_pattern_next(&sine, 0, 0);
+    for (uint32_t n = 1; n <= 12; n++) {
+        seq[n] = cgm_pattern_next(&sine, seq[n - 1].glucose, n);
+    }
+    CHECK(seq[6].glucose == 200);
+    CHECK(seq[12].glucose == 150);
+
+    /* Walk: every step moves toward the target, never overshoots it, and stays
+     * inside the 40..400 range until it arrives. */
+    cgm_pattern_t walk = {CGM_PATTERN_WALK, 300, 0, 0, 0};
+    uint16_t prev = 120;
+    for (uint32_t n = 0; n < 100; n++) {
+        cgm_next_reading_t r = cgm_pattern_next(&walk, prev, n);
+        CHECK(r.glucose >= 40 && r.glucose <= 400);
+        if (n > 0 && prev != 300) {
+            CHECK(abs((int)r.glucose - 300) < abs((int)prev - 300));
+        }
+        if (r.glucose != prev) {
+            CHECK((r.glucose > prev) == (300 > prev));
+            CHECK((r.trend > 0) == (r.glucose > prev));
+        }
+        prev = r.glucose;
+    }
+    CHECK(prev == 300); /* it arrives, and then stays */
+    walk.value = 60;
+    prev = 300;
+    for (uint32_t n = 0; n < 100; n++) {
+        cgm_next_reading_t r = cgm_pattern_next(&walk, prev, n);
+        CHECK(r.glucose >= 40 && r.glucose <= 400);
+        if (n > 0 && prev != 60) {
+            CHECK(abs((int)r.glucose - 60) < abs((int)prev - 60));
+        }
+        if (r.glucose != prev) {
+            CHECK((r.glucose > prev) == (60 > prev));
+            CHECK((r.trend > 0) == (r.glucose > prev));
+        }
+        prev = r.glucose;
+    }
+    CHECK(prev == 60);
+
+    /* The pattern is part of the core state, so a saved blob keeps it and the
+     * next reading after a restore is identical. */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_t st;
+    cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
+    CHECK(st.version == CGM_STATE_VERSION);
+    st.warmup_done = fk.now;
+    st.pattern = CGM_PATTERN_SINE;
+    st.glucose = 150;
+    st.amplitude = 50;
+    st.period_minutes = 60;
+    static cgm_t c, restored;
+    cgm_init(&c, &st, &fio);
+    cgm_tick(&c);
+    CHECK(c.st.n_hist == 1 && c.st.hist[0].glucose == 150);
+    CHECK(c.st.hist[0].trend == 0); /* the first reading has no previous reading */
+    CHECK(c.st.pattern == CGM_PATTERN_SINE && c.st.amplitude == 50 && c.st.period_minutes == 60);
+    cgm_state_t saved = c.st; /* what sensor_app puts in its NVS blob */
+    CHECK(saved.version == CGM_STATE_VERSION);
+    cgm_init(&restored, &saved, &fio);
+    CHECK(restored.st.pattern == CGM_PATTERN_SINE);
+    CHECK(restored.st.amplitude == 50 && restored.st.period_minutes == 60);
+    fk.now += CGM_READING_INTERVAL;
+    cgm_tick(&c);
+    cgm_tick(&restored);
+    CHECK(c.st.n_hist == 2 && restored.st.n_hist == 2);
+    CHECK(restored.st.hist[1].glucose == c.st.hist[1].glucose);
+    CHECK(restored.st.hist[1].trend == c.st.hist[1].trend);
+
+    /* The first OK reading after warm-up sits behind a warm-up entry with no
+     * glucose. It must report no trend, not one faked from the walk's 120
+     * starting point (the production sentinel path, not the pure function). */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_set_pattern(&c, &sine);
+    cgm_tick(&c); /* the warm-up reading, glucose 0 */
+    CHECK(c.st.n_hist == 1 && c.st.hist[0].glucose == 0);
+    cgm_skip_warmup(&c);
+    fk.now += 1;
+    cgm_tick(&c);
+    const cgm_reading_t *first_ok = &c.st.hist[c.st.n_hist - 1];
+    CHECK(first_ok->state == CGM_STATE_OK && first_ok->glucose > 0);
+    CHECK(first_ok->trend == 0);
+
+    /* Both kinds run through the same generator: a sine is not the static
+     * glucose the core had before, and the panel's status names it. */
+    const cgm_kind_t kinds[2] = {CGM_G6, CGM_G7};
+    for (int k = 0; k < 2; k++) {
+        memset(&fk, 0, sizeof fk);
+        fk.now = 1800000000 + k * 86400;
+        cgm_state_fresh(&st, kinds[k], kinds[k] == CGM_G6 ? "81AB7Q" : NULL, fk.now);
+        st.warmup_done = fk.now;
+        cgm_init(&c, &st, &fio);
+        cgm_set_pattern(&c, &sine);
+        cgm_tick(&c);
+        bool varied = false;
+        for (int i = 0; i < 12; i++) {
+            fk.now += CGM_READING_INTERVAL;
+            cgm_tick(&c);
+            const cgm_reading_t *last = &c.st.hist[c.st.n_hist - 1];
+            if (last->glucose != 150) varied = true;
+        }
+        CHECK(varied);
+        char js[700];
+        size_t n = cgm_status_json(&c, js, sizeof js);
+        CHECK(n > 0 && strstr(js, "\"pattern\":\"sine\""));
+    }
+}
+
 static void test_status(void)
 {
     static cgm_t c;
@@ -1110,11 +1261,22 @@ static void test_status(void)
     fk.now = 1800000000;
     cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
     cgm_init(&c, &st, &fio);
+    cgm_tick(&c); /* the warm-up reading has no glucose and must report no trend */
+    char warm[700];
+    size_t wn = cgm_status_json(&c, warm, sizeof warm);
+    CHECK(wn > 0);
+    const char *warm_last = strstr(warm, "\"last\":{");
+    CHECK(warm_last && strstr(warm_last, "\"trend\":null"));
+    cgm_set_glucose(&c, 100, -20);
+    cgm_skip_warmup(&c);
+    fk.now += 1;
     cgm_tick(&c);
-    char js[600];
+    char js[700];
     size_t n = cgm_status_json(&c, js, sizeof js);
     CHECK(n > 0 && js[0] == '{' && js[n - 1] == '}');
     CHECK(strstr(js, "\"kind\":7") && strstr(js, "\"name\":\"DXCM"));
+    const char *last = strstr(js, "\"last\":{");
+    CHECK(last && strstr(last, "\"trend\":-20"));
     cgm_new_sensor(&c, CGM_G6, "81AB7Q");
     CHECK(c.st.kind == CGM_G6 && strcmp(c.st.id, "81AB7Q") == 0 && c.st.n_hist == 0);
     cgm_new_sensor(&c, CGM_OFF, NULL);
@@ -1138,5 +1300,6 @@ void test_cgm_all(void)
     test_advertise();
     test_bad_session();
     test_drop_all_sessions();
+    test_patterns();
     test_status();
 }

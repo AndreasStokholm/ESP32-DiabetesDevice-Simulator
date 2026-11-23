@@ -1,9 +1,9 @@
 #pragma once
-// The CGM's control panel (the board's own page at /g7). It talks to the
-// portable CGM core through /g7/status and /g7/command: the kind (Dexcom G6
-// transmitter, Dexcom G7 sensor, off), a G6 transmitter id, the next reading
-// and its trend, a calibration, the forced algorithm state, and the failure
-// knob the radio applies.
+// The CGM's control panel (the board's own page at /cgm). It talks to the
+// portable CGM core through /cgm/status and /cgm/command: the kind (Dexcom G6
+// transmitter, Dexcom G7 sensor, off), a G6 transmitter id, the glucose pattern
+// (fixed, a sine, or a walk), a calibration, the forced algorithm state, and the
+// failure knob the radio applies.
 static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
 <html lang="en">
 <head>
@@ -46,6 +46,7 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
   button.primary { background:var(--accent); border-color:var(--accent); color:#0b0d10; font-weight:600; }
   button.danger:hover { border-color:var(--bad); }
   .muted { color:var(--mut); font-size:13px; }
+  [hidden] { display:none !important; }
   footer { max-width:760px; margin:0 auto; padding:4px 16px 24px; color:var(--mut); font-size:12px; }
 </style>
 </head>
@@ -53,7 +54,7 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
 <nav>
   <span class="brand">ESP-Sim</span>
   <a href="/">Home</a>
-  <a class="active" href="/g7">CGM</a>
+  <a class="active" href="/cgm">CGM</a>
   <a href="/pump">Pump</a>
   <a href="/settings">Settings</a>
 </nav>
@@ -103,23 +104,35 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
 
   <div class="card">
     <h2>Glucose</h2>
+    <div class="seg" id="pattern">
+      <button type="button" data-pattern="fixed">Fixed</button>
+      <button type="button" data-pattern="sine">Wave</button>
+      <button type="button" data-pattern="walk">Random walk</button>
+    </div>
     <div class="row">
       <div>
-        <label>Next reading (mg/dL)</label>
+        <label id="valueLabel" for="glucoseIn">Next reading (mg/dL)</label>
         <input type="number" id="glucoseIn" min="40" max="400" step="1" value="120">
         <input type="range" id="glucoseRange" min="40" max="400" step="1" value="120">
       </div>
-      <div>
-        <label>Trend (mg/dL per minute)</label>
+      <div id="trendWrap">
+        <label for="trendIn">Trend (mg/dL per minute)</label>
         <input type="number" id="trendIn" min="-12.7" max="12.6" step="0.1" value="0">
+      </div>
+      <div class="sineOnly" hidden>
+        <label for="amplitudeIn">Wave amplitude (&plusmn; mg/dL)</label>
+        <input type="number" id="amplitudeIn" min="0" max="180" step="1" value="50">
+      </div>
+      <div class="sineOnly" hidden>
+        <label for="periodIn">Wave period (minutes)</label>
+        <input type="number" id="periodIn" min="10" max="1440" step="1" value="240">
       </div>
     </div>
     <div style="margin-top:14px; display:flex; align-items:center; gap:12px">
       <button class="primary" id="applyGlucose">Apply</button>
       <span class="muted" id="glucoseMsg"></span>
     </div>
-    <div class="muted" style="margin-top:10px">The core holds one next reading and a trend: the next reading is set to this glucose and then moves by the trend each 5 minutes. 
-    g7sim's sine and random walk are not in the core.</div>
+    <div class="muted" style="margin-top:10px">Fixed: the next reading is this value, then it moves by the trend every 5 minutes. Wave: a sine around the mean. Random walk: each reading steps toward the target. The pattern is the same for a G6 and a G7.</div>
   </div>
 
   <div class="card">
@@ -148,7 +161,7 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
     <div style="margin-top:12px; display:flex; align-items:center; gap:12px">
       <span class="muted" id="stateMsg"></span>
     </div>
-    <div class="muted" style="margin-top:8px">Any non-normal state is sent as-is and the error states report no glucose; 0 lets the core derive it from the sensor's age. Another state can be posted to /g7/command.</div>
+    <div class="muted" style="margin-top:8px">Any non-normal state is sent as-is and the error states report no glucose; 0 lets the core derive it from the sensor's age. Another state can be posted to /cgm/command.</div>
   </div>
 
   <div class="card">
@@ -189,16 +202,44 @@ const KIND = {0:"off", 6:"Dexcom G6 transmitter", 7:"Dexcom G7 sensor"};
 const STATE = {1:["stopped","bad"],2:["warm-up","warn"],6:["ok","ok"],16:["session failure","bad"],
   18:["temporary issue","warn"],24:["expired","bad"],25:["sensor failed","bad"],26:["session ended","bad"]};
 let s = {};
+let pattern = 'fixed';
+let patternDirty = false;
+// The board's /cgm/status carries `now` and `nextReading` as Unix seconds on the
+// core's clock, not the browser's. Keep those two numbers here; performance.now()
+// only interpolates between polls, so neither the browser clock nor NTP skew can
+// move the countdown. Nothing is rounded to whole minutes.
+let countdown = null;
 
 function ago(sec){ if(sec==null) return "—"; if(sec<0) sec=0;
   if(sec<60) return Math.round(sec)+"s"; if(sec<3600) return Math.round(sec/60)+"m";
   if(sec<172800) return Math.round(sec/3600)+"h"; return (sec/86400).toFixed(1)+"d"; }
 
+function countdownText(){
+  if (!countdown) return '—';
+  const left = countdown.next - countdown.now - (performance.now() - countdown.at)/1000;
+  const secs = Math.max(0, Math.ceil(left));
+  const m = Math.floor(secs / 60), s = secs % 60;
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function renderWindow(){
+  const el = document.getElementById('window');
+  if (!s.kind) {
+    el.textContent = 'the CGM is off: it neither advertises nor serves a reading';
+    return;
+  }
+  const when = (s.warmupLeftSeconds||0) > 0 ? 'warm-up ends in '+ago(s.warmupLeftSeconds)
+                                            : 'next reading in '+countdownText();
+  el.textContent = when
+    + ' · ' + (s.signalLoss ? 'signal loss: not advertising' : s.advertising ? 'advertising for a phone' : 'quiet')
+    + ' · ' + (s.connected ? 'a phone has the link' : 'no phone');
+}
+
 async function cmd(body, msg, done){
   const el = document.getElementById(msg);
   el.textContent = 'Applying…';
   try {
-    const r = await fetch('/g7/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const r = await fetch('/cgm/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const t = await r.text();
     if(!r.ok) throw new Error(t.trim());
     el.textContent = done;
@@ -209,13 +250,29 @@ async function cmd(body, msg, done){
 
 function sync(id, val){ const el = document.getElementById(id); if(document.activeElement !== el) el.value = val; }
 
+function showPattern(kind){
+  document.querySelectorAll('#pattern button').forEach(b=>b.classList.toggle('active', b.dataset.pattern===kind));
+  document.querySelectorAll('.sineOnly').forEach(el=>{ el.hidden = kind!=='sine'; });
+  document.getElementById('trendWrap').hidden = kind!=='fixed';
+  document.getElementById('valueLabel').textContent = kind==='sine' ? 'Mean (mg/dL)' : kind==='walk' ? 'Target (mg/dL)' : 'Next reading (mg/dL)';
+}
+
+document.querySelectorAll('#pattern button').forEach(b=>b.onclick=()=>{
+  pattern = b.dataset.pattern; patternDirty = true; showPattern(pattern);
+});
+
 document.querySelectorAll('#kind button').forEach(b=>b.onclick=()=>
   cmd({command:'cgmSetKind', kind:+b.dataset.kind}, 'kindMsg', 'Set'));
 document.getElementById('applyId').onclick = ()=>cmd({command:'cgmSetId', id:document.getElementById('g6id').value.trim()}, 'sensorMsg', 'Id set');
 document.getElementById('newSensor').onclick = ()=>cmd({command:'cgmNewSensor', kind:(s.kind||7)}, 'sensorMsg', 'New sensor started');
-document.getElementById('applyGlucose').onclick = ()=>cmd({command:'cgmSetGlucose',
-  glucose:+document.getElementById('glucoseIn').value,
-  trend:Math.round(+document.getElementById('trendIn').value*10)}, 'glucoseMsg', 'Applied ✓');
+document.getElementById('applyGlucose').onclick = async ()=>{ patternDirty = false;
+  const body = {command:'cgmSetPattern', pattern: pattern, value:+document.getElementById('glucoseIn').value};
+  if (pattern === 'fixed') body.trend = Math.round(+document.getElementById('trendIn').value*10);
+  if (pattern === 'sine') {
+    body.amplitude = +document.getElementById('amplitudeIn').value;
+    body.periodMinutes = +document.getElementById('periodIn').value;
+  }
+  await cmd(body, 'glucoseMsg', 'Applied ✓'); };
 document.getElementById('calApply').onclick = ()=>cmd({command:'cgmSetCalibration',
   glucose:+document.getElementById('calIn').value}, 'glucoseMsg', 'Calibrated ✓');
 document.getElementById('algostate').onchange = ()=>cmd({command:'cgmSetState',
@@ -227,7 +284,7 @@ document.getElementById('glucoseIn').oninput = e=>{ document.getElementById('glu
 document.getElementById('glucoseRange').oninput = e=>{ document.getElementById('glucoseIn').value = e.target.value; };
 
 async function refresh(){
-  let st; try { st = await (await fetch('/g7/status')).json(); } catch(e){ return; }
+  let st; try { st = await (await fetch('/cgm/status')).json(); } catch(e){ return; }
   s = st;
   document.getElementById('name').textContent = st.name || 'CGM';
   document.getElementById('model').textContent = KIND[st.kind] || 'CGM';
@@ -238,18 +295,16 @@ async function refresh(){
   const last = st.last;
   const g = last && last.glucose ? last.glucose : (st.glucose || null);
   document.getElementById('glucose').textContent = (!st.kind || g==null) ? '—' : g;
-  const tr = (st.trend||0)/10;
+  const shownTrend = last && last.glucose && last.trend != null ? last.trend : st.trend;
+  const tr = (shownTrend||0)/10;
   document.getElementById('trend').textContent = st.kind ? (tr>0?'+':'')+tr.toFixed(1)+'/min' : '';
   const sb = STATE[st.state] || ['state '+(st.state==null?'?':st.state),''];
   const lab = document.getElementById('statelabel');
   lab.textContent = st.kind ? sb[0] : 'off';
   lab.className = 'state ' + (st.kind ? sb[1] : '');
-  const nextIn = st.nextReading ? Math.round((st.nextReading - st.now)/60) : null;
-  document.getElementById('window').textContent = st.kind
-    ? ((st.warmupLeftSeconds>0 ? 'warm-up ends in '+ago(st.warmupLeftSeconds) : 'next reading in '+(nextIn==null?'—':nextIn+' min'))
-       + ' · ' + (st.signalLoss ? 'signal loss: not advertising' : st.advertising ? 'advertising for a phone' : 'quiet')
-       + ' · ' + (st.connected ? 'a phone has the link' : 'no phone'))
-    : 'the CGM is off: it neither advertises nor serves a reading';
+  countdown = st.kind && st.nextReading != null && st.now != null
+    ? { next: st.nextReading, now: st.now, at: performance.now() } : null;
+  renderWindow();
   document.querySelectorAll('#kind button').forEach(b=>b.classList.toggle('active', +b.dataset.kind === st.kind));
   sync('g6id', st.kind===6 ? (st.id||'') : '');
   document.getElementById('g6id').disabled = st.kind!==6;
@@ -261,6 +316,10 @@ async function refresh(){
   sync('glucoseIn', st.glucose||120);
   sync('glucoseRange', st.glucose||120);
   sync('trendIn', ((st.trend||0)/10).toFixed(1));
+  sync('amplitudeIn', st.amplitude ?? 50);
+  sync('periodIn', st.periodMinutes ?? 240);
+  if (!patternDirty) pattern = st.pattern || 'fixed';
+  showPattern(pattern);
   document.getElementById('algostate').value = st.forcedState || 0;
 }
 
@@ -282,7 +341,7 @@ document.getElementById('failApply').onclick = ()=>fail({device:'g7',
   delayMs:+document.getElementById('failDelay').value,
   ignore:+document.getElementById('failIgnore').value}, 'Failure set');
 document.getElementById('failClear').onclick = ()=>fail({device:'g7', drop:false, refuse:0, quietMs:0, delayMs:0, ignore:0}, 'Failures cleared');
-refresh(); setInterval(refresh, 2000);
+refresh(); setInterval(refresh, 2000); setInterval(renderWindow, 1000);
 </script>
 </body>
 </html>)HTML";

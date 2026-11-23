@@ -22,8 +22,8 @@ extern "C" {
 // that name: the CGM is reached through this namespace only.
 
 namespace sensor {
-#define SENSOR_STATE_MAGIC 0x43474d31u /* "CGM1" */
-#define SENSOR_STATE_VERSION 1u
+#define SENSOR_STATE_MAGIC 0x43474d32u /* "CGM2" */
+#define SENSOR_STATE_VERSION 2u
 
 // What survives a reboot: the whole core state (identity, activation, the
 // panel's glucose/trend and the 3-hour reading history), and the clock's
@@ -43,7 +43,7 @@ void begin();
 // Starts serving phones. Call once the radio is up.
 void start();
 
-// The control panel's /g7 status JSON (the core's, plus the radio's own view
+// The control panel's /cgm status JSON (the core's, plus the radio's own view
 // of the link and the sensor's age).
 std::string statusJson();
 // One control-panel command ({"command": ...}); returns an error message, or

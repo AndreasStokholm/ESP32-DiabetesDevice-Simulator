@@ -11,7 +11,7 @@
 // paired to it, for therapy.
 //
 // Control: the USB serial console (type `help`) and the web pages: the home
-// page at /, the CGM's at /g7 and the pod's at /pod. With no Wi-Fi network saved,
+// page at /, the CGM's at /cgm and the pod's at /pod. With no Wi-Fi network saved,
 // the board runs its own access point (name and password are printed at boot)
 // and answers every HTTP probe as a captive portal, so a phone that joins it
 // gets the Wi-Fi sheet at /setup.
@@ -97,7 +97,7 @@ static const char* applyNewCgm(int kind, long ageMinutes) {
 // auto-authenticates) and no per-display slots (it bonds every phone), so
 // `code` is "" and `slots` is {}. It keeps one next glucose and a trend, not
 // g7sim's waveforms, so `glucoseMode.kind` is "fixed". The core's own view is
-// under `cgm`, and the panel reads /g7/status rather than this.
+// under `cgm`, and the panel reads /cgm/status rather than this.
 static void buildStatus(JsonDocument& d) {
   JsonDocument core;
   if (deserializeJson(core, String(sensor::statusJson().c_str()))) return;
@@ -126,8 +126,9 @@ static void buildStatus(JsonDocument& d) {
     o["time"] = (uint32_t)((last["t"] | 0LL) - activated);
     if ((last["glucose"] | 0) > 0) {
       o["glucose"] = last["glucose"];
-      // As g7sim: a reading only carries a trend when it has a glucose value.
-      o["trend"] = (core["trend"] | 0) / 10.0;  // tenths of mg/dL per minute
+      // As g7sim: a reading only carries a trend when it has a glucose value;
+      // use the reading's own trend, not the configured fixed step.
+      if (!last["trend"].isNull()) o["trend"] = (last["trend"] | 0) / 10.0;  // tenths of mg/dL per minute
     }
     o["state"] = last["state"] | 0;
   }
@@ -341,6 +342,31 @@ static void sendPortalProbe() {
   }
 }
 
+// The CGM page and its API. /g7 is the old URL and stays as a redirect (the page)
+// and as aliases (the API), so a bookmark or a panel already open keeps working.
+static void sendCgmPage() {
+  web.send_P(200, "text/html; charset=utf-8", indexHTML);
+}
+
+static void redirectG7Page() {
+  web.sendHeader("Location", "/cgm");
+  web.send(302, "text/plain", "moved to /cgm\n");
+}
+
+static void sendCgmStatus() {
+  web.sendHeader("Cache-Control", "no-store");
+  web.send(200, "application/json", sensor::statusJson().c_str());
+}
+
+static void sendCgmCommand() {
+  String body = web.arg("plain");
+  if (const char* err = sensor::command(body.c_str())) {
+    web.send(400, "text/plain", err);
+    return;
+  }
+  web.send(200, "application/json", sensor::statusJson().c_str());
+}
+
 static void startWeb() {
   // The captive portal's own pages.
   web.on("/", HTTP_GET, [] {
@@ -351,7 +377,8 @@ static void startWeb() {
     }
     web.send_P(200, "text/html; charset=utf-8", homeHTML);
   });
-  web.on("/g7", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", indexHTML); });
+  web.on("/cgm", HTTP_GET, sendCgmPage);
+  web.on("/g7", HTTP_GET, redirectG7Page);
   web.on("/setup", HTTP_GET, [] { web.send_P(200, "text/html; charset=utf-8", setupHTML); });
   web.on("/setup/wifi", HTTP_POST, sendWifiSaved);
   web.on("/setup/dismiss", HTTP_POST, [] {
@@ -474,21 +501,14 @@ static void startWeb() {
     web.send(200, "application/json", failStateJson());
   });
   web.on("/status", HTTP_GET, sendStatus);
-  // The CGM's panel and its own API (the new core, under /g7).
-  web.on("/g7/status", HTTP_GET, [] {
-    web.sendHeader("Cache-Control", "no-store");
-    web.send(200, "application/json", sensor::statusJson().c_str());
-  });
-  web.on("/g7/command", HTTP_POST, [] {
-    String body = web.arg("plain");
-    if (const char* err = sensor::command(body.c_str())) {
-      web.send(400, "text/plain", err);
-      return;
-    }
-    web.send(200, "application/json", sensor::statusJson().c_str());
-  });
+  // The CGM's panel and its own API (the new core, under /cgm, with /g7 as
+  // aliases that call the same handlers).
+  web.on("/cgm/status", HTTP_GET, sendCgmStatus);
+  web.on("/g7/status", HTTP_GET, sendCgmStatus);
+  web.on("/cgm/command", HTTP_POST, sendCgmCommand);
+  web.on("/g7/command", HTTP_POST, sendCgmCommand);
   // g7sim's four requests, unchanged at the root and with their field names:
-  // they are the same controls the panel's /g7/command takes.
+  // they are the same controls the panel's /cgm/command takes.
   web.on("/glucose", HTTP_POST, [] {
     JsonDocument j;
     if (deserializeJson(j, web.arg("plain")) || !j["kind"].is<const char*>()) {
