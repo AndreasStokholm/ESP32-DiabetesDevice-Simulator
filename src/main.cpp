@@ -126,8 +126,9 @@ static void buildStatus(JsonDocument& d) {
     o["time"] = (uint32_t)((last["t"] | 0LL) - activated);
     if ((last["glucose"] | 0) > 0) {
       o["glucose"] = last["glucose"];
-      // As g7sim: a reading only carries a trend when it has a glucose value.
-      o["trend"] = (core["trend"] | 0) / 10.0;  // tenths of mg/dL per minute
+      // As g7sim: a reading only carries a trend when it has a glucose value;
+      // use the reading's own trend, not the configured fixed step.
+      if (!last["trend"].isNull()) o["trend"] = (last["trend"] | 0) / 10.0;  // tenths of mg/dL per minute
     }
     o["state"] = last["state"] | 0;
   }

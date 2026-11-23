@@ -1205,6 +1205,12 @@ static void test_status(void)
     fk.now = 1800000000;
     cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
     cgm_init(&c, &st, &fio);
+    cgm_tick(&c); /* the warm-up reading has no glucose and must report no trend */
+    char warm[700];
+    size_t wn = cgm_status_json(&c, warm, sizeof warm);
+    CHECK(wn > 0);
+    const char *warm_last = strstr(warm, "\"last\":{");
+    CHECK(warm_last && strstr(warm_last, "\"trend\":null"));
     cgm_set_glucose(&c, 100, -20);
     cgm_skip_warmup(&c);
     fk.now += 1;
