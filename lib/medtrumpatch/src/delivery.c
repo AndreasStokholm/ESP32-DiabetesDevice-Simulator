@@ -421,6 +421,17 @@ void medtrum_patch_tick(medtrum_patch_t *p, int64_t now_ms)
      * temp basal runs, otherwise at the schedule. A halted patch (suspended or
      * stopped) draws nothing at all. */
     bool halted = medtrum_state_is_delivery_halted(p->status.state);
+    /* A resume that does not go through RESUME_PUMP (CLEAR_ALARM from a max
+     * suspension, the panel's set state or clear fault) leaves the old segment
+     * anchor behind; without this edge reset the first tick back would charge
+     * the whole halt. Start a fresh segment at the last tick instead, so only
+     * the span since then is drawn. RESUME_PUMP also resets via
+     * set_basal_status, which is harmless. */
+    if (!halted && p->delivery.was_halted) {
+        p->status.basal_delivery = 0;
+        p->status.basal_start_time = p->delivery.patch_time - elapsed;
+    }
+    p->delivery.was_halted = halted;
     if (!halted) {
         draw_basal(p);
     }

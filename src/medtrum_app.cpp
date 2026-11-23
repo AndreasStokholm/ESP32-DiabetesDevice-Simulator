@@ -38,6 +38,17 @@ static medtrum_request_t req;
 static SemaphoreHandle_t mu;
 static nvs_handle_t nvs;
 
+// The model as last committed to NVS, so the run loop can save the drift the
+// tick produces without a commit per tick.
+static medtrum_status_t savedStatus;
+static medtrum_delivery_t savedDelivery;
+static int64_t savedAtMs;
+
+// How often a tick may commit: the draw moves the reservoir every tick, but a
+// minute's lag after a hard reboot is honest and costs 1440 commits a day, where
+// a save per tick would wear the flash for nothing.
+#define TICK_SAVE_MS 60000
+
 // MARK: - The platform, as the patch core sees it
 
 static int64_t nowMs(void*) {
@@ -119,6 +130,9 @@ static void saveState() {
   esp_err_t err = nvs_set_blob(nvs, "state", &st, sizeof st);
   if (err == ESP_OK) err = nvs_commit(nvs);
   if (err != ESP_OK) logf("medtrum: could not save the patch state: %s", esp_err_to_name(err));
+  savedStatus = patch.status;
+  savedDelivery = patch.delivery;
+  savedAtMs = monoMs();
 }
 
 // A fresh patch identity, as the reference assigns on activation. The app
@@ -195,6 +209,15 @@ static void medtrumTask(void*) {
         }
       }
       if (sendStatus) statusLen = medtrum_patch_notification(&patch, statusPayload, sizeof statusPayload);
+      /* The tick moves the reservoir and the bolus/basal progress, which only a
+       * command path used to commit: a hard reboot would then restore a
+       * reservoir the patch no longer has. Commit that drift here at most once
+       * a minute, and only when it changed, so a tick does not wear the flash. */
+      if (monoMs() - savedAtMs >= TICK_SAVE_MS &&
+          (memcmp(&savedStatus, &patch.status, sizeof savedStatus) != 0 ||
+           memcmp(&savedDelivery, &patch.delivery, sizeof savedDelivery) != 0)) {
+        saveState();
+      }
     });
     for (int i = 0; i < count; i++) io.notify(io.ctx, frags[i].data, frags[i].len);
     if (statusLen > 0) radio::medtrumNotifyStatus(statusPayload, statusLen);
