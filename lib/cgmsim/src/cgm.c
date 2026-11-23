@@ -639,8 +639,12 @@ static void g6_control(cgm_t *c, cgm_session_t session, const uint8_t *p, size_t
         send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 17));
         break;
     }
-    case 0x09: /* disconnect */
-        c->io->disconnect(c->io->ctx, session);
+    case 0x09: /* the app ends its session; the link is NOT dropped */
+        /* A G6 keeps its connection for the whole session and pushes every new
+         * reading over it, so a disconnect here ended the link 0.45 s after the
+         * app authenticated and it never got a reading. Keep the link; the app
+         * reconnects when it wants to. */
+        logf_(c, "g6 opcode 0x09: session state, link kept");
         break;
     default:
         logf_(c, "ignoring control opcode 0x%02x", p[0]);
@@ -678,6 +682,10 @@ void cgm_on_write(cgm_t *c, cgm_session_t session, cgm_chr_t chr, const uint8_t 
             s->auth_value[2] = s->authed ? 0x01 : 0x02; /* bonded: no Bluetooth pairing is asked for */
             s->auth_len = 3;
             logf_(c, "app %s the G6 login", s->authed ? "passed" : "failed");
+            /* On success, hand the app the current reading at once: the pairing
+             * flow waits for a glucose and would otherwise sit until the next
+             * five-minute boundary (or give up). */
+            if (s->authed) push_glucose(c, session);
         }
         /* 06 keep-alive and 07 bond request need no answer. */
         return;

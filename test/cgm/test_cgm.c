@@ -474,10 +474,13 @@ static void test_g6_active(void)
     CHECK(fk.n_sent == 1 && fk.sent[0].p[0] == 0x29 && le32(fk.sent[0].p + 7) == 0xffffffff);
     CHECK(cgm_current_state(&c.st, fk.now) == CGM_STATE_STOPPED);
 
-    /* Disconnect message. */
+    /* 0x09 from the app: a G6 keeps its link (a real transmitter does), so this
+     * must NOT disconnect. It used to, 0.45 s after authentication, and the app
+     * never received a reading. */
     int d = fk.disconnects;
     cgm_on_write(&c, 0, CGM_CHR_CONTROL, (const uint8_t *)"\x09", 1);
-    CHECK(fk.disconnects == d + 1);
+    CHECK(fk.disconnects == d);
+    CHECK(c.sessions[0].connected);
 }
 
 static void test_two_sessions(void)
