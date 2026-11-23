@@ -141,7 +141,8 @@ void cgm_init(cgm_t *c, const cgm_state_t *st, const cgm_io_t *io);
 /* Call about once a second: makes readings, keeps a G6 advertising while it
  * is unconnected (a G7 opens and closes a window per reading), delivers a new
  * reading to each connected central that subscribed to CONTROL and has not
- * had it, and ends each idle session on its own. */
+ * had it, and ends each idle G7 session on its own (a G6 keeps its
+ * connection). */
 void cgm_tick(cgm_t *c);
 
 /* From the radio. session is the central's slot, 0 .. CGM_MAX_SESSIONS-1; an

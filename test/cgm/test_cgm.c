@@ -921,6 +921,16 @@ static void test_advertise(void)
     CHECK(c.window_end < fk.now);
     CHECK(fk.advertising);
 
+    /* A reading a phone collected and then left does not silence a G6. */
+    connect_n(&c, 0);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    CHECK(c.sessions[0].sent_glucose && c.st.delivered == c.st.hist[c.st.n_hist - 1].seq);
+    cgm_on_disconnect(&c, 0);
+    run(&c, 61);
+    CHECK(c.window_end < fk.now);
+    CHECK(fk.advertising);
+
     /* G7: the same reading, no connection. Its window still closes. */
     memset(&fk, 0, sizeof fk);
     fk.now = 1800000000;
@@ -1010,6 +1020,30 @@ static void test_drop_all_sessions(void)
     CHECK(c.sessions[0].delivered == 0 && c.sessions[1].delivered == 0);
     cgm_on_disconnect(&c, 0);
     cgm_on_disconnect(&c, 1);
+
+    /* G6: with the link kept, signal loss is the main way it ends. It drops
+     * both sessions, and nothing advertises until the loss is cleared. */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G6, "81AB7Q", fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_tick(&c);
+    CHECK(fk.advertising);
+    connect_n(&c, 0);
+    connect_n(&c, 1);
+    d0 = fk.disconnects_for[0];
+    d1 = fk.disconnects_for[1];
+    cgm_set_signal_loss(&c, true);
+    CHECK(fk.disconnects_for[0] == d0 + 1 && fk.disconnects_for[1] == d1 + 1);
+    cgm_on_disconnect(&c, 0);
+    cgm_on_disconnect(&c, 1);
+    cgm_tick(&c);
+    CHECK(!fk.advertising);
+    run(&c, 61);
+    CHECK(!fk.advertising);
+    cgm_set_signal_loss(&c, false);
+    cgm_tick(&c);
+    CHECK(fk.advertising);
 }
 
 static void test_status(void)
