@@ -427,10 +427,12 @@ static void test_g6_active(void)
     n = cgm_on_read(&c, 0, CGM_CHR_AUTH, v, sizeof v);
     CHECK_BYTES(v, n, AUTH_OK, 3);
 
-    /* Subscribing to control sends nothing unasked in active mode. */
+    /* Subscribing to control delivers the current reading at once. A real app
+     * logs in and then waits for the push instead of asking for the message. */
     clear_sent();
     cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
-    CHECK(fk.n_sent == 0);
+    CHECK(fk.n_sent == 2 && fk.sent[0].p[0] == 0x25 && fk.sent[1].p[0] == 0x4f);
+    clear_sent();
 
     /* Start the sensor 5 seconds after activation (startSensor). */
     fk.now += 10;
@@ -481,6 +483,57 @@ static void test_g6_active(void)
     cgm_on_write(&c, 0, CGM_CHR_CONTROL, (const uint8_t *)"\x09", 1);
     CHECK(fk.disconnects == d);
     CHECK(c.sessions[0].connected);
+}
+
+/* The real app's pairing: it logs in, subscribes to CONTROL, and then waits
+ * for the simulator to push a reading. The first arrives on the subscribe, the
+ * next on the tick that makes it; a second subscribe repeats nothing. */
+static void test_g6_pairing(void)
+{
+    static cgm_t c;
+    cgm_state_t st;
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G6, "81AB7Q", fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_skip_warmup(&c);
+    cgm_set_glucose(&c, 100, 0);
+    cgm_tick(&c);
+    const cgm_reading_t *r = &c.st.hist[c.st.n_hist - 1];
+    connect(&c);
+
+    /* Log in. The push must wait for the CONTROL subscription, because the app
+     * writes that CCCD only after the login. */
+    uint8_t tok[10] = {0x01, 1, 2, 3, 4, 5, 6, 7, 8, 0x02}, v[32], ch[9] = {0x04};
+    cgm_on_write(&c, 0, CGM_CHR_AUTH, tok, sizeof tok);
+    cgm_on_read(&c, 0, CGM_CHR_AUTH, v, sizeof v);
+    cgm_g6_hash("81AB7Q", v + 9, ch + 1);
+    clear_sent();
+    cgm_on_write(&c, 0, CGM_CHR_AUTH, ch, sizeof ch);
+    CHECK(c.sessions[0].authed && fk.n_sent == 0);
+
+    /* The subscribe delivers the current reading: time, then glucose. */
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    int t = find_session(CGM_CHR_CONTROL, 0x25, 0, 0);
+    int g = find_session(CGM_CHR_CONTROL, 0x4f, 0, 0);
+    CHECK(fk.n_sent == 2 && t == 0 && g == 1);
+    CHECK(g >= 0 && le32(fk.sent[g].p + 2) == r->seq);
+
+    /* Subscribing again must not repeat the same reading. */
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    CHECK(fk.n_sent == 0);
+
+    /* The next reading is pushed without the app asking for it. */
+    clear_sent();
+    run(&c, CGM_READING_INTERVAL);
+    const cgm_reading_t *next = &c.st.hist[c.st.n_hist - 1];
+    CHECK(next->seq == r->seq + 1);
+    t = find_session(CGM_CHR_CONTROL, 0x25, 0, 0);
+    g = find_session(CGM_CHR_CONTROL, 0x4f, 0, 0);
+    CHECK(fk.n_sent == 2 && t == 0 && g == 1);
+    CHECK(g >= 0 && le32(fk.sent[g].p + 2) == next->seq);
+    cgm_on_disconnect(&c, 0);
 }
 
 static void test_two_sessions(void)
@@ -1075,6 +1128,7 @@ void test_cgm_all(void)
     test_g7();
     test_g6_passive();
     test_g6_active();
+    test_g6_pairing();
     test_two_sessions();
     test_tick_delivery();
     test_slot_reuse();

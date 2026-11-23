@@ -355,10 +355,11 @@ void cgm_tick(cgm_t *c)
     bool undelivered = r && r->seq != st->delivered;
     /* A connected central that asked for CONTROL notifications gets a reading it
      * has not had, whether it was made this tick or it only subscribed after
-     * the reading was made. Active mode asks for each message itself. */
+     * the reading was made. Authentication is not a reason to stop: the real
+     * app logs in and still expects a pushed reading every five minutes. */
     for (int i = 0; i < CGM_MAX_SESSIONS; i++) {
         const cgm_session_state_t *s = &c->sessions[i];
-        if (s->connected && s->control_on && !s->authed) {
+        if (s->connected && s->control_on) {
             push_glucose(c, (cgm_session_t)i);
         }
     }
@@ -539,9 +540,8 @@ void cgm_on_subscribe(cgm_t *c, cgm_session_t session, cgm_chr_t chr, bool on)
         break;
     }
     case CGM_CHR_CONTROL:
-        if (!s->authed) { /* active mode asks for each message itself */
-            push_glucose(c, session);
-        }
+        /* Sent below, once the CCCD is actually on and a notification can
+         * reach the app. */
         break;
     case CGM_CHR_BACKFILL:
         send_backfill(c, session);
@@ -549,6 +549,11 @@ void cgm_on_subscribe(cgm_t *c, cgm_session_t session, cgm_chr_t chr, bool on)
     default:
         break;
     }
+    /* The app subscribes to CONTROL and only then waits for a reading: hand it
+     * the current one here, so a pairing flow does not sit until the next
+     * five-minute boundary. A repeat subscribe is a no-op: push_glucose knows
+     * this connection already has the reading. */
+    if (on && chr == CGM_CHR_CONTROL) push_glucose(c, session);
 }
 
 static void session_reply(cgm_t *c, cgm_session_t session, uint8_t op, uint32_t requested, int64_t now)
@@ -682,10 +687,8 @@ void cgm_on_write(cgm_t *c, cgm_session_t session, cgm_chr_t chr, const uint8_t 
             s->auth_value[2] = s->authed ? 0x01 : 0x02; /* bonded: no Bluetooth pairing is asked for */
             s->auth_len = 3;
             logf_(c, "app %s the G6 login", s->authed ? "passed" : "failed");
-            /* On success, hand the app the current reading at once: the pairing
-             * flow waits for a glucose and would otherwise sit until the next
-             * five-minute boundary (or give up). */
-            if (s->authed) push_glucose(c, session);
+            /* No reading here: the app subscribes to CONTROL after the login,
+             * so the push belongs in cgm_on_subscribe. */
         }
         /* 06 keep-alive and 07 bond request need no answer. */
         return;
