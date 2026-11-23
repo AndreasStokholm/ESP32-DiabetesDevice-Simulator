@@ -128,7 +128,7 @@ typedef struct {
     cgm_session_state_t sessions[CGM_MAX_SESSIONS];
     /* Advertising. */
     bool advertising;
-    int64_t window_end;
+    int64_t window_end; /* CGM_G7: the 60 s window closes here */
 } cgm_t;
 
 /* A fresh G6 transmitter (id NULL: a random one) or G7 sensor, started now. */
@@ -138,9 +138,10 @@ void cgm_name(const cgm_state_t *st, char out[16]);
 bool cgm_valid_g6_id(const char *id);
 
 void cgm_init(cgm_t *c, const cgm_state_t *st, const cgm_io_t *io);
-/* Call about once a second: makes readings, opens and closes the advertising
- * window, delivers a new reading to each connected central that subscribed to
- * CONTROL and has not had it, and ends each idle session on its own. */
+/* Call about once a second: makes readings, keeps a G6 advertising while it
+ * is unconnected (a G7 opens and closes a window per reading), delivers a new
+ * reading to each connected central that subscribed to CONTROL and has not
+ * had it, and ends each idle session on its own. */
 void cgm_tick(cgm_t *c);
 
 /* From the radio. session is the central's slot, 0 .. CGM_MAX_SESSIONS-1; an

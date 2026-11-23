@@ -360,7 +360,11 @@ void cgm_tick(cgm_t *c)
         }
     }
     if (!any_connected(c)) {
-        advertise(c, undelivered && !st->signal_loss && now < c->window_end);
+        /* A G6 transmitter advertises for as long as no central is connected.
+         * A G7 opens a window per reading and closes it. Signal loss silences
+         * both on purpose. */
+        bool want = st->kind == CGM_G6 ? true : undelivered && now < c->window_end;
+        advertise(c, want && !st->signal_loss);
     }
     /* A session that has its reading and has gone quiet is hung up on its own;
      * a central still collecting does not hold another central's link open. */
