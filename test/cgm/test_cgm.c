@@ -735,9 +735,10 @@ static void test_address_rotate(void)
 }
 
 /* A lone central's reading-boundary delivery and hang-up, as README documents:
- * the tick that makes a new reading sends it before the idle hang-up, and the
- * reconnect still gets the latest reading again (the same seq may be seen
- * twice). This is what the old single session sent nothing for. */
+ * for a G7 the tick that makes a new reading sends it before the idle hang-up,
+ * and the reconnect still gets the latest reading again (the same seq may be
+ * seen twice). A G6 keeps the link instead. This is what the old single
+ * session sent nothing for. */
 static void test_single_boundary(void)
 {
     static cgm_t c;
@@ -801,8 +802,169 @@ static void test_single_boundary(void)
     CHECK(fk.sent[0].session == 0 && fk.sent[0].chr == CGM_CHR_CONTROL && fk.sent[0].p[0] == 0x25);
     CHECK(fk.sent[1].session == 0 && fk.sent[1].chr == CGM_CHR_CONTROL && fk.sent[1].p[0] == 0x4f);
     CHECK(c.sessions[0].delivered == next_seq);
-    CHECK(fk.disconnects_for[0] == 1);
+    CHECK(fk.disconnects_for[0] == 0); /* a G6 keeps the link */
     cgm_on_disconnect(&c, 0);
+}
+
+/* A G6 keeps the link it has and pushes each reading on it; a G7 is hung up
+ * after it has collected its reading. */
+static void test_hangup(void)
+{
+    static cgm_t c;
+    cgm_state_t st;
+
+    /* G6: two sessions connect, take the current reading, stay quiet past the
+     * idle timeout and the connection cap, and still get the next reading. */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G6, "81AB7Q", fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_set_glucose(&c, 110, 0);
+    cgm_tick(&c);
+    uint32_t first_seq = c.st.hist[c.st.n_hist - 1].seq;
+    connect_n(&c, 0);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    int g = find_session(CGM_CHR_CONTROL, 0x4f, 0, 0);
+    CHECK(g >= 0 && le32(fk.sent[g].p + 2) == first_seq);
+    CHECK(c.sessions[0].sent_glucose && c.sessions[0].delivered == first_seq);
+
+    /* Past both IDLE_END and CONN_MAX: no hang-up. */
+    run(&c, 31);
+    CHECK(fk.disconnects_for[0] == 0);
+    CHECK(c.sessions[0].connected);
+
+    /* A second session joins and gets the cached reading too. */
+    connect_n(&c, 1);
+    clear_sent();
+    cgm_on_subscribe(&c, 1, CGM_CHR_CONTROL, true);
+    g = find_session(CGM_CHR_CONTROL, 0x4f, 0, 1);
+    CHECK(g >= 0 && le32(fk.sent[g].p + 2) == first_seq);
+    CHECK(c.sessions[1].sent_glucose && c.sessions[1].delivered == first_seq);
+
+    /* The next reading reaches both sessions on the same links. */
+    clear_sent();
+    run(&c, CGM_READING_INTERVAL - 31);
+    uint32_t next_seq = c.st.hist[c.st.n_hist - 1].seq;
+    CHECK(next_seq == first_seq + 1);
+    g = find_session(CGM_CHR_CONTROL, 0x4f, 0, 0);
+    CHECK(g >= 0 && le32(fk.sent[g].p + 2) == next_seq);
+    g = find_session(CGM_CHR_CONTROL, 0x4f, 0, 1);
+    CHECK(g >= 0 && le32(fk.sent[g].p + 2) == next_seq);
+    CHECK(count_session(CGM_CHR_CONTROL, 0) == 2); /* time, then glucose */
+    CHECK(count_session(CGM_CHR_CONTROL, 1) == 2);
+    CHECK(c.sessions[0].connected && c.sessions[1].connected);
+    CHECK(fk.disconnects_for[0] == 0 && fk.disconnects_for[1] == 0);
+
+    /* A G7 still collects one reading per link and is hung up on. */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_tick(&c);
+    connect_n(&c, 0);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    CHECK(find_session(CGM_CHR_CONTROL, 0x4e, 0, 0) >= 0);
+    run(&c, 2);
+    CHECK(fk.disconnects_for[0] == 0); /* still collecting: IDLE_END not reached */
+    run(&c, 1);
+    CHECK(fk.disconnects_for[0] == 1); /* hung up after its reading */
+    CHECK(fk.last_disconnect == 0);
+}
+
+/* A G6 advertises for as long as it is unconnected; only a G7 closes its
+ * window and waits for the next reading. Signal loss silences both. */
+static void test_advertise(void)
+{
+    static cgm_t c;
+    cgm_state_t st;
+
+    /* G6: one reading and no connection. The 60 s window is long gone. */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G6, "81AB7Q", fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_set_glucose(&c, 120, 0);
+    cgm_tick(&c);
+    CHECK(c.st.n_hist == 1 && fk.advertising);
+    CHECK(strcmp(fk.adv_name, "Dexcom7Q") == 0);
+    run(&c, 61);
+    CHECK(c.window_end < fk.now); /* the window closed at 60 s */
+    CHECK(fk.advertising);        /* but a G6 is still there */
+
+    /* As close to five minutes after its last reading as the 5-minute reading
+     * grid allows (299 s; the next reading is one second away): the old core
+     * went silent at 60 s. */
+    run(&c, CGM_READING_INTERVAL - 1 - 61);
+    CHECK(fk.now - (int64_t)c.st.hist[c.st.n_hist - 1].t == CGM_READING_INTERVAL - 1);
+    CHECK(c.window_end < fk.now);
+    CHECK(fk.advertising);
+    /* The next reading's window opens and closes; the G6 never goes away. */
+    run(&c, 1);
+    CHECK(fk.now - (int64_t)c.st.hist[c.st.n_hist - 1].t == 0);
+    CHECK(fk.advertising);
+    run(&c, 61);
+    CHECK(c.window_end < fk.now);
+    CHECK(fk.advertising);
+
+    /* Signal loss is authoritative, G6 included; clearing it advertises again. */
+    cgm_set_signal_loss(&c, true);
+    cgm_tick(&c);
+    CHECK(!fk.advertising);
+    run(&c, CGM_READING_INTERVAL);
+    CHECK(!fk.advertising);
+    cgm_set_signal_loss(&c, false);
+    cgm_tick(&c);
+    CHECK(fk.advertising);
+    run(&c, 61);
+    CHECK(c.window_end < fk.now);
+    CHECK(fk.advertising);
+
+    /* A reading a phone collected and then left does not silence a G6. */
+    connect_n(&c, 0);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    CHECK(c.sessions[0].sent_glucose && c.st.delivered == c.st.hist[c.st.n_hist - 1].seq);
+    cgm_on_disconnect(&c, 0);
+    run(&c, 61);
+    CHECK(c.window_end < fk.now);
+    CHECK(fk.advertising);
+
+    /* G7: the same reading, no connection. Its window still closes. */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_tick(&c);
+    CHECK(c.st.n_hist == 1 && fk.advertising);
+    run(&c, 61);
+    CHECK(c.window_end < fk.now);
+    CHECK(!fk.advertising); /* reading 1 missed */
+    run(&c, CGM_READING_INTERVAL - 1 - 61);
+    CHECK(fk.now - (int64_t)c.st.hist[c.st.n_hist - 1].t == CGM_READING_INTERVAL - 1);
+    CHECK(!fk.advertising); /* a G7 in the G6's state is not advertising */
+    /* The next reading opens a window, and it closes again: unchanged. */
+    run(&c, 1);
+    CHECK(fk.now - (int64_t)c.st.hist[c.st.n_hist - 1].t == 0);
+    CHECK(fk.advertising);
+    run(&c, 61);
+    CHECK(c.window_end < fk.now);
+    CHECK(!fk.advertising);
+
+    /* Signal loss stops a G7 too, and it stays off until the next window. */
+    cgm_set_signal_loss(&c, true);
+    cgm_tick(&c);
+    CHECK(!fk.advertising);
+    run(&c, CGM_READING_INTERVAL);
+    CHECK(!fk.advertising);
+    cgm_set_signal_loss(&c, false);
+    cgm_tick(&c);
+    CHECK(!fk.advertising); /* a G7 waits for the next reading's window */
+    for (int i = 0; i < CGM_READING_INTERVAL && !fk.advertising; i++) {
+        run(&c, 1);
+    }
+    CHECK(fk.advertising);
 }
 
 static void test_bad_session(void)
@@ -858,6 +1020,30 @@ static void test_drop_all_sessions(void)
     CHECK(c.sessions[0].delivered == 0 && c.sessions[1].delivered == 0);
     cgm_on_disconnect(&c, 0);
     cgm_on_disconnect(&c, 1);
+
+    /* G6: with the link kept, signal loss is the main way it ends. It drops
+     * both sessions, and nothing advertises until the loss is cleared. */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G6, "81AB7Q", fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_tick(&c);
+    CHECK(fk.advertising);
+    connect_n(&c, 0);
+    connect_n(&c, 1);
+    d0 = fk.disconnects_for[0];
+    d1 = fk.disconnects_for[1];
+    cgm_set_signal_loss(&c, true);
+    CHECK(fk.disconnects_for[0] == d0 + 1 && fk.disconnects_for[1] == d1 + 1);
+    cgm_on_disconnect(&c, 0);
+    cgm_on_disconnect(&c, 1);
+    cgm_tick(&c);
+    CHECK(!fk.advertising);
+    run(&c, 61);
+    CHECK(!fk.advertising);
+    cgm_set_signal_loss(&c, false);
+    cgm_tick(&c);
+    CHECK(fk.advertising);
 }
 
 static void test_status(void)
@@ -891,6 +1077,8 @@ void test_cgm_all(void)
     test_slot_reuse();
     test_address_rotate();
     test_single_boundary();
+    test_hangup();
+    test_advertise();
     test_bad_session();
     test_drop_all_sessions();
     test_status();

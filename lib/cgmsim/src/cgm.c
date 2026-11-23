@@ -25,9 +25,9 @@
 #define G6_SESSION (10 * 86400)
 #define G7_WARMUP (27 * 60)
 #define G7_SESSION (10 * 86400 + 12 * 3600) /* 10 days, and the 12-hour grace period */
-#define WINDOW 60    /* seconds of advertising per reading */
-#define IDLE_END 3   /* seconds of quiet, once the reading is out, before hanging up */
-#define CONN_MAX 30  /* seconds a connection may last */
+#define WINDOW 60    /* G7: seconds of advertising per reading */
+#define IDLE_END 3   /* G7: seconds of quiet, once the reading is out, before hanging up */
+#define CONN_MAX 30  /* G7: seconds a connection may last */
 #define NO_TREND 0x7f
 
 static const char ID_CHARS[] = "0123456789ABCDEFGHJKLMNPQRSTUVWXYZ";
@@ -329,7 +329,8 @@ void cgm_init(cgm_t *c, const cgm_state_t *st, const cgm_io_t *io)
     memset(c, 0, sizeof *c);
     c->st = *st;
     c->io = io;
-    /* After a restart, offer an unsent reading at once. */
+    /* After a restart, offer an unsent reading at once. Only a G7 reads this;
+     * a G6 advertises regardless, so the value is harmless there. */
     c->window_end = io->now(io->ctx) + WINDOW;
 }
 
@@ -346,6 +347,8 @@ void cgm_tick(cgm_t *c)
         make_reading(c, n, now);
         st->next_n = n + 1;
         save(c);
+        /* A G7's window. A G6 never reads window_end, so writing it there is
+         * harmless. */
         c->window_end = now + WINDOW;
     }
     const cgm_reading_t *r = latest(c);
@@ -360,18 +363,26 @@ void cgm_tick(cgm_t *c)
         }
     }
     if (!any_connected(c)) {
-        advertise(c, undelivered && !st->signal_loss && now < c->window_end);
+        /* A G6 transmitter advertises for as long as no central is connected.
+         * A G7 opens a window per reading and closes it. Signal loss silences
+         * both on purpose. */
+        bool want = st->kind == CGM_G6 || (undelivered && now < c->window_end);
+        advertise(c, want && !st->signal_loss);
     }
-    /* A session that has its reading and has gone quiet is hung up on its own;
-     * a central still collecting does not hold another central's link open. */
-    for (int i = 0; i < CGM_MAX_SESSIONS; i++) {
-        const cgm_session_state_t *s = &c->sessions[i];
-        if (!s->connected) {
-            continue;
-        }
-        if ((s->sent_glucose && now - s->last_activity >= IDLE_END) || now - s->connected_at >= CONN_MAX) {
-            logf_(c, "hanging up");
-            c->io->disconnect(c->io->ctx, (cgm_session_t)i);
+    /* A G7 collects one reading per link: once it has its reading and has gone
+     * quiet it is hung up on, and no G7 link outlives CONN_MAX. A G6 keeps the
+     * link it has and pushes every reading on it; signal loss and a new sensor
+     * end its sessions elsewhere. */
+    if (st->kind == CGM_G7) {
+        for (int i = 0; i < CGM_MAX_SESSIONS; i++) {
+            const cgm_session_state_t *s = &c->sessions[i];
+            if (!s->connected) {
+                continue;
+            }
+            if ((s->sent_glucose && now - s->last_activity >= IDLE_END) || now - s->connected_at >= CONN_MAX) {
+                logf_(c, "hanging up");
+                c->io->disconnect(c->io->ctx, (cgm_session_t)i);
+            }
         }
     }
 }
