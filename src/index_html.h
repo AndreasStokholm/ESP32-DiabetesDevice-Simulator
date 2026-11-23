@@ -1,6 +1,6 @@
 #pragma once
-// The CGM's control panel (the board's own page at /g7). It talks to the
-// portable CGM core through /g7/status and /g7/command: the kind (Dexcom G6
+// The CGM's control panel (the board's own page at /cgm). It talks to the
+// portable CGM core through /cgm/status and /cgm/command: the kind (Dexcom G6
 // transmitter, Dexcom G7 sensor, off), a G6 transmitter id, the next reading
 // and its trend, a calibration, the forced algorithm state, and the failure
 // knob the radio applies.
@@ -53,7 +53,7 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
 <nav>
   <span class="brand">ESP-Sim</span>
   <a href="/">Home</a>
-  <a class="active" href="/g7">CGM</a>
+  <a class="active" href="/cgm">CGM</a>
   <a href="/pump">Pump</a>
   <a href="/settings">Settings</a>
 </nav>
@@ -148,7 +148,7 @@ static const char indexHTML[] PROGMEM = R"HTML(<!doctype html>
     <div style="margin-top:12px; display:flex; align-items:center; gap:12px">
       <span class="muted" id="stateMsg"></span>
     </div>
-    <div class="muted" style="margin-top:8px">Any non-normal state is sent as-is and the error states report no glucose; 0 lets the core derive it from the sensor's age. Another state can be posted to /g7/command.</div>
+    <div class="muted" style="margin-top:8px">Any non-normal state is sent as-is and the error states report no glucose; 0 lets the core derive it from the sensor's age. Another state can be posted to /cgm/command.</div>
   </div>
 
   <div class="card">
@@ -198,7 +198,7 @@ async function cmd(body, msg, done){
   const el = document.getElementById(msg);
   el.textContent = 'Applying…';
   try {
-    const r = await fetch('/g7/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const r = await fetch('/cgm/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const t = await r.text();
     if(!r.ok) throw new Error(t.trim());
     el.textContent = done;
@@ -227,7 +227,7 @@ document.getElementById('glucoseIn').oninput = e=>{ document.getElementById('glu
 document.getElementById('glucoseRange').oninput = e=>{ document.getElementById('glucoseIn').value = e.target.value; };
 
 async function refresh(){
-  let st; try { st = await (await fetch('/g7/status')).json(); } catch(e){ return; }
+  let st; try { st = await (await fetch('/cgm/status')).json(); } catch(e){ return; }
   s = st;
   document.getElementById('name').textContent = st.name || 'CGM';
   document.getElementById('model').textContent = KIND[st.kind] || 'CGM';

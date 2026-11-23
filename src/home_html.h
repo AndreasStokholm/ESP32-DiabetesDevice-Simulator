@@ -37,15 +37,15 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
 <nav>
   <span class="brand">ESP-Sim</span>
   <a class="active" href="/">Home</a>
-  <a href="/g7">CGM</a>
+  <a href="/cgm">CGM</a>
   <a href="/pump">Pump</a>
   <a href="/settings">Settings</a>
 </nav>
 <main>
   <div class="banner" id="wallclock">No wall clock: NTP never ran.<a href="/setup">Set up Wi-Fi &rarr;</a></div>
-  <a class="card" href="/g7">
+  <a class="card" href="/cgm">
     <div class="t"><span id="cgmTitle">CGM</span><span class="go">Open &rarr;</span></div>
-    <div class="s"><span class="dot" id="g7dot"></span><span id="g7line">--</span></div>
+    <div class="s"><span class="dot" id="cgmdot"></span><span id="cgmline">--</span></div>
   </a>
   <a class="card" href="/pump">
     <div class="t"><span id="pumpTitle">Pump</span><span class="go">Open &rarr;</span></div>
@@ -81,19 +81,19 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
     return r.json();
   }
 
-  async function pollG7() {
+  async function pollCgm() {
     try {
-      // The CGM's own view (/g7/status): the kind, name, reading and state. The
+      // The CGM's own view (/cgm/status): the kind, name, reading and state. The
       // g7sim-shaped /status has no code or display slots to show any more.
-      const s = await get('/g7/status');
+      const s = await get('/cgm/status');
       set('cgmTitle', CGM_KINDS[s.kind] || 'CGM');
       const glucose = s.last && s.last.glucose ? s.last.glucose + ' mg/dL' : '--';
       const st = CGM_STATES[s.state] || ('state ' + s.state);
-      set('g7line', (s.name || '--') + ' · ' + glucose + ' · ' + st + (s.signalLoss ? ' · signal loss' : ''));
-      dot('g7dot', (s.kind && s.state === 6 && s.last && s.last.glucose) ? 'ok' : 'warn');
+      set('cgmline', (s.name || '--') + ' · ' + glucose + ' · ' + st + (s.signalLoss ? ' · signal loss' : ''));
+      dot('cgmdot', (s.kind && s.state === 6 && s.last && s.last.glucose) ? 'ok' : 'warn');
     } catch (err) {
-      set('g7line', '--');
-      dot('g7dot', '');
+      set('cgmline', '--');
+      dot('cgmdot', '');
     }
   }
 
@@ -140,7 +140,7 @@ static const char homeHTML[] PROGMEM = R"HTML(<!doctype html>
   }
 
   async function poll() {
-    await pollG7();
+    await pollCgm();
     await pollPump();
   }
 
