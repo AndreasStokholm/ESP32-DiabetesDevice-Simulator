@@ -749,8 +749,13 @@ const char* command(const std::string& json) {
         return "periodMinutes is 10 to 1440";
       }
     }
+    cgm_pattern_t p = {};
+    p.kind = pattern;
+    p.value = (uint16_t)value;
+    p.trend = (int8_t)trend;
+    p.amplitude = (uint16_t)amplitude;
+    p.period_minutes = (uint16_t)period;
     LOCKED({
-      cgm_pattern_t p = {pattern, (uint16_t)value, (int8_t)trend, (uint16_t)amplitude, (uint16_t)period};
       cgm_set_pattern(&c, &p);
       persistNowLocked();
     });
