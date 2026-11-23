@@ -11,10 +11,11 @@ CFLAGS ?= -O1 -g
 WARN := -Wall -Wextra -Werror
 CFLAGS += -std=c11 -D_DEFAULT_SOURCE -I$(MED)/include -I.
 
-all: medtrum_tests adv_payload_tests serial_tests
+all: medtrum_tests adv_payload_tests serial_tests draw_tests
 	./medtrum_tests
 	./adv_payload_tests
 	./serial_tests
+	./draw_tests
 
 medtrum_tests: $(SRCS) $(wildcard $(MED)/include/*.h) test.h
 	$(CC) $(CFLAGS) $(WARN) -o $@ $(SRCS)
@@ -29,7 +30,12 @@ adv_payload_tests: test_adv_payload.c ../../src/adv_payload.h
 serial_tests: test_serial.c ../../src/medtrum_serial.h $(wildcard $(MED)/src/*.c)
 	$(CC) $(CFLAGS) $(WARN) -I../../src -o $@ test_serial.c $(wildcard $(MED)/src/*.c)
 
+# The reservoir draw: a bolus consumes the reservoir in pulses, by the
+# increment each tick delivers.
+draw_tests: test_draw.c $(wildcard $(MED)/src/*.c) $(wildcard $(MED)/include/*.h) test.h
+	$(CC) $(CFLAGS) $(WARN) -o $@ test_draw.c $(wildcard $(MED)/src/*.c)
+
 clean:
-	rm -f medtrum_tests adv_payload_tests serial_tests
+	rm -f medtrum_tests adv_payload_tests serial_tests draw_tests
 
 .PHONY: all clean

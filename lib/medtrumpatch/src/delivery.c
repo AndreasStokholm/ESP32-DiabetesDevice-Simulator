@@ -312,6 +312,68 @@ int medtrum_patch_command(medtrum_patch_t *p, uint8_t command, uint8_t sequence,
     }
 }
 
+/* The notification packs the basal rate and the delivered pulses into one
+ * 24-bit value: the rate in the low 12 bits, the pulses in the next 12. */
+#define BASAL_DELIVERY_MAX 0x0fff
+
+/* A basal rate is in pulses of 0.05 U per HOUR, the patch clock counts
+ * seconds and the reservoir counts whole pulses, so a span of seconds draws
+ * seconds * rate / 3600 pulses, truncated. The pump can only deliver a
+ * complete 0.05 U pulse: a span shorter than 3600/rate seconds draws nothing
+ * yet. That fraction is not lost between ticks because the count is always
+ * recomputed from the start of the current basal segment, not added up tick by
+ * tick; only the increase over what the segment has already drawn is charged
+ * to the reservoir, so a repeated tick cannot double-count. */
+static void draw_basal_span(medtrum_patch_t *p, uint32_t from, uint32_t to, uint16_t rate)
+{
+    if (rate == 0 || to <= from) {
+        return;
+    }
+    uint64_t pulses = (uint64_t)(to - from) * rate / 3600;
+    uint64_t drawn = p->status.basal_delivery;
+    bool clamped = false;
+    if (pulses > drawn) {
+        uint32_t increment = (uint32_t)(pulses - drawn);
+        if (increment > p->status.reservoir) {
+            /* Only what is left in the reservoir can be delivered. */
+            increment = p->status.reservoir;
+            clamped = true;
+        }
+        p->status.reservoir = (uint16_t)(p->status.reservoir - increment);
+        drawn += increment;
+    }
+    if (drawn > BASAL_DELIVERY_MAX) {
+        drawn = BASAL_DELIVERY_MAX;
+        clamped = true; /* the 12 delivery bits cannot hold any more */
+    }
+    p->status.basal_delivery = (uint16_t)drawn;
+
+    /* Start a fresh segment at this second when the count filled its 12 bits,
+     * or when the reservoir could not meet the span. Forgetting the shortfall
+     * is deliberate: an empty reservoir must not build a backlog that a refill
+     * would then deliver in one burst. */
+    if (clamped || p->status.basal_delivery >= BASAL_DELIVERY_MAX) {
+        p->status.basal_delivery = 0;
+        p->status.basal_start_time = to;
+    }
+}
+
+/* Basal delivery for the pump seconds up to this tick, at the temp rate while
+ * a temp basal runs and at the schedule otherwise. */
+static void draw_basal(medtrum_patch_t *p)
+{
+    uint32_t from = p->status.basal_start_time;
+    uint32_t to = p->delivery.patch_time;
+    uint16_t rate = p->delivery.scheduled_rate;
+    if (p->delivery.temp_end != 0) {
+        rate = p->delivery.temp_rate;
+        if (to > p->delivery.temp_end) {
+            to = p->delivery.temp_end; /* the tick ends the temp basal */
+        }
+    }
+    draw_basal_span(p, from, to, rate);
+}
+
 void medtrum_patch_tick(medtrum_patch_t *p, int64_t now_ms)
 {
     if (p->delivery.last_ms == INT64_MIN) {
@@ -328,22 +390,65 @@ void medtrum_patch_tick(medtrum_patch_t *p, int64_t now_ms)
     }
     p->delivery.patch_time += elapsed;
 
-    /* A bolus runs at 1.5 U/min: 0.5 pulses a second, one pulse every two. */
+    /* A bolus runs at 1.5 U/min: 0.5 pulses a second, one pulse every two.
+     * The reservoir is charged the INCREMENT since the last tick, never the
+     * running total, so a repeated tick cannot deliver the same pulse twice. */
     if (p->delivery.bolus_active) {
-        uint32_t delivered = (p->delivery.patch_time - p->delivery.bolus_start) / 2;
-        if (delivered >= p->delivery.bolus_total) {
-            delivered = p->delivery.bolus_total;
+        uint32_t pulses = (p->delivery.patch_time - p->delivery.bolus_start) / 2;
+        if (pulses >= p->delivery.bolus_total) {
+            pulses = p->delivery.bolus_total;
             p->delivery.bolus_active = false;
             p->status.bolus_completed = true;
         }
-        p->status.bolus_delivered = (uint16_t)delivered;
+        uint16_t delivered = (uint16_t)pulses;
+        uint16_t increment = delivered > p->status.bolus_delivered
+                                 ? (uint16_t)(delivered - p->status.bolus_delivered)
+                                 : 0;
+        if (increment > p->status.reservoir) {
+            /* Only what is left in the reservoir can be delivered. */
+            increment = p->status.reservoir;
+        }
+        p->status.reservoir = (uint16_t)(p->status.reservoir - increment);
+        p->status.bolus_delivered = (uint16_t)(p->status.bolus_delivered + increment);
+        if (p->status.reservoir == 0 && p->delivery.bolus_active) {
+            /* A real patch reports an empty reservoir rather than pumping
+             * air, so the bolus stops here, short of its total. */
+            p->delivery.bolus_active = false;
+        }
+    }
+
+    /* Basal draws too, in the same pump-time step: at the temp rate while a
+     * temp basal runs, otherwise at the schedule. A halted patch (suspended or
+     * stopped) draws nothing at all. */
+    bool halted = medtrum_state_is_delivery_halted(p->status.state);
+    /* A resume that does not go through RESUME_PUMP (CLEAR_ALARM from a max
+     * suspension, the panel's set state or clear fault) leaves the old segment
+     * anchor behind; without this edge reset the first tick back would charge
+     * the whole halt. Start a fresh segment at the last tick instead, so only
+     * the span since then is drawn. RESUME_PUMP also resets via
+     * set_basal_status, which is harmless. */
+    if (!halted && p->delivery.was_halted) {
+        p->status.basal_delivery = 0;
+        p->status.basal_start_time = p->delivery.patch_time - elapsed;
+    }
+    p->delivery.was_halted = halted;
+    if (!halted) {
+        draw_basal(p);
     }
 
     /* A temp basal ends on its own. */
     if (p->delivery.temp_end != 0 && p->delivery.patch_time >= p->delivery.temp_end) {
+        uint32_t ended = p->delivery.temp_end;
         p->delivery.temp_end = 0;
         p->delivery.temp_rate = 0;
         set_basal_status(p, MEDTRUM_BASAL_STANDARD, p->delivery.scheduled_rate);
+        /* The schedule resumed when the temp ended, not at this tick, so the
+         * new segment is anchored there and the seconds since are drawn at the
+         * scheduled rate. */
+        p->status.basal_start_time = ended;
+        if (!halted) {
+            draw_basal_span(p, ended, p->delivery.patch_time, p->delivery.scheduled_rate);
+        }
     }
 
     if (p->status.mask & MEDTRUM_MASK_AGE) {
@@ -351,6 +456,7 @@ void medtrum_patch_tick(medtrum_patch_t *p, int64_t now_ms)
     }
 }
 
+/* Absolute, not a decrement: the control panel's "set the reservoir". */
 void medtrum_patch_set_reservoir(medtrum_patch_t *p, uint16_t pulses)
 {
     p->status.reservoir = pulses;

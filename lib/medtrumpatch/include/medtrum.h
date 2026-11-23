@@ -323,7 +323,9 @@ enum {
 
 /* The delivery model. The commands project it into `status`, and
  * medtrum_patch_tick keeps the clock, the bolus progress, the temp basal and
- * the patch age moving. */
+ * the patch age moving. Delivery consumes the reservoir in `status`: each tick
+ * subtracts the pulses it newly delivered (bolus and basal), and an empty
+ * reservoir stops the bolus short of its total. */
 typedef struct {
     uint8_t patch_id[4];      /* the active patch's id */
     uint32_t patch_time;      /* the patch's clock, Medtrum seconds */
@@ -337,6 +339,7 @@ typedef struct {
     uint16_t bolus_total;     /* pulses */
     uint32_t bolus_start;     /* Medtrum seconds */
     bool bolus_active;
+    bool was_halted;          /* the previous tick saw a halted state */
     uint16_t storage_sequence;
     uint16_t max_hourly;      /* pulses */
     uint16_t max_daily;       /* pulses */
@@ -384,7 +387,16 @@ int medtrum_patch_command(medtrum_patch_t *p, uint8_t command, uint8_t sequence,
                           size_t content_len, medtrum_frag_t *frags, size_t max_frags);
 
 /* Advances the patch clock, the bolus progress, the temp basal and the patch
- * age. `now_ms` is the platform's wall clock; the first call only records it. */
+ * age. `now_ms` is the platform's wall clock; the first call only records it.
+ * Delivery drains `status.reservoir` in pulses of 0.05 U, charging only the
+ * pulses each tick newly delivers (never the running total): a running bolus at
+ * 1.5 U/min, and the basal at the temp rate or the schedule. Both clamp at
+ * zero. An empty reservoir stops a running bolus without setting
+ * `bolus_completed` or changing `state` (this simulator changes numbers, not
+ * the base's frames), so the app sees a bolus that neither progresses nor
+ * completes. A halted patch (suspended or stopped) draws no basal, and the
+ * first tick after it resumes starts a fresh basal segment rather than charging
+ * the whole halt. */
 void medtrum_patch_tick(medtrum_patch_t *p, int64_t now_ms);
 
 /* Direct setters, for the control panel and for tests. */

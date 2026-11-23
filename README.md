@@ -17,9 +17,11 @@ starts as a Dexcom G7 and an Omnipod 5.
 It builds on two projects:
 
 - the pod and the Medtrum patch are [nightscout/ESP-Sim](https://github.com/nightscout/ESP-Sim)'s
-  **portable C cores**, unmodified: `lib/dashpod` (commit `26c5219`, plus loopkit/pod's
-  `ignoreNextMessages` and `failNextConnects` commands) and `lib/medtrumpatch`, each with
-  small Arduino/PlatformIO glue;
+  **portable C cores**: `lib/dashpod` (commit `26c5219`, plus loopkit/pod's
+  `ignoreNextMessages` and `failNextConnects` commands) unmodified, and
+  `lib/medtrumpatch` with one deliberate change — it now consumes its reservoir as it
+  delivers, bolus and basal (see [Differences](#differences-from-the-originals)) — each
+  with small Arduino/PlatformIO glue;
 - the CGM is ESP-Sim's portable G6/G7 core, `lib/cgmsim`, with one deliberate change: it
   keeps a **session per central** so a phone and a watch can read at the same time, which
   ESP-Sim's single-session core cannot (see
@@ -442,15 +444,18 @@ The host suites need only `cc` and `make` (no PlatformIO, no board):
 | Command | What it covers |
 |---|---|
 | `make -C test/cgm` | The CGM core: ESP-Sim's checks adapted to the per-session API, plus two-session cases |
-| `make -C test/medtrum` | The Medtrum patch core |
+| `make -C test/medtrum` | The Medtrum patch core; `test_draw.c` covers the reservoir draw for bolus and basal |
 | `make -C test/fail` | The failure-injection decisions (drop, refuse, quiet, delay, ignore) for each device |
 | `make -C test/portal` | The captive-portal probe and redirect decision |
 
 The items that need a board: the NimBLE wiring (`src/radio.cpp`), the CGM's NVS
-blob and its g7sim-state migration (`src/sensor_app.cpp`), and the panels. They
-depend on the Arduino platform (NimBLE, Preferences/NVS, LittleFS, ArduinoJson),
-so they are exercised on a board; a host test for them would first need the
-platform split behind a fake-able interface.
+blob and its g7sim-state migration (`src/sensor_app.cpp`), the Medtrum glue
+(`src/medtrum_app.cpp` and the patch's side of `src/radio.cpp`: the three-way
+advertising rotation, the WRITE/READ notify routing and the NVS round-trip) and
+the panels. They depend on the Arduino platform (NimBLE, Preferences/NVS,
+LittleFS, ArduinoJson), so they are exercised on a board; a host test for them
+would first need the platform split behind a fake-able interface. The portable
+cores' host suites above cover the protocol and the delivery model, not the glue.
 
 ## Failure injection
 
@@ -518,7 +523,8 @@ reading by the core itself.
 ## Good to know
 
 - All three simulators keep their state in flash: a reboot is the same CGM, pod and
-  patch, still paired.
+  patch, still paired. The patch's reservoir and delivery progress are committed about a
+  minute behind, so a hard reboot can restore a reservoir a minute stale.
 - The CGM keeps its own clock: a reboot continues the sensor's age, and NTP is not needed
   for it. Without NTP, the pod's and patch's clocks pause while the board is unplugged.
 - In the app the pod may briefly show as reconnecting after each CGM reading. That's the
@@ -575,6 +581,25 @@ Devices we want to add:
   The patch's panel is the pump page at `/pump` (the Medtrum patch choice), its host tests
   run with `make -C test/medtrum`, and its controls are the panel and `/medtrum/command`
   (there is no console command prefix for it).
+- **The Medtrum base consumes its reservoir as it delivers**, which ESP-Sim's core does
+  not: it reports a bolus and a basal without ever drawing the reservoir, so a simulator
+  built on it shows a patch that never runs low. Here `medtrum_patch_tick` charges
+  `status.reservoir` in pulses of 0.05 U — the bolus at 1.5 U/min and the basal at the
+  scheduled or temp rate, which draws nothing while the patch is suspended (and is not
+  charged for the halt when it resumes, by whichever path: `RESUME_PUMP`, `CLEAR_ALARM`,
+  the panel's set state or its clear fault). Each tick charges only the **increment** it
+  newly delivers, never the running total, so a repeated or coarse tick cannot
+  double-count, and the draw clamps at zero. An empty reservoir stops a running bolus
+  there, and deliberately reports no more than that: `bolus_completed` stays false, the
+  state is not switched to the base's empty-reservoir state and no alarm is raised, so the
+  app sees a bolus that stops progressing — this port moves numbers, not the state field.
+  A basal rate is in pulses per *hour* while the patch clock
+  counts seconds and the reservoir counts whole pulses, so a span is truncated to whole
+  pulses and the fraction is carried in the segment rather than dropped; that rounding is
+  documented in `lib/medtrumpatch/src/delivery.c`. The wire is untouched — no frame the
+  base sends changes shape, only the numbers it reports. The ported `test/medtrum.c` is
+  still **byte-identical** to ESP-Sim's; the new cases live in `test/medtrum/test_draw.c`,
+  which `make -C test/medtrum` builds and runs alongside the ported suite.
 - **The CGM is ESP-Sim's core, no longer byte-identical.** `lib/cgmsim` is ESP-Sim's
   portable G6/G7 protocol with one deliberate change: ESP-Sim keeps **one session** (one
   `connected`, one login, one delivery cursor), which cannot give a phone and a watch each
