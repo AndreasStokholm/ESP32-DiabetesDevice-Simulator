@@ -1131,6 +1131,7 @@ static void test_patterns(void)
     fk.now = 1800000000;
     cgm_state_t st;
     cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
+    CHECK(st.version == CGM_STATE_VERSION);
     st.warmup_done = fk.now;
     st.pattern = CGM_PATTERN_SINE;
     st.glucose = 150;
@@ -1140,8 +1141,10 @@ static void test_patterns(void)
     cgm_init(&c, &st, &fio);
     cgm_tick(&c);
     CHECK(c.st.n_hist == 1 && c.st.hist[0].glucose == 150);
+    CHECK(c.st.hist[0].trend == 0); /* the first reading has no previous reading */
     CHECK(c.st.pattern == CGM_PATTERN_SINE && c.st.amplitude == 50 && c.st.period_minutes == 60);
     cgm_state_t saved = c.st; /* what sensor_app puts in its NVS blob */
+    CHECK(saved.version == CGM_STATE_VERSION);
     cgm_init(&restored, &saved, &fio);
     CHECK(restored.st.pattern == CGM_PATTERN_SINE);
     CHECK(restored.st.amplitude == 50 && restored.st.period_minutes == 60);
@@ -1151,6 +1154,23 @@ static void test_patterns(void)
     CHECK(c.st.n_hist == 2 && restored.st.n_hist == 2);
     CHECK(restored.st.hist[1].glucose == c.st.hist[1].glucose);
     CHECK(restored.st.hist[1].trend == c.st.hist[1].trend);
+
+    /* The first OK reading after warm-up sits behind a warm-up entry with no
+     * glucose. It must report no trend, not one faked from the walk's 120
+     * starting point (the production sentinel path, not the pure function). */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_set_pattern(&c, &sine);
+    cgm_tick(&c); /* the warm-up reading, glucose 0 */
+    CHECK(c.st.n_hist == 1 && c.st.hist[0].glucose == 0);
+    cgm_skip_warmup(&c);
+    fk.now += 1;
+    cgm_tick(&c);
+    const cgm_reading_t *first_ok = &c.st.hist[c.st.n_hist - 1];
+    CHECK(first_ok->state == CGM_STATE_OK && first_ok->glucose > 0);
+    CHECK(first_ok->trend == 0);
 
     /* Both kinds run through the same generator: a sine is not the static
      * glucose the core had before, and the panel's status names it. */
@@ -1185,11 +1205,16 @@ static void test_status(void)
     fk.now = 1800000000;
     cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
     cgm_init(&c, &st, &fio);
+    cgm_set_glucose(&c, 100, -20);
+    cgm_skip_warmup(&c);
+    fk.now += 1;
     cgm_tick(&c);
-    char js[600];
+    char js[700];
     size_t n = cgm_status_json(&c, js, sizeof js);
     CHECK(n > 0 && js[0] == '{' && js[n - 1] == '}');
     CHECK(strstr(js, "\"kind\":7") && strstr(js, "\"name\":\"DXCM"));
+    const char *last = strstr(js, "\"last\":{");
+    CHECK(last && strstr(last, "\"trend\":-20"));
     cgm_new_sensor(&c, CGM_G6, "81AB7Q");
     CHECK(c.st.kind == CGM_G6 && strcmp(c.st.id, "81AB7Q") == 0 && c.st.n_hist == 0);
     cgm_new_sensor(&c, CGM_OFF, NULL);

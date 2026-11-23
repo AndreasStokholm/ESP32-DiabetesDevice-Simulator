@@ -265,12 +265,14 @@ document.querySelectorAll('#kind button').forEach(b=>b.onclick=()=>
   cmd({command:'cgmSetKind', kind:+b.dataset.kind}, 'kindMsg', 'Set'));
 document.getElementById('applyId').onclick = ()=>cmd({command:'cgmSetId', id:document.getElementById('g6id').value.trim()}, 'sensorMsg', 'Id set');
 document.getElementById('newSensor').onclick = ()=>cmd({command:'cgmNewSensor', kind:(s.kind||7)}, 'sensorMsg', 'New sensor started');
-document.getElementById('applyGlucose').onclick = async ()=>{ patternDirty = false; await cmd({command:'cgmSetPattern',
-  pattern: pattern,
-  value:+document.getElementById('glucoseIn').value,
-  trend:Math.round(+document.getElementById('trendIn').value*10),
-  amplitude:+document.getElementById('amplitudeIn').value,
-  periodMinutes:+document.getElementById('periodIn').value}, 'glucoseMsg', 'Applied ✓'); };
+document.getElementById('applyGlucose').onclick = async ()=>{ patternDirty = false;
+  const body = {command:'cgmSetPattern', pattern: pattern, value:+document.getElementById('glucoseIn').value};
+  if (pattern === 'fixed') body.trend = Math.round(+document.getElementById('trendIn').value*10);
+  if (pattern === 'sine') {
+    body.amplitude = +document.getElementById('amplitudeIn').value;
+    body.periodMinutes = +document.getElementById('periodIn').value;
+  }
+  await cmd(body, 'glucoseMsg', 'Applied ✓'); };
 document.getElementById('calApply').onclick = ()=>cmd({command:'cgmSetCalibration',
   glucose:+document.getElementById('calIn').value}, 'glucoseMsg', 'Calibrated ✓');
 document.getElementById('algostate').onchange = ()=>cmd({command:'cgmSetState',

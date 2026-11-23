@@ -730,13 +730,24 @@ const char* command(const std::string& json) {
     long value = 120;
     if (!jsonNumber(body, "value", &value) && !jsonNumber(body, "glucose", &value)) return "value is 40 to 400";
     if (value < 40 || value > 400) return "value is 40 to 400";
+    // Start from what the sensor already has, so switching pattern does not
+    // reset parameters the new pattern does not use. Only the parameters the
+    // chosen pattern uses are read and validated from the request.
     long trend = 0, amplitude = 50, period = 240;
-    if (jsonNumber(body, "trend", &trend) && (trend < -127 || trend > 126)) return "trend is -127 to 126";
-    if (jsonNumber(body, "amplitude", &amplitude) && (amplitude < 0 || amplitude > 180)) {
-      return "amplitude is 0 to 180";
-    }
-    if (jsonNumber(body, "periodMinutes", &period) && (period < 10 || period > 1440)) {
-      return "periodMinutes is 10 to 1440";
+    LOCKED({
+      trend = c.st.trend;
+      amplitude = c.st.amplitude;
+      period = c.st.period_minutes;
+    });
+    if (pattern == CGM_PATTERN_FIXED) {
+      if (jsonNumber(body, "trend", &trend) && (trend < -127 || trend > 126)) return "trend is -127 to 126";
+    } else if (pattern == CGM_PATTERN_SINE) {
+      if (jsonNumber(body, "amplitude", &amplitude) && (amplitude < 0 || amplitude > 180)) {
+        return "amplitude is 0 to 180";
+      }
+      if (jsonNumber(body, "periodMinutes", &period) && (period < 10 || period > 1440)) {
+        return "periodMinutes is 10 to 1440";
+      }
     }
     LOCKED({
       cgm_pattern_t p = {pattern, (uint16_t)value, (int8_t)trend, (uint16_t)amplitude, (uint16_t)period};

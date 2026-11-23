@@ -438,7 +438,10 @@ static void make_reading(cgm_t *c, uint32_t n, int64_t now)
     };
     if (r.state == CGM_STATE_OK) {
         const cgm_reading_t *prev_r = latest(c);
-        uint16_t prev = prev_r && prev_r->glucose ? prev_r->glucose : 120;
+        /* 0 is the generator's "no previous reading" sentinel. A warm-up (or
+         * other error-state) entry has no glucose, so it must not seed a curve's
+         * trend or a walk's path. */
+        uint16_t prev = prev_r && prev_r->glucose ? prev_r->glucose : 0;
         cgm_pattern_t p = {
             .kind = (cgm_pattern_kind_t)st->pattern,
             .value = st->glucose,
@@ -963,9 +966,14 @@ size_t cgm_status_json(cgm_t *c, char *out, size_t cap)
     if (n < 0 || (size_t)n >= cap) {
         return 0;
     }
+    char tr[5] = "null";
+    if (r && r->trend != NO_TREND) {
+        snprintf(tr, sizeof tr, "%d", r->trend);
+    }
     int m = r ? snprintf(out + n, cap - n,
-                         ",\"last\":{\"seq\":%u,\"t\":%u,\"glucose\":%u,\"state\":%u,\"sent\":%s}}", (unsigned)r->seq,
-                         (unsigned)r->t, r->glucose, r->state, r->seq <= st->delivered ? "true" : "false")
+                         ",\"last\":{\"seq\":%u,\"t\":%u,\"glucose\":%u,\"state\":%u,\"trend\":%s,\"sent\":%s}}",
+                         (unsigned)r->seq, (unsigned)r->t, r->glucose, r->state, tr,
+                         r->seq <= st->delivered ? "true" : "false")
               : snprintf(out + n, cap - n, ",\"last\":null}");
     if (m < 0 || (size_t)(n + m) >= cap) {
         return 0;

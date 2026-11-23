@@ -40,7 +40,7 @@ static const char settingsHTML[] PROGMEM = R"HTML(<!doctype html>
 <nav>
   <span class="brand">ESP-Sim</span>
   <a href="/">Home</a>
-  <a href="/g7">CGM</a>
+  <a href="/cgm">CGM</a>
   <a href="/pump">Pump</a>
   <a class="active" href="/settings">Settings</a>
 </nav>
