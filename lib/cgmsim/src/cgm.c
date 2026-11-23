@@ -366,16 +366,20 @@ void cgm_tick(cgm_t *c)
         bool want = st->kind == CGM_G6 ? true : undelivered && now < c->window_end;
         advertise(c, want && !st->signal_loss);
     }
-    /* A session that has its reading and has gone quiet is hung up on its own;
-     * a central still collecting does not hold another central's link open. */
-    for (int i = 0; i < CGM_MAX_SESSIONS; i++) {
-        const cgm_session_state_t *s = &c->sessions[i];
-        if (!s->connected) {
-            continue;
-        }
-        if ((s->sent_glucose && now - s->last_activity >= IDLE_END) || now - s->connected_at >= CONN_MAX) {
-            logf_(c, "hanging up");
-            c->io->disconnect(c->io->ctx, (cgm_session_t)i);
+    /* A G7 collects one reading per link: once it has its reading and has gone
+     * quiet it is hung up on, and no G7 link outlives CONN_MAX. A G6 keeps the
+     * link it has and pushes every reading on it; signal loss and a new sensor
+     * end its sessions elsewhere. */
+    if (st->kind == CGM_G7) {
+        for (int i = 0; i < CGM_MAX_SESSIONS; i++) {
+            const cgm_session_state_t *s = &c->sessions[i];
+            if (!s->connected) {
+                continue;
+            }
+            if ((s->sent_glucose && now - s->last_activity >= IDLE_END) || now - s->connected_at >= CONN_MAX) {
+                logf_(c, "hanging up");
+                c->io->disconnect(c->io->ctx, (cgm_session_t)i);
+            }
         }
     }
 }

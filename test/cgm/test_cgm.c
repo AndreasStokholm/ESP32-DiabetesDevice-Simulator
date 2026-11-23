@@ -735,9 +735,10 @@ static void test_address_rotate(void)
 }
 
 /* A lone central's reading-boundary delivery and hang-up, as README documents:
- * the tick that makes a new reading sends it before the idle hang-up, and the
- * reconnect still gets the latest reading again (the same seq may be seen
- * twice). This is what the old single session sent nothing for. */
+ * for a G7 the tick that makes a new reading sends it before the idle hang-up,
+ * and the reconnect still gets the latest reading again (the same seq may be
+ * seen twice). A G6 keeps the link instead. This is what the old single
+ * session sent nothing for. */
 static void test_single_boundary(void)
 {
     static cgm_t c;
@@ -801,8 +802,75 @@ static void test_single_boundary(void)
     CHECK(fk.sent[0].session == 0 && fk.sent[0].chr == CGM_CHR_CONTROL && fk.sent[0].p[0] == 0x25);
     CHECK(fk.sent[1].session == 0 && fk.sent[1].chr == CGM_CHR_CONTROL && fk.sent[1].p[0] == 0x4f);
     CHECK(c.sessions[0].delivered == next_seq);
-    CHECK(fk.disconnects_for[0] == 1);
+    CHECK(fk.disconnects_for[0] == 0); /* a G6 keeps the link */
     cgm_on_disconnect(&c, 0);
+}
+
+/* A G6 keeps the link it has and pushes each reading on it; a G7 is hung up
+ * after it has collected its reading. */
+static void test_hangup(void)
+{
+    static cgm_t c;
+    cgm_state_t st;
+
+    /* G6: two sessions connect, take the current reading, stay quiet past the
+     * idle timeout and the connection cap, and still get the next reading. */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G6, "81AB7Q", fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_set_glucose(&c, 110, 0);
+    cgm_tick(&c);
+    uint32_t first_seq = c.st.hist[c.st.n_hist - 1].seq;
+    connect_n(&c, 0);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    int g = find_session(CGM_CHR_CONTROL, 0x4f, 0, 0);
+    CHECK(g >= 0 && le32(fk.sent[g].p + 2) == first_seq);
+    CHECK(c.sessions[0].sent_glucose && c.sessions[0].delivered == first_seq);
+
+    /* Past both IDLE_END and CONN_MAX: no hang-up. */
+    run(&c, 31);
+    CHECK(fk.disconnects_for[0] == 0);
+    CHECK(c.sessions[0].connected);
+
+    /* A second session joins and gets the cached reading too. */
+    connect_n(&c, 1);
+    clear_sent();
+    cgm_on_subscribe(&c, 1, CGM_CHR_CONTROL, true);
+    g = find_session(CGM_CHR_CONTROL, 0x4f, 0, 1);
+    CHECK(g >= 0 && le32(fk.sent[g].p + 2) == first_seq);
+    CHECK(c.sessions[1].sent_glucose && c.sessions[1].delivered == first_seq);
+
+    /* The next reading reaches both sessions on the same links. */
+    clear_sent();
+    run(&c, CGM_READING_INTERVAL - 31);
+    uint32_t next_seq = c.st.hist[c.st.n_hist - 1].seq;
+    CHECK(next_seq == first_seq + 1);
+    g = find_session(CGM_CHR_CONTROL, 0x4f, 0, 0);
+    CHECK(g >= 0 && le32(fk.sent[g].p + 2) == next_seq);
+    g = find_session(CGM_CHR_CONTROL, 0x4f, 0, 1);
+    CHECK(g >= 0 && le32(fk.sent[g].p + 2) == next_seq);
+    CHECK(count_session(CGM_CHR_CONTROL, 0) == 2); /* time, then glucose */
+    CHECK(count_session(CGM_CHR_CONTROL, 1) == 2);
+    CHECK(c.sessions[0].connected && c.sessions[1].connected);
+    CHECK(fk.disconnects_for[0] == 0 && fk.disconnects_for[1] == 0);
+
+    /* A G7 still collects one reading per link and is hung up on. */
+    memset(&fk, 0, sizeof fk);
+    fk.now = 1800000000;
+    cgm_state_fresh(&st, CGM_G7, NULL, fk.now);
+    cgm_init(&c, &st, &fio);
+    cgm_tick(&c);
+    connect_n(&c, 0);
+    clear_sent();
+    cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
+    CHECK(find_session(CGM_CHR_CONTROL, 0x4e, 0, 0) >= 0);
+    run(&c, 2);
+    CHECK(fk.disconnects_for[0] == 0); /* still collecting: IDLE_END not reached */
+    run(&c, 1);
+    CHECK(fk.disconnects_for[0] == 1); /* hung up after its reading */
+    CHECK(fk.last_disconnect == 0);
 }
 
 /* A G6 advertises for as long as it is unconnected; only a G7 closes its
@@ -975,6 +1043,7 @@ void test_cgm_all(void)
     test_slot_reuse();
     test_address_rotate();
     test_single_boundary();
+    test_hangup();
     test_advertise();
     test_bad_session();
     test_drop_all_sessions();
