@@ -307,6 +307,27 @@ int medtrum_patch_command(medtrum_patch_t *p, uint8_t command, uint8_t sequence,
         payload[0] = p->status.state;
         return medtrum_encode_response(command, sequence, rc, payload, 1, frags, max_frags);
 
+    case MEDTRUM_CMD_GET_RECORD: {
+        /* GetRecordPacket: index(2) patchId(2). The simulator keeps no record
+         * log; it answers each sequence the status advertises with a TDD
+         * record (type 9), which the client parses and the watch's history
+         * sweep accepts without inventing a dose. */
+        if (content == NULL || content_len < 4) {
+            return -1;
+        }
+        uint16_t index = rd_u16(content);
+        uint16_t patch = rd_u16(content + 2);
+        uint8_t record[20] = {0};
+        record[0] = 0xAA; /* VALID_HEADER */
+        record[2] = 9;    /* TDD record */
+        memcpy(record + 4, p->sn, 4);
+        wr_u16(record + 8, patch);
+        wr_u16(record + 10, index);
+        wr_u32(record + 12, p->delivery.patch_time);
+        wr_u16(record + 16, (uint16_t)(int16_t)p->delivery.timezone_minutes);
+        return medtrum_encode_response(command, sequence, rc, record, sizeof record, frags, max_frags);
+    }
+
     default:
         return -1;
     }

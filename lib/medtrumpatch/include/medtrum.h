@@ -62,7 +62,7 @@ typedef enum {
     MEDTRUM_CMD_READ_BOLUS_STATE = 34, /* declared, unused by the client */
     MEDTRUM_CMD_SET_PATCH = 35,
     MEDTRUM_CMD_SET_BOLUS_MOTOR = 36,  /* declared, unused by the client */
-    MEDTRUM_CMD_GET_RECORD = 99,       /* declared, unused by the client */
+    MEDTRUM_CMD_GET_RECORD = 99,       /* history: the TDD answer the simulator gives */
     MEDTRUM_CMD_CLEAR_ALARM = 115,
 } medtrum_cmd_t;
 

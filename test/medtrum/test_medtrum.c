@@ -531,6 +531,45 @@ static void test_sync_full_vector(void)
     CHECK(pkt.data[6] == MEDTRUM_STATE_ACTIVE);
 }
 
+/* GetRecord (99): the history answer the watch's cold sweep needs. The
+ * simulator has no record log; each sequence the status advertises comes back
+ * as a TDD record with the request's patch id and index. */
+static void test_get_record(void)
+{
+    medtrum_patch_t p;
+    medtrum_patch_init(&p, (uint8_t[]){1, 2, 3, 4});
+    p.authenticated = true;
+    p.status.state = MEDTRUM_STATE_ACTIVE;
+    p.status.storage_sequence = 7;
+    p.status.storage_patch_id = 0x1234;
+    p.delivery.patch_id[0] = 0x34;
+    p.delivery.patch_id[1] = 0x12;
+    p.delivery.patch_time = 0x11223344;
+    p.delivery.timezone_minutes = 60;
+
+    uint8_t req[4] = {3, 0, 0x34, 0x12}; /* index 3, patch 0x1234 */
+    medtrum_frag_t resp[MEDTRUM_FRAGS_MAX];
+    int n = medtrum_patch_handle(&p, MEDTRUM_CMD_GET_RECORD, 9, req, sizeof req, resp, MEDTRUM_FRAGS_MAX);
+    CHECK(n > 0);
+
+    medtrum_packet_t pkt;
+    medtrum_decode_init(&pkt, MEDTRUM_CMD_GET_RECORD);
+    for (int i = 0; i < n; i++) {
+        medtrum_decode(&pkt, resp[i].data, resp[i].len);
+    }
+    CHECK(!pkt.failed && medtrum_complete(&pkt));
+    CHECK(pkt.response_code == MEDTRUM_RESPONSE_OK);
+    CHECK(pkt.len >= 26);
+    if (pkt.len >= 26) {
+        CHECK(pkt.data[6] == 0xAA);          /* valid record header */
+        CHECK(pkt.data[8] == 9);             /* TDD record */
+        CHECK(pkt.data[14] == 0x34 && pkt.data[15] == 0x12); /* patch id */
+        CHECK(pkt.data[16] == 3 && pkt.data[17] == 0);       /* sequence */
+        CHECK(pkt.data[18] == 0x44 && pkt.data[19] == 0x33 && pkt.data[20] == 0x22 && pkt.data[21] == 0x11);
+        CHECK(pkt.data[22] == 0x3c && pkt.data[23] == 0);    /* zone +60 min */
+    }
+}
+
 /* A simulated phone: AUTH_REQ -> SYNCHRONIZE -> SUBSCRIBE. */
 static void test_session(void)
 {
@@ -969,6 +1008,7 @@ int main(void)
     test_patch_state();
     test_sync_fragment_vector();
     test_sync_full_vector();
+    test_get_record();
     test_session();
     test_session_failures();
     test_lifecycle();
