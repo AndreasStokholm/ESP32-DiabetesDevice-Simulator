@@ -510,6 +510,13 @@ static void test_g6_pairing(void)
     cgm_on_write(&c, 0, CGM_CHR_AUTH, ch, sizeof ch);
     CHECK(c.sessions[0].authed && fk.n_sent == 0);
 
+    /* A DisconnectTx before the app has a reading is still pairing. It must not
+     * tear the link down: that is the bonding loop. */
+    int d = fk.disconnects;
+    cgm_on_write(&c, 0, CGM_CHR_CONTROL, (const uint8_t *)"\x09", 1);
+    CHECK(fk.disconnects == d);
+    CHECK(c.sessions[0].connected);
+
     /* The subscribe delivers the current reading: time, then glucose. */
     cgm_on_subscribe(&c, 0, CGM_CHR_CONTROL, true);
     int t = find_session(CGM_CHR_CONTROL, 0x25, 0, 0);
@@ -531,6 +538,11 @@ static void test_g6_pairing(void)
     g = find_session(CGM_CHR_CONTROL, 0x4f, 0, 0);
     CHECK(fk.n_sent == 2 && t == 0 && g == 1);
     CHECK(g >= 0 && le32(fk.sent[g].p + 2) == next->seq);
+
+    /* Once it has a reading, DisconnectTx is the end of this session. */
+    d = fk.disconnects;
+    cgm_on_write(&c, 0, CGM_CHR_CONTROL, (const uint8_t *)"\x09", 1);
+    CHECK(fk.disconnects == d + 1);
     cgm_on_disconnect(&c, 0);
 }
 
