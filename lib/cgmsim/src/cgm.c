@@ -791,6 +791,10 @@ static void g6_control(cgm_t *c, cgm_session_t session, const uint8_t *p, size_t
         send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 17));
         break;
     }
+    case 0x50: /* GlucoseBackfillTx: the app asks for the history itself */
+        logf_(c, "backfill requested by the app");
+        send_backfill(c, session);
+        break;
     case 0x09: { /* DisconnectTx: the app ends this session */
         cgm_session_state_t *s = session_at(c, session);
         /* An app that sends this before it has been given a reading is still
