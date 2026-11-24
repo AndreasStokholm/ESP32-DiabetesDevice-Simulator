@@ -791,12 +791,14 @@ static void g6_control(cgm_t *c, cgm_session_t session, const uint8_t *p, size_t
         send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 17));
         break;
     }
-    case 0x09: /* the app ends its session; the link is NOT dropped */
-        /* A G6 keeps its connection for the whole session and pushes every new
-         * reading over it, so a disconnect here ended the link 0.45 s after the
-         * app authenticated and it never got a reading. Keep the link; the app
-         * reconnects when it wants to. */
-        logf_(c, "g6 opcode 0x09: session state, link kept");
+    case 0x09: /* DisconnectTx: the app ends this session */
+        /* CGMBLEKit sets CONTROL notifications off and then sends this: the
+         * transmitter's session is over. Close the link; the radio drains any
+         * queued frame first, and a G6 advertises while unconnected, so the
+         * next reading is collected on a fresh session. Keeping the link open
+         * left the app believing it still had a session it had ended. */
+        logf_(c, "g6 opcode 0x09: app ended the session");
+        c->io->disconnect(c->io->ctx, session);
         break;
     default:
         logf_(c, "ignoring control opcode 0x%02x", p[0]);
