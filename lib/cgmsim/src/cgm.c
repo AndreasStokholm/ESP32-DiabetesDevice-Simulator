@@ -454,6 +454,41 @@ static void push_glucose(cgm_t *c, cgm_session_t session)
     delivered(c, session, r);
 }
 
+/* The G6 backfill frames for history indices [first, last], then the 0x51
+ * response that names the same times and buffer. */
+static void send_g6_backfill_range(cgm_t *c, cgm_session_t session, int first, int last, uint8_t id)
+{
+    const cgm_state_t *st = &c->st;
+    uint8_t buf[4 + 8 * CGM_HISTORY] = {0};
+    size_t n = 4;
+    for (int i = first; i <= last; i++) {
+        const cgm_reading_t *h = &st->hist[i];
+        put32(buf + n, tx_time(st, h->t));
+        put16(buf + n + 4, h->glucose);
+        buf[n + 6] = h->state;
+        buf[n + 7] = (uint8_t)h->trend;
+        n += 8;
+    }
+    uint8_t frames[sizeof buf + 2 * 32];
+    size_t total = 0;
+    uint8_t frame_no = 1;
+    for (size_t off = 0; off < n; off += 18) {
+        size_t k = n - off < 18 ? n - off : 18;
+        uint8_t *f = frames + total;
+        f[0] = frame_no++;
+        f[1] = id;
+        memcpy(f + 2, buf + off, k);
+        send(c, session, CGM_CHR_BACKFILL, f, k + 2);
+        total += k + 2;
+    }
+    uint8_t m[20] = {0x51, 0x00, 0x01, id};
+    put32(m + 4, tx_time(st, st->hist[first].t));
+    put32(m + 8, tx_time(st, st->hist[last].t));
+    put32(m + 12, (uint32_t)total);
+    put16(m + 16, cgm_crc16(frames, total));
+    send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 18));
+}
+
 /* The readings the session missed, before the one it was just sent. Its own
  * backfill cursor (prev_delivered) keeps it to what this central has not had. */
 static void send_backfill(cgm_t *c, cgm_session_t session)
@@ -486,36 +521,7 @@ static void send_backfill(cgm_t *c, cgm_session_t session)
         send(c, session, CGM_CHR_CONTROL, done, sizeof done);
         return;
     }
-    /* G6: a 4-byte header and 8-byte records, cut into 20-byte frames that
-     * start with their number and the backfill's id; then 0x51 on control. */
-    uint8_t buf[4 + 8 * CGM_HISTORY] = {0};
-    size_t n = 4;
-    for (int i = first; i <= last; i++) {
-        const cgm_reading_t *h = &st->hist[i];
-        put32(buf + n, tx_time(st, h->t));
-        put16(buf + n + 4, h->glucose);
-        buf[n + 6] = h->state;
-        buf[n + 7] = (uint8_t)h->trend;
-        n += 8;
-    }
-    uint8_t frames[sizeof buf + 2 * 32];
-    size_t total = 0;
-    uint8_t frame_no = 1;
-    for (size_t off = 0; off < n; off += 18) {
-        size_t k = n - off < 18 ? n - off : 18;
-        uint8_t *f = frames + total;
-        f[0] = frame_no++;
-        f[1] = 0; /* the backfill's id */
-        memcpy(f + 2, buf + off, k);
-        send(c, session, CGM_CHR_BACKFILL, f, k + 2);
-        total += k + 2;
-    }
-    uint8_t m[20] = {0x51, 0x00, 0x01, 0x00};
-    put32(m + 4, tx_time(st, st->hist[first].t));
-    put32(m + 8, tx_time(st, st->hist[last].t));
-    put32(m + 12, (uint32_t)total);
-    put16(m + 16, cgm_crc16(frames, total));
-    send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 18));
+    send_g6_backfill_range(c, session, first, last, 0);
 }
 
 void cgm_on_subscribe(cgm_t *c, cgm_session_t session, cgm_chr_t chr, bool on)
@@ -644,10 +650,34 @@ static void g6_control(cgm_t *c, cgm_session_t session, const uint8_t *p, size_t
         send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 17));
         break;
     }
-    case 0x50: /* GlucoseBackfillTx: the app asks for the history itself */
-        logf_(c, "backfill requested by the app");
-        send_backfill(c, session);
+    case 0x50: { /* GlucoseBackfillTx: id at 3, start(4) at 4, end(4) at 8 */
+        uint8_t id = n >= 4 ? p[3] : 0;
+        uint32_t start = n >= 12 ? get32(p + 4) : 0;
+        uint32_t end = n >= 12 ? get32(p + 8) : 0xffffffffu;
+        int first = -1, last = -1;
+        for (int i = 0; i < st->n_hist; i++) {
+            uint32_t t = tx_time(st, st->hist[i].t);
+            if (t >= start && t <= end) {
+                if (first < 0) first = i;
+                last = i;
+            }
+        }
+        logf_(c, "backfill requested by the app: %d readings", first < 0 ? 0 : last - first + 1);
+        if (first < 0) {
+            /* An empty answer still closes the request. */
+            memset(m, 0, sizeof m);
+            m[0] = 0x51;
+            m[1] = 0x00;
+            m[2] = 0x01;
+            m[3] = id;
+            put32(m + 4, start);
+            put32(m + 8, end);
+            send(c, session, CGM_CHR_CONTROL, m, with_crc(m, 18));
+            break;
+        }
+        send_g6_backfill_range(c, session, first, last, id);
         break;
+    }
     case 0x09: { /* DisconnectTx: the app ends this session */
         cgm_session_state_t *s = session_at(c, session);
         /* An app that sends this before it has been given a reading is still
