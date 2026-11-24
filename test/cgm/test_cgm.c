@@ -542,7 +542,7 @@ static void test_g6_pairing(void)
     /* GlucoseBackfillTx from the app: answer with the history and 0x51, or the
      * app sits for 10 s and ends the session without a second entry. */
     clear_sent();
-    uint8_t hist[18] = {0x50, 0x05, 0x02, 0x00, 0, 0, 0, 0, 0x88, 0x13, 0, 0, 0, 0, 0, 0, 0, 0};
+    uint8_t hist[18] = {0x50, 0x05, 0x02, 0x00, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0};
     send_cmd(&c, hist, sizeof hist);
     CHECK(find_session(CGM_CHR_BACKFILL, 1, 0, 0) >= 0);
     CHECK(find_session(CGM_CHR_CONTROL, 0x51, 0, 0) >= 0);
