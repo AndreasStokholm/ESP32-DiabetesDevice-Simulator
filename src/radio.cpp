@@ -100,9 +100,12 @@ static std::string cgmAdvData;
 static std::string cgmAdvName;
 // The core's advertising window. It is NOT cleared when a central connects:
 // with two links the set stays on while a slot remains, so a watch that scans
-// after the phone has connected can still find the sensor. The core's own
-// cgm_tick closes the window when the session is over; the last CGM
-// onDisconnect clears this copy to mirror the core's silent off.
+// after the phone has connected can still find the sensor. It also stays on
+// across a disconnect: an app that has just ended its session reconnects at
+// once, and stopping the set for even one tick lets it find the pump's set
+// instead and sit at "bonding". The core's cgm_tick opens or closes the window
+// (signal loss, a G7 window, CGM off), and that is the only thing that changes
+// this copy.
 static bool cgmAdvOn = false;
 // The sensor's random static address, applied to the CGM advertising instance
 // by tick() (the core hands it in with every advertise() call). Guarded by mu
@@ -485,13 +488,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         for (int c = 0; c < CGM_CHR_COUNT; c++) cgmSubs[i][c] = 0;
         cgmDrops[i] = CgmDrop{};
         links[i] = Link{};
-        // Mirror the core's silent advertising-off after a connection. The core
-        // set c->advertising = false in cgm_on_connect without calling
-        // advertise(false); onDisconnect only clears that session, so a window
-        // the core considers closed is never announced. With no CGM link left,
-        // the radio's copy can only follow that false; if the core opens a new
-        // window it calls advertise(true) again.
-        if (cgmCountLocked() == 0) cgmAdvOn = false;
+        // Do NOT stop the CGM set here. The core's cgm_tick owns the window,
+        // and an app that has just sent DisconnectTx reconnects immediately;
+        // dropping the set for a tick lets it latch onto the pump's set.
       }
     }
     std::string addr = addrString(desc->peer_ota_addr);
