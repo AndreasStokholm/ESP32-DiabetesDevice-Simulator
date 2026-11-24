@@ -502,6 +502,12 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     }
     if (hadPod) podPush(DASH_EV_DISCONNECTED, nullptr, 0);
   }
+
+  void onAuthenticationComplete(ble_gap_conn_desc* desc) override {
+    std::string addr = addrString(desc->peer_ota_addr);
+    logf("%s authentication: encrypted=%d bonded=%d authenticated=%d", addr.c_str(),
+         desc->sec_state.encrypted, desc->sec_state.bonded, desc->sec_state.authenticated);
+  }
 };
 
 // One GATT event each way for the core: the core's own protocol runs inside
@@ -542,6 +548,13 @@ class CgmCallbacks : public NimBLECharacteristicCallbacks {
       return;
     }
     NimBLEAttValue v = ch->getValue();
+    logf("cgm: %s write %s (handle 0x%04x)", cgmCharNames[chr], hexstr(v.data(), v.length()).c_str(), h);
+    if (chr == CGM_CHR_AUTH && v.length() > 0 && v.data()[0] == 0x07) {
+      // BondRequestTx: the transmitter starts BLE pairing. Without this the
+      // app waits at "bonding" for a pairing the simulator never begins.
+      int rc = NimBLEDevice::startSecurity(h);
+      logf("cgm: bond request: pairing started (rc=%d)", rc);
+    }
     sensor::onWrite(session, chr, v.data(), v.length());
   }
 
@@ -554,6 +567,7 @@ class CgmCallbacks : public NimBLECharacteristicCallbacks {
     // The core answers a subscription at once (the auth status, the cached
     // reading for that session), so the CCCD value is recorded first: cgmNotify
     // sends only to a subscriber.
+    logf("cgm: %s subscribe %s (handle 0x%04x)", cgmCharNames[chr], subValue ? "on" : "off", h);
     setCgmSub(h, chr, subValue);
     sensor::onSubscribe(session, chr, subValue != 0);
   }
@@ -695,6 +709,9 @@ void begin() {
   NimBLEDevice::init(name.c_str());
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEDevice::setMTU(251);  // Omnipod 5 packets are 244 bytes
+  // Bonding is initiated only when an app writes G6 BondRequestTx (0x07); the
+  // auth status still reports the protocol-level bonded flag. Just Works.
+  NimBLEDevice::setSecurityAuth(true, false, true);
   logf("Bluetooth address %s (the pump and the patch advertise from it; the CGM uses the sensor's)",
        NimBLEDevice::getAddress().toString().c_str());
 
